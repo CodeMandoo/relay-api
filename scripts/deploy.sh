@@ -3,7 +3,7 @@
 set -e
 
 ZIP_PATH="/tmp/release.zip"
-EXTRACT_DIR="/tmp/release"
+EXTRACT_DIR="/tmp/release-$$"
 RELAY_BIN="/opt/relay-platform/bin/relay-server"
 RELAY_WEB="/opt/relay-platform/web/dist"
 RELAY_USER="relay"
@@ -14,7 +14,8 @@ if [ ! -f "$ZIP_PATH" ]; then
 fi
 
 echo "Extracting $ZIP_PATH ..."
-unzip -o "$ZIP_PATH" -d /tmp/ 2>&1 | tail -2
+rm -rf "$EXTRACT_DIR"
+unzip -o "$ZIP_PATH" -d "$EXTRACT_DIR" 2>&1 | tail -2
 
 if [ ! -f "$EXTRACT_DIR/backend/relay-server" ]; then
     echo "relay-server not found in archive"
