@@ -37,9 +37,11 @@ jobs:
 
       - name: Package release
         run: |
+          mkdir -p release/backend release/frontend
           cp -r apps/web/dist release/frontend/dist
-          cd release
-          zip -r ../release.zip .
+          cp server/release/backend/relay-server release/backend/
+          chmod +x release/backend/relay-server
+          cd release && zip -r ../release.zip .
 
       - uses: actions/upload-artifact@v4
         with:
