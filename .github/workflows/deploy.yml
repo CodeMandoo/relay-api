@@ -1,0 +1,72 @@
+name: Build and Deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.0.0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build frontend
+        run: pnpm --filter @relay-api/web build
+
+      - name: Build backend
+        run: |
+          mkdir -p release/backend release/frontend
+          CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o release/backend/relay-server ./cmd/server
+        working-directory: server
+
+      - name: Package release
+        run: |
+          cp -r apps/web/dist release/frontend/dist
+          cd release
+          zip -r ../release.zip .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release
+          path: release.zip
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SERVER_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "${{ secrets.SERVER_HOST }}" >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Upload release
+        run: |
+          scp release.zip ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }}:/tmp/release.zip
+
+      - name: Deploy on server
+        run: |
+          ssh ${{ secrets.SERVER_USER }}@${{ secrets.SERVER_HOST }} \
+            "sudo bash /home/admin/deploy-relay.sh"
