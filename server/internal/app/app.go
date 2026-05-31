@@ -57,7 +57,7 @@ func openDatabase(cfg Config) (*gorm.DB, error) {
 }
 
 func migrate(db *gorm.DB) error {
-	return db.AutoMigrate(
+	err := db.AutoMigrate(
 		&User{},
 		&InviteCode{},
 		&EmailVerificationCode{},
@@ -66,11 +66,16 @@ func migrate(db *gorm.DB) error {
 		&SourceAccountUsageLog{},
 		&SourceKey{},
 		&ModelConfig{},
+		&ModelRouteBinding{},
 		&APIKey{},
 		&UsageLog{},
 		&RequestAttempt{},
 		&PlatformSettings{},
 	)
+	if err != nil {
+		return err
+	}
+	return migrateModelRouteBindings(db)
 }
 
 func (a *App) buildRouter() *gin.Engine {

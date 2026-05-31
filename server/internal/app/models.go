@@ -201,6 +201,20 @@ type ModelConfig struct {
 	DeletedAt          gorm.DeletedAt `gorm:"index"`
 }
 
+type ModelRouteBinding struct {
+	ID             uint `gorm:"primaryKey"`
+	ModelID        uint `gorm:"index;not null"`
+	SourceID       uint `gorm:"index;not null"`
+	SourceKeyID    *uint
+	RoutingWeight  int  `gorm:"not null;default:1"`
+	RoutingEnabled bool `gorm:"not null;default:true"`
+	Enabled        bool `gorm:"not null;default:true"`
+	LatencyMS      int
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
+	DeletedAt      gorm.DeletedAt `gorm:"index"`
+}
+
 type APIKey struct {
 	ID         uint   `gorm:"primaryKey"`
 	UserID     uint   `gorm:"index;not null"`
@@ -628,19 +642,27 @@ func modelDTO(model ModelConfig, sourceName string, sourceKeyAlias string) Model
 }
 
 func modelRouteCandidateDTO(model ModelConfig, source UpstreamSource, sourceKeyAlias string) ModelRouteCandidateDTO {
+	return modelRouteCandidateDTOFromBinding(model, legacyBindingFromModel(model), source, sourceKeyAlias)
+}
+
+func modelRouteCandidateDTOFromBinding(model ModelConfig, binding ModelRouteBinding, source UpstreamSource, sourceKeyAlias string) ModelRouteCandidateDTO {
+	candidateID := id("mb", binding.ID)
+	if binding.ID == 0 {
+		candidateID = id("m", model.ID)
+	}
 	out := ModelRouteCandidateDTO{
-		ID:             id("m", model.ID),
-		SourceID:       id("s", model.SourceID),
+		ID:             candidateID,
+		SourceID:       id("s", binding.SourceID),
 		SourceName:     source.Name,
 		SourceStatus:   source.Status,
 		SourcePriority: source.Priority,
-		RoutingWeight:  nonZeroInt(model.RoutingWeight, 1),
-		RoutingEnabled: model.RoutingEnabled,
-		ModelEnabled:   model.Status == ModelStatusActive,
+		RoutingWeight:  nonZeroInt(binding.RoutingWeight, 1),
+		RoutingEnabled: binding.RoutingEnabled,
+		ModelEnabled:   model.Status == ModelStatusActive && binding.Enabled,
 		CoolingDown:    source.CooldownUntil != nil && source.CooldownUntil.After(time.Now()),
 	}
-	if model.SourceKeyID != nil && *model.SourceKeyID > 0 {
-		out.SourceKeyID = id("sk", *model.SourceKeyID)
+	if binding.SourceKeyID != nil && *binding.SourceKeyID > 0 {
+		out.SourceKeyID = id("sk", *binding.SourceKeyID)
 		out.SourceKeyAlias = sourceKeyAlias
 	}
 	if source.CooldownUntil != nil {

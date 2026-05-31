@@ -19,6 +19,7 @@ import (
 
 type routeTarget struct {
 	Model     ModelConfig
+	Binding   ModelRouteBinding
 	Source    UpstreamSource
 	SourceKey *SourceKey
 }
@@ -37,12 +38,12 @@ const (
 )
 
 type usageTokens struct {
-	Prompt      int64 // input tokens
-	Completion  int64 // output tokens
-	CacheRead   int64 // cache read tokens
-	CacheWrite  int64 // cache creation tokens
-	Reasoning   int64 // reasoning/thinking tokens
-	Total       int64
+	Prompt     int64 // input tokens
+	Completion int64 // output tokens
+	CacheRead  int64 // cache read tokens
+	CacheWrite int64 // cache creation tokens
+	Reasoning  int64 // reasoning/thinking tokens
+	Total      int64
 }
 
 type usageRecordMeta struct {
@@ -450,35 +451,41 @@ func (a *App) routeTargets(modelName string, protocol relayProtocol) ([]routeTar
 	targets := make([]routeTarget, 0, len(models))
 	now := time.Now()
 	for _, model := range models {
-		if !model.RoutingEnabled {
-			continue
-		}
 		if !modelSupportsRelayProtocol(model, protocol) {
 			continue
 		}
-		var source UpstreamSource
-		if err := a.db.Where("id = ? AND status = ?", model.SourceID, SourceStatusOnline).First(&source).Error; err != nil {
-			if errors.Is(err, gorm.ErrRecordNotFound) {
-				continue
-			}
+		bindings, err := a.modelBindings(model)
+		if err != nil {
 			return nil, err
 		}
-		if source.CooldownUntil != nil && source.CooldownUntil.After(now) {
-			continue
-		}
-		target := routeTarget{Model: model, Source: source}
-		if model.SourceKeyID != nil {
-			var sourceKey SourceKey
-			err := a.db.Where("id = ? AND source_id = ? AND status = ?", *model.SourceKeyID, source.ID, APIKeyStatusValid).First(&sourceKey).Error
-			if err != nil {
+		for _, binding := range bindings {
+			if !binding.Enabled {
+				continue
+			}
+			var source UpstreamSource
+			if err := a.db.Where("id = ? AND status = ?", binding.SourceID, SourceStatusOnline).First(&source).Error; err != nil {
 				if errors.Is(err, gorm.ErrRecordNotFound) {
 					continue
 				}
 				return nil, err
 			}
-			target.SourceKey = &sourceKey
+			if source.CooldownUntil != nil && source.CooldownUntil.After(now) {
+				continue
+			}
+			target := routeTarget{Model: model, Binding: binding, Source: source}
+			if binding.SourceKeyID != nil {
+				var sourceKey SourceKey
+				err := a.db.Where("id = ? AND source_id = ? AND status = ?", *binding.SourceKeyID, source.ID, APIKeyStatusValid).First(&sourceKey).Error
+				if err != nil {
+					if errors.Is(err, gorm.ErrRecordNotFound) {
+						continue
+					}
+					return nil, err
+				}
+				target.SourceKey = &sourceKey
+			}
+			targets = append(targets, target)
 		}
-		targets = append(targets, target)
 	}
 	if len(targets) == 0 {
 		return nil, errors.New("no online source for model")
@@ -487,16 +494,13 @@ func (a *App) routeTargets(modelName string, protocol relayProtocol) ([]routeTar
 		if targets[i].Source.Priority != targets[j].Source.Priority {
 			return targets[i].Source.Priority < targets[j].Source.Priority
 		}
-		leftWeight := targets[i].Model.RoutingWeight
-		if leftWeight <= 0 {
-			leftWeight = 1
-		}
-		rightWeight := targets[j].Model.RoutingWeight
-		if rightWeight <= 0 {
-			rightWeight = 1
-		}
+		leftWeight := nonZeroInt(targets[i].Binding.RoutingWeight, 1)
+		rightWeight := nonZeroInt(targets[j].Binding.RoutingWeight, 1)
 		if leftWeight != rightWeight {
 			return leftWeight > rightWeight
+		}
+		if targets[i].Binding.ID != targets[j].Binding.ID {
+			return targets[i].Binding.ID < targets[j].Binding.ID
 		}
 		return targets[i].Model.ID < targets[j].Model.ID
 	})
@@ -599,6 +603,9 @@ func (a *App) recordUsage(c *gin.Context, user User, key APIKey, target routeTar
 	if target.Source.ID != 0 && latency > 0 {
 		_ = a.db.Model(&UpstreamSource{}).Where("id = ?", target.Source.ID).Updates(map[string]any{"latency_ms": int(latency), "status": target.Source.Status}).Error
 		_ = a.db.Model(&ModelConfig{}).Where("id = ?", target.Model.ID).Update("latency_ms", int(latency)).Error
+		if target.Binding.ID != 0 {
+			_ = a.db.Model(&ModelRouteBinding{}).Where("id = ?", target.Binding.ID).Update("latency_ms", int(latency)).Error
+		}
 	}
 	if target.SourceKey != nil && target.SourceKey.ID != 0 {
 		_ = a.db.Model(&SourceKey{}).Where("id = ?", target.SourceKey.ID).Update("last_used_at", now).Error
@@ -647,6 +654,9 @@ func requestAttemptRow(requestID string, index int, target routeTarget, protocol
 
 func sourceKeyIDFromTarget(target routeTarget) uint {
 	if target.SourceKey == nil {
+		return sourceKeyIDValueFromBinding(target.Binding)
+	}
+	if target.SourceKey.ID == 0 {
 		return 0
 	}
 	return target.SourceKey.ID
@@ -819,10 +829,10 @@ func extractGeminiUsage(raw map[string]any) usageTokens {
 	}
 	cacheRead := int64(numberAny(raw["cachedContentTokenCount"]))
 	return usageTokens{
-		Prompt:    prompt,
+		Prompt:     prompt,
 		Completion: completion,
-		CacheRead: cacheRead,
-		Total:     total,
+		CacheRead:  cacheRead,
+		Total:      total,
 	}
 }
 

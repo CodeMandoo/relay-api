@@ -21,6 +21,9 @@ func (a *App) bootstrap() error {
 			return err
 		}
 	}
+	if err := migrateModelRouteBindings(a.db); err != nil {
+		return err
+	}
 	if err := a.normalizeSourceBaseURLs(); err != nil {
 		return err
 	}

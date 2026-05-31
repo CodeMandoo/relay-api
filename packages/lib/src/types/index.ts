@@ -144,6 +144,14 @@ export interface PlatformModel {
   routingEnabled: boolean;
   candidateCount?: number;
   routingCandidates?: ModelRouteCandidate[];
+  bindings?: ModelBindingInput[];
+}
+
+export interface ModelBindingInput {
+  id?: string;
+  sourceId: string;
+  sourceKeyId?: string;
+  routingWeight: number;
 }
 
 export interface ModelRouteCandidate {
@@ -328,5 +336,9 @@ export interface UsageDetailRow {
   requests: number;
   promptTokens: number;
   completionTokens: number;
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
+  reasoningTokens?: number;
+  totalTokens?: number;
   estimatedCost: number;
 }

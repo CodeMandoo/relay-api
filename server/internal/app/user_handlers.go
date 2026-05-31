@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"time"
 
@@ -74,7 +75,12 @@ func (a *App) userModels(c *gin.Context) {
 	}
 	candidateCounts := map[string]int{}
 	for _, model := range models {
-		candidateCounts[model.Name]++
+		bindings, err := a.modelBindings(model)
+		if err != nil || len(bindings) == 0 {
+			candidateCounts[model.Name]++
+			continue
+		}
+		candidateCounts[model.Name] += len(bindings)
 	}
 	sourceMap := map[uint]UpstreamSource{}
 	var sources []UpstreamSource
@@ -82,10 +88,30 @@ func (a *App) userModels(c *gin.Context) {
 	for _, source := range sources {
 		sourceMap[source.ID] = source
 	}
+	sourceKeyMap := map[uint]SourceKey{}
+	sourceKeyIDs := make([]uint, 0)
+	for _, model := range models {
+		if model.SourceKeyID != nil {
+			sourceKeyIDs = append(sourceKeyIDs, *model.SourceKeyID)
+		}
+	}
+	if len(sourceKeyIDs) > 0 {
+		var sourceKeys []SourceKey
+		a.db.Where("id IN ?", sourceKeyIDs).Find(&sourceKeys)
+		for _, key := range sourceKeys {
+			sourceKeyMap[key.ID] = key
+		}
+	}
+	models = currentUserModels(models, sourceMap, sourceKeyMap, time.Now())
 	settings, _ := a.getSettings()
 	out := make([]gin.H, 0, len(models))
 	for _, model := range models {
 		source := sourceMap[model.SourceID]
+		latency := model.LatencyMS
+		if targets, err := a.routeTargets(model.Name, modelTestProtocol(model)); err == nil && len(targets) > 0 {
+			source = targets[0].Source
+			latency = nonZeroInt(targets[0].Binding.LatencyMS, targets[0].Model.LatencyMS)
+		}
 		sourceName := source.Name
 		if settings.HideUpstreamNameFromUsers {
 			sourceName = "平台中转源"
@@ -100,8 +126,8 @@ func (a *App) userModels(c *gin.Context) {
 			"provider":          model.Provider,
 			"formats":           modelFormatList(model),
 			"status":            status,
-			"latencyMs":         model.LatencyMS,
-			"sourceId":          id("s", model.SourceID),
+			"latencyMs":         latency,
+			"sourceId":          id("s", source.ID),
 			"source":            sourceName,
 			"sourceName":        sourceName,
 			"sourceType":        source.Type,
@@ -110,6 +136,65 @@ func (a *App) userModels(c *gin.Context) {
 		})
 	}
 	c.JSON(http.StatusOK, gin.H{"data": out})
+}
+
+func currentUserModels(models []ModelConfig, sources map[uint]UpstreamSource, sourceKeys map[uint]SourceKey, now time.Time) []ModelConfig {
+	groups := map[string][]ModelConfig{}
+	names := make([]string, 0)
+	for _, model := range models {
+		if _, ok := groups[model.Name]; !ok {
+			names = append(names, model.Name)
+		}
+		groups[model.Name] = append(groups[model.Name], model)
+	}
+	sort.Strings(names)
+	out := make([]ModelConfig, 0, len(names))
+	for _, name := range names {
+		group := groups[name]
+		sort.SliceStable(group, func(i, j int) bool {
+			leftUsable := userModelSchedulable(group[i], sources, sourceKeys, now)
+			rightUsable := userModelSchedulable(group[j], sources, sourceKeys, now)
+			if leftUsable != rightUsable {
+				return leftUsable
+			}
+			leftSource := sources[group[i].SourceID]
+			rightSource := sources[group[j].SourceID]
+			if leftSource.Priority != rightSource.Priority {
+				return leftSource.Priority < rightSource.Priority
+			}
+			leftWeight := group[i].RoutingWeight
+			if leftWeight <= 0 {
+				leftWeight = 1
+			}
+			rightWeight := group[j].RoutingWeight
+			if rightWeight <= 0 {
+				rightWeight = 1
+			}
+			if leftWeight != rightWeight {
+				return leftWeight > rightWeight
+			}
+			return group[i].ID < group[j].ID
+		})
+		if len(group) > 0 {
+			out = append(out, group[0])
+		}
+	}
+	return out
+}
+
+func userModelSchedulable(model ModelConfig, sources map[uint]UpstreamSource, sourceKeys map[uint]SourceKey, now time.Time) bool {
+	source, ok := sources[model.SourceID]
+	if !ok || source.Status != SourceStatusOnline {
+		return false
+	}
+	if source.CooldownUntil != nil && source.CooldownUntil.After(now) {
+		return false
+	}
+	if model.SourceKeyID == nil {
+		return true
+	}
+	key, ok := sourceKeys[*model.SourceKeyID]
+	return ok && key.SourceID == model.SourceID && key.Status == APIKeyStatusValid
 }
 
 func (a *App) userTestModel(c *gin.Context) {
@@ -220,25 +305,12 @@ func (a *App) userModelTestTarget(c *gin.Context, modelID uint) (routeTarget, bo
 		errorJSON(c, http.StatusNotFound, "model not found")
 		return routeTarget{}, false
 	}
-	var source UpstreamSource
-	if err := a.db.First(&source, model.SourceID).Error; err != nil {
-		errorJSON(c, http.StatusNotFound, "source not found")
-		return routeTarget{}, false
-	}
-	if source.Status != SourceStatusOnline {
+	targets, err := a.routeTargets(model.Name, modelTestProtocol(model))
+	if err != nil || len(targets) == 0 {
 		errorJSON(c, http.StatusBadGateway, "source is not online")
 		return routeTarget{}, false
 	}
-	target := routeTarget{Model: model, Source: source}
-	if model.SourceKeyID != nil {
-		var sourceKey SourceKey
-		if err := a.db.Where("id = ? AND source_id = ? AND status = ?", *model.SourceKeyID, source.ID, APIKeyStatusValid).First(&sourceKey).Error; err != nil {
-			errorJSON(c, http.StatusBadGateway, "source key is unavailable")
-			return routeTarget{}, false
-		}
-		target.SourceKey = &sourceKey
-	}
-	return target, true
+	return targets[0], true
 }
 
 func modelTestProtocol(model ModelConfig) relayProtocol {
@@ -478,20 +550,39 @@ func (a *App) usageRows(userID uint, rawRange string, apiKeyRaw string) []gin.H 
 		if apiKeyID > 0 {
 			q = q.Where("api_key_id = ?", apiKeyID)
 		}
-		var requests int64
-		var prompt int64
-		var completion int64
-		var cost float64
-		q.Count(&requests)
-		q.Select("COALESCE(sum(prompt_tokens), 0)").Scan(&prompt)
-		q.Select("COALESCE(sum(completion_tokens), 0)").Scan(&completion)
-		q.Select("COALESCE(sum(estimated_cost), 0)").Scan(&cost)
+		var usage struct {
+			Requests         int64
+			PromptTokens     int64
+			CompletionTokens int64
+			CacheReadTokens  int64
+			CacheWriteTokens int64
+			ReasoningTokens  int64
+			TotalTokens      int64
+			EstimatedCost    float64
+		}
+		q.Select(`
+			count(*) as requests,
+			COALESCE(sum(prompt_tokens), 0) as prompt_tokens,
+			COALESCE(sum(completion_tokens), 0) as completion_tokens,
+			COALESCE(sum(cache_read_tokens), 0) as cache_read_tokens,
+			COALESCE(sum(cache_write_tokens), 0) as cache_write_tokens,
+			COALESCE(sum(reasoning_tokens), 0) as reasoning_tokens,
+			COALESCE(sum(total_tokens), 0) as total_tokens,
+			COALESCE(sum(estimated_cost), 0) as estimated_cost
+		`).Scan(&usage)
+		if usage.TotalTokens == 0 {
+			usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens
+		}
 		rows = append(rows, gin.H{
 			"date":             day.Format("2006-01-02"),
-			"requests":         requests,
-			"promptTokens":     prompt,
-			"completionTokens": completion,
-			"estimatedCost":    round2(cost),
+			"requests":         usage.Requests,
+			"promptTokens":     usage.PromptTokens,
+			"completionTokens": usage.CompletionTokens,
+			"cacheReadTokens":  usage.CacheReadTokens,
+			"cacheWriteTokens": usage.CacheWriteTokens,
+			"reasoningTokens":  usage.ReasoningTokens,
+			"totalTokens":      usage.TotalTokens,
+			"estimatedCost":    round2(usage.EstimatedCost),
 		})
 	}
 	return rows

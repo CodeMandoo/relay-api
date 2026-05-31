@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -918,6 +919,10 @@ func (a *App) adminDeleteSourceKey(c *gin.Context) {
 		errorJSON(c, http.StatusBadRequest, "clear model key bindings failed")
 		return
 	}
+	if err := a.db.Model(&ModelRouteBinding{}).Where("source_key_id = ?", key.ID).Update("source_key_id", gorm.Expr("NULL")).Error; err != nil {
+		errorJSON(c, http.StatusBadRequest, "clear model route key bindings failed")
+		return
+	}
 	if err := a.db.Delete(&key).Error; err != nil {
 		errorJSON(c, http.StatusBadRequest, "delete source key failed")
 		return
@@ -950,57 +955,54 @@ func (a *App) adminModels(c *gin.Context) {
 
 func (a *App) adminCreateModel(c *gin.Context) {
 	var req struct {
-		Name               string   `json:"name"`
-		SourceID           string   `json:"sourceId"`
-		SourceKeyID        string   `json:"sourceKeyId"`
-		Provider           string   `json:"provider"`
-		Formats            []string `json:"formats"`
-		InputPrice         float64  `json:"inputPrice"`
-		OutputPrice        float64  `json:"outputPrice"`
-		CacheWritePrice    float64  `json:"cacheWritePrice"`
-		CacheReadPrice     float64  `json:"cacheReadPrice"`
-		InputMultiple      float64  `json:"inputMultiple"`
-		OutputMultiple     float64  `json:"outputMultiple"`
-		CacheWriteMultiple float64  `json:"cacheWriteMultiple"`
-		CacheReadMultiple  float64  `json:"cacheReadMultiple"`
-		BillingInput       float64  `json:"billingInput"`
-		BillingOutput      float64  `json:"billingOutput"`
-		Enabled            *bool    `json:"enabled"`
-		RoutingWeight      int      `json:"routingWeight"`
-		RoutingEnabled     *bool    `json:"routingEnabled"`
+		Name               string                `json:"name"`
+		SourceID           string                `json:"sourceId"`
+		SourceKeyID        string                `json:"sourceKeyId"`
+		Provider           string                `json:"provider"`
+		Formats            []string              `json:"formats"`
+		InputPrice         float64               `json:"inputPrice"`
+		OutputPrice        float64               `json:"outputPrice"`
+		CacheWritePrice    float64               `json:"cacheWritePrice"`
+		CacheReadPrice     float64               `json:"cacheReadPrice"`
+		InputMultiple      float64               `json:"inputMultiple"`
+		OutputMultiple     float64               `json:"outputMultiple"`
+		CacheWriteMultiple float64               `json:"cacheWriteMultiple"`
+		CacheReadMultiple  float64               `json:"cacheReadMultiple"`
+		BillingInput       float64               `json:"billingInput"`
+		BillingOutput      float64               `json:"billingOutput"`
+		Enabled            *bool                 `json:"enabled"`
+		RoutingWeight      int                   `json:"routingWeight"`
+		RoutingEnabled     *bool                 `json:"routingEnabled"`
+		Bindings           []modelBindingRequest `json:"bindings"`
 	}
 	if !bindJSON(c, &req) {
-		return
-	}
-	sourceID, err := parseNumericID(req.SourceID)
-	if err != nil {
-		errorJSON(c, http.StatusBadRequest, "sourceId is required")
-		return
-	}
-	if _, err := a.getSourceForModel(sourceID); err != nil {
-		errorJSON(c, http.StatusBadRequest, err.Error())
-		return
-	}
-	sourceKeyID, err := a.resolveSourceKeyID(sourceID, req.SourceKeyID)
-	if err != nil {
-		errorJSON(c, http.StatusBadRequest, err.Error())
 		return
 	}
 	if strings.TrimSpace(req.Name) == "" {
 		errorJSON(c, http.StatusBadRequest, "model name is required")
 		return
 	}
+	bindings := normalizeBindingRequests(req.Bindings, modelBindingRequest{
+		SourceID:       req.SourceID,
+		SourceKeyID:    req.SourceKeyID,
+		RoutingWeight:  req.RoutingWeight,
+		RoutingEnabled: req.RoutingEnabled,
+	})
+	parsedBindings, err := a.validateModelBindingRequests(bindings)
+	if err != nil {
+		errorJSON(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	firstBinding := parsedBindings[0]
+	firstSourceID, _ := parseNumericID(firstBinding.SourceID)
+	firstSourceKeyID, _ := a.resolveSourceKeyID(firstSourceID, firstBinding.SourceKeyID)
+	firstRoutingEnabled := true
+	if firstBinding.RoutingEnabled != nil {
+		firstRoutingEnabled = *firstBinding.RoutingEnabled
+	}
 	status := ModelStatusActive
 	if req.Enabled != nil && !*req.Enabled {
 		status = ModelStatusDisabled
-	}
-	routingWeight := req.RoutingWeight
-	if routingWeight <= 0 {
-		routingWeight = 1
-	}
-	routingEnabled := true
-	if req.RoutingEnabled != nil {
-		routingEnabled = *req.RoutingEnabled
 	}
 	inputPrice := nonZeroFloat(req.InputPrice, req.BillingInput)
 	outputPrice := nonZeroFloat(req.OutputPrice, req.BillingOutput)
@@ -1009,8 +1011,8 @@ func (a *App) adminCreateModel(c *gin.Context) {
 	cacheWriteMultiple := nonZeroFloat(req.CacheWriteMultiple, 1)
 	cacheReadMultiple := nonZeroFloat(req.CacheReadMultiple, 1)
 	model := ModelConfig{
-		SourceID:           sourceID,
-		SourceKeyID:        sourceKeyID,
+		SourceID:           firstSourceID,
+		SourceKeyID:        firstSourceKeyID,
 		Name:               strings.TrimSpace(req.Name),
 		DisplayName:        strings.TrimSpace(req.Name),
 		Provider:           strings.TrimSpace(req.Provider),
@@ -1028,8 +1030,8 @@ func (a *App) adminCreateModel(c *gin.Context) {
 		BillingCacheWrite:  finalBillingPrice(req.CacheWritePrice, cacheWriteMultiple),
 		BillingCacheRead:   finalBillingPrice(req.CacheReadPrice, cacheReadMultiple),
 		Status:             status,
-		RoutingWeight:      routingWeight,
-		RoutingEnabled:     routingEnabled,
+		RoutingWeight:      firstBinding.RoutingWeight,
+		RoutingEnabled:     firstRoutingEnabled,
 	}
 	if model.Provider == "" {
 		model.Provider = "OpenAI"
@@ -1037,6 +1039,10 @@ func (a *App) adminCreateModel(c *gin.Context) {
 	}
 	if err := a.db.Create(&model).Error; err != nil {
 		errorJSON(c, http.StatusBadRequest, "create model failed")
+		return
+	}
+	if err := a.replaceModelBindings(model.ID, parsedBindings); err != nil {
+		errorJSON(c, http.StatusBadRequest, "create model bindings failed")
 		return
 	}
 	c.JSON(http.StatusCreated, gin.H{"data": a.modelDTOWithRouting(model)})
@@ -1056,6 +1062,16 @@ func (a *App) adminUpdateModel(c *gin.Context) {
 	if err := a.db.First(&existing, modelID).Error; err != nil {
 		errorJSON(c, http.StatusNotFound, "model not found")
 		return
+	}
+	bindingRequests, hasBindingRequests := parseBindingRequests(req["bindings"])
+	var parsedBindings []modelBindingRequest
+	if hasBindingRequests {
+		var err error
+		parsedBindings, err = a.validateModelBindingRequests(bindingRequests)
+		if err != nil {
+			errorJSON(c, http.StatusBadRequest, err.Error())
+			return
+		}
 	}
 	updates := map[string]any{}
 	for _, key := range []string{"name", "provider"} {
@@ -1129,17 +1145,50 @@ func (a *App) adminUpdateModel(c *gin.Context) {
 		updates["routing_weight"] = weight
 	}
 	if len(updates) == 0 {
-		errorJSON(c, http.StatusBadRequest, "no fields to update")
-		return
-	}
-	if err := a.db.Model(&ModelConfig{}).Where("id = ?", modelID).Updates(updates).Error; err != nil {
-		errorJSON(c, http.StatusBadRequest, "update model failed")
-		return
+		if !hasBindingRequests {
+			errorJSON(c, http.StatusBadRequest, "no fields to update")
+			return
+		}
+	} else {
+		if err := a.db.Model(&ModelConfig{}).Where("id = ?", modelID).Updates(updates).Error; err != nil {
+			errorJSON(c, http.StatusBadRequest, "update model failed")
+			return
+		}
 	}
 	var model ModelConfig
 	if err := a.db.First(&model, modelID).Error; err != nil {
 		errorJSON(c, http.StatusNotFound, "model not found")
 		return
+	}
+	if hasBindingRequests {
+		if err := a.replaceModelBindings(model.ID, parsedBindings); err != nil {
+			errorJSON(c, http.StatusBadRequest, "update model bindings failed")
+			return
+		}
+		if err := a.syncModelLegacyBindingFields(model.ID, parsedBindings[0]); err != nil {
+			errorJSON(c, http.StatusBadRequest, "update model binding mirror failed")
+			return
+		}
+		if err := a.db.First(&model, modelID).Error; err != nil {
+			errorJSON(c, http.StatusNotFound, "model not found")
+			return
+		}
+	} else if sourceChanged || req["sourceKeyId"] != nil || req["routingWeight"] != nil || req["routingEnabled"] != nil {
+		fallback := modelBindingRequest{
+			SourceID:       id("s", model.SourceID),
+			SourceKeyID:    optionalPublicID("sk", sourceKeyIDValue(model.SourceKeyID)),
+			RoutingWeight:  nonZeroInt(model.RoutingWeight, 1),
+			RoutingEnabled: &model.RoutingEnabled,
+		}
+		parsed, err := a.validateModelBindingRequests([]modelBindingRequest{fallback})
+		if err != nil {
+			errorJSON(c, http.StatusBadRequest, err.Error())
+			return
+		}
+		if err := a.replaceModelBindings(model.ID, parsed); err != nil {
+			errorJSON(c, http.StatusBadRequest, "update model bindings failed")
+			return
+		}
 	}
 	c.JSON(http.StatusOK, gin.H{"data": a.modelDTOWithRouting(model)})
 }
@@ -1238,6 +1287,7 @@ func (a *App) adminDeleteModel(c *gin.Context) {
 		errorJSON(c, http.StatusBadRequest, "delete model failed")
 		return
 	}
+	_ = a.db.Where("model_id = ?", modelID).Delete(&ModelRouteBinding{}).Error
 	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
@@ -1264,6 +1314,7 @@ func (a *App) adminBatchModels(c *gin.Context) {
 	case "disable":
 		a.db.Model(&ModelConfig{}).Where("id IN ?", ids).Update("status", ModelStatusDisabled)
 	case "delete":
+		a.db.Where("model_id IN ?", ids).Delete(&ModelRouteBinding{})
 		a.db.Delete(&ModelConfig{}, ids)
 	default:
 		errorJSON(c, http.StatusBadRequest, "unsupported action")
@@ -1772,8 +1823,27 @@ func (a *App) modelRouteCandidates(name string, sources map[uint]UpstreamSource,
 func (a *App) modelRouteCandidatesByName(models []ModelConfig, sources map[uint]UpstreamSource, sourceKeys map[uint]string) map[string][]ModelRouteCandidateDTO {
 	out := map[string][]ModelRouteCandidateDTO{}
 	for _, model := range models {
-		source := sources[model.SourceID]
-		out[model.Name] = append(out[model.Name], modelRouteCandidateDTO(model, source, sourceKeys[sourceKeyIDValue(model.SourceKeyID)]))
+		bindings, err := a.modelBindings(model)
+		if err != nil {
+			continue
+		}
+		for _, binding := range bindings {
+			source := sources[binding.SourceID]
+			out[model.Name] = append(out[model.Name], modelRouteCandidateDTOFromBinding(model, binding, source, sourceKeys[sourceKeyIDValueFromBinding(binding)]))
+		}
+	}
+	for name := range out {
+		sort.SliceStable(out[name], func(i, j int) bool {
+			left := out[name][i]
+			right := out[name][j]
+			if left.SourcePriority != right.SourcePriority {
+				return left.SourcePriority < right.SourcePriority
+			}
+			if left.RoutingWeight != right.RoutingWeight {
+				return left.RoutingWeight > right.RoutingWeight
+			}
+			return publicIDNumber(left.ID) < publicIDNumber(right.ID)
+		})
 	}
 	return out
 }

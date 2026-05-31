@@ -219,14 +219,12 @@ func TestAdminDashboardReturnsComputedComparisons(t *testing.T) {
 	user := loadTestUser(t, app)
 	key := createStoredAPIKey(t, app, user.ID, "dashboard-key")
 	now := time.Now()
-	today := time.Date(now.Year(), now.Month(), now.Day(), 9, 0, 0, 0, now.Location())
-	yesterday := today.AddDate(0, 0, -1)
-	currentMonth := monthStart(now).Add(2 * time.Hour)
-	lastMonthSameWindow := monthStart(now).AddDate(0, -1, 0).Add(2 * time.Hour)
+	today := now
+	yesterday := now.AddDate(0, 0, -1)
+	lastMonthSameWindow := monthStart(now).AddDate(0, -1, 0)
 
-	createUsageLog(t, app, UsageLog{UserID: user.ID, APIKeyID: key.ID, Model: "dashboard-model", TotalTokens: 100, CreatedAt: today})
+	createUsageLog(t, app, UsageLog{UserID: user.ID, APIKeyID: key.ID, Model: "dashboard-model", TotalTokens: 100, EstimatedCost: 4, CreatedAt: today})
 	createUsageLog(t, app, UsageLog{UserID: user.ID, APIKeyID: key.ID, Model: "dashboard-model", TotalTokens: 100, CreatedAt: yesterday})
-	createUsageLog(t, app, UsageLog{UserID: user.ID, APIKeyID: key.ID, Model: "dashboard-month", TotalTokens: 100, EstimatedCost: 4, CreatedAt: currentMonth})
 	createUsageLog(t, app, UsageLog{UserID: user.ID, APIKeyID: key.ID, Model: "dashboard-month", TotalTokens: 100, EstimatedCost: 2, CreatedAt: lastMonthSameWindow})
 
 	adminToken := loginToken(t, app, testAdminEmail, testAdminPassword, RoleAdmin)
@@ -251,8 +249,8 @@ func TestAdminUsageStatsRangeFiltersTotalsAndAggregates(t *testing.T) {
 	user := loadTestUser(t, app)
 	key := createStoredAPIKey(t, app, user.ID, "usage-key")
 	now := time.Now()
-	today := time.Date(now.Year(), now.Month(), now.Day(), 10, 0, 0, 0, now.Location())
-	lastWeek := today.AddDate(0, 0, -8)
+	today := now
+	lastWeek := now.AddDate(0, 0, -8)
 
 	createUsageLog(t, app, UsageLog{UserID: user.ID, APIKeyID: key.ID, Model: "today-model", PromptTokens: 40, CompletionTokens: 60, TotalTokens: 100, EstimatedCost: 1.25, CreatedAt: today})
 	createUsageLog(t, app, UsageLog{UserID: user.ID, APIKeyID: key.ID, Model: "old-model", PromptTokens: 400, CompletionTokens: 500, TotalTokens: 900, EstimatedCost: 9.5, CreatedAt: lastWeek})
@@ -288,9 +286,9 @@ func TestUserUsageStatsAPIKeyFilterAffectsTotals(t *testing.T) {
 	keyA := createStoredAPIKey(t, app, user.ID, "key-a")
 	keyB := createStoredAPIKey(t, app, user.ID, "key-b")
 	now := time.Now()
-	today := time.Date(now.Year(), now.Month(), now.Day(), 11, 0, 0, 0, now.Location())
+	today := now
 
-	createUsageLog(t, app, UsageLog{UserID: user.ID, APIKeyID: keyA.ID, Model: "key-a-model", PromptTokens: 10, CompletionTokens: 15, TotalTokens: 25, EstimatedCost: 0.25, CreatedAt: today})
+	createUsageLog(t, app, UsageLog{UserID: user.ID, APIKeyID: keyA.ID, Model: "key-a-model", PromptTokens: 10, CompletionTokens: 15, CacheReadTokens: 4, CacheWriteTokens: 2, ReasoningTokens: 6, TotalTokens: 25, EstimatedCost: 0.25, CreatedAt: today})
 	createUsageLog(t, app, UsageLog{UserID: user.ID, APIKeyID: keyB.ID, Model: "key-b-model", PromptTokens: 20, CompletionTokens: 30, TotalTokens: 50, EstimatedCost: 0.5, CreatedAt: today})
 
 	userToken := loginToken(t, app, testUserEmail, testUserPassword, RoleUser)
@@ -306,6 +304,25 @@ func TestUserUsageStatsAPIKeyFilterAffectsTotals(t *testing.T) {
 	rows := payload["rows"].([]any)
 	if len(rows) != 1 || int64(rows[0].(map[string]any)["requests"].(float64)) != 1 {
 		t.Fatalf("expected one filtered day row with one request, got %v", rows)
+	}
+	row := rows[0].(map[string]any)
+	if got := int64(row["promptTokens"].(float64)); got != 10 {
+		t.Fatalf("promptTokens = %d, want 10", got)
+	}
+	if got := int64(row["completionTokens"].(float64)); got != 15 {
+		t.Fatalf("completionTokens = %d, want 15", got)
+	}
+	if got := int64(row["cacheReadTokens"].(float64)); got != 4 {
+		t.Fatalf("cacheReadTokens = %d, want 4", got)
+	}
+	if got := int64(row["cacheWriteTokens"].(float64)); got != 2 {
+		t.Fatalf("cacheWriteTokens = %d, want 2", got)
+	}
+	if got := int64(row["reasoningTokens"].(float64)); got != 6 {
+		t.Fatalf("reasoningTokens = %d, want 6", got)
+	}
+	if got := int64(row["totalTokens"].(float64)); got != 25 {
+		t.Fatalf("totalTokens = %d, want 25", got)
 	}
 }
 
@@ -384,14 +401,17 @@ func TestAdminModelsExposeRoutingCandidatesAndControls(t *testing.T) {
 	if err := app.db.Create(&models).Error; err != nil {
 		t.Fatalf("create routed models: %v", err)
 	}
+	if err := migrateModelRouteBindings(app.db); err != nil {
+		t.Fatalf("migrate routed models: %v", err)
+	}
 
 	w := performJSON(app, http.MethodGet, "/api/admin/models?q=routed-admin-model", adminToken, nil)
 	if w.Code != http.StatusOK {
 		t.Fatalf("admin models: %d %s", w.Code, w.Body.String())
 	}
 	rows := decodeBody(t, w)["data"].([]any)
-	if len(rows) != 2 {
-		t.Fatalf("expected two routed model rows, got %v", rows)
+	if len(rows) != 1 {
+		t.Fatalf("expected one logical routed model row, got %v", rows)
 	}
 	first := rows[0].(map[string]any)
 	if first["candidateCount"] != float64(2) {
@@ -416,6 +436,63 @@ func TestAdminModelsExposeRoutingCandidatesAndControls(t *testing.T) {
 	updated := decodeBody(t, update)["data"].(map[string]any)
 	if updated["routingEnabled"] != false || updated["routingWeight"] != float64(7) {
 		t.Fatalf("unexpected updated routing controls: %v", updated)
+	}
+}
+
+func TestModelBindingMigrationMergesLegacyDuplicateModels(t *testing.T) {
+	app := testApp(t)
+	sourceA := UpstreamSource{Name: "Legacy_Source_A", Type: SourceTypeThirdParty, BaseURL: "https://legacy-a.example.com/v1", APIKey: "a-key", Priority: 2, Status: SourceStatusOnline}
+	sourceB := UpstreamSource{Name: "Legacy_Source_B", Type: SourceTypeThirdParty, BaseURL: "https://legacy-b.example.com/v1", APIKey: "b-key", Priority: 1, Status: SourceStatusOnline}
+	if err := app.db.Create(&sourceA).Error; err != nil {
+		t.Fatalf("create source A: %v", err)
+	}
+	if err := app.db.Create(&sourceB).Error; err != nil {
+		t.Fatalf("create source B: %v", err)
+	}
+	models := []ModelConfig{
+		{SourceID: sourceA.ID, Name: "legacy-merged-model", DisplayName: "Legacy Merged Model", Provider: "OpenAI", Formats: ModelFormatOpenAI, Status: ModelStatusActive, RoutingWeight: 5},
+		{SourceID: sourceB.ID, Name: "legacy-merged-model", DisplayName: "Legacy Merged Model", Provider: "OpenAI", Formats: ModelFormatOpenAI, Status: ModelStatusActive, RoutingWeight: 20},
+		{SourceID: sourceA.ID, Name: "legacy-single-model", DisplayName: "Legacy Single Model", Provider: "OpenAI", Formats: ModelFormatOpenAI, Status: ModelStatusActive, RoutingWeight: 3},
+	}
+	if err := app.db.Create(&models).Error; err != nil {
+		t.Fatalf("create legacy models: %v", err)
+	}
+	if err := migrateModelRouteBindings(app.db); err != nil {
+		t.Fatalf("migrate model bindings: %v", err)
+	}
+
+	var mergedCount int64
+	if err := app.db.Model(&ModelConfig{}).Where("name = ?", "legacy-merged-model").Count(&mergedCount).Error; err != nil {
+		t.Fatalf("count merged models: %v", err)
+	}
+	if mergedCount != 1 {
+		t.Fatalf("legacy-merged-model count = %d, want 1", mergedCount)
+	}
+	var merged ModelConfig
+	if err := app.db.Where("name = ?", "legacy-merged-model").First(&merged).Error; err != nil {
+		t.Fatalf("load merged model: %v", err)
+	}
+	var bindings []ModelRouteBinding
+	if err := app.db.Where("model_id = ?", merged.ID).Order("routing_weight desc").Find(&bindings).Error; err != nil {
+		t.Fatalf("load bindings: %v", err)
+	}
+	if len(bindings) != 2 {
+		t.Fatalf("binding count = %d, want 2", len(bindings))
+	}
+	if bindings[0].SourceID != sourceB.ID || bindings[0].RoutingWeight != 20 {
+		t.Fatalf("expected source B to keep higher route weight, got %+v", bindings[0])
+	}
+
+	var single ModelConfig
+	if err := app.db.Where("name = ?", "legacy-single-model").First(&single).Error; err != nil {
+		t.Fatalf("load single model: %v", err)
+	}
+	var singleBindings int64
+	if err := app.db.Model(&ModelRouteBinding{}).Where("model_id = ?", single.ID).Count(&singleBindings).Error; err != nil {
+		t.Fatalf("count single bindings: %v", err)
+	}
+	if singleBindings != 1 {
+		t.Fatalf("single binding count = %d, want 1", singleBindings)
 	}
 }
 
@@ -482,10 +559,10 @@ func TestUserModelsHideUpstreamNameWhenConfigured(t *testing.T) {
 	t.Fatalf("private-source-model not found in %v", rows)
 }
 
-func TestUserModelsExposeSourceMetadataAndCandidateCount(t *testing.T) {
+func TestUserModelsExposeCurrentScheduledModelAndCandidateCount(t *testing.T) {
 	app := testApp(t)
-	sourceA := UpstreamSource{Name: "OpenRouter_A", Type: SourceTypeThirdParty, BaseURL: "https://a.example.com/v1", APIKey: "a-key", Priority: 1, Status: SourceStatusOnline}
-	sourceB := UpstreamSource{Name: "OpenRouter_B", Type: SourceTypeThirdParty, BaseURL: "https://b.example.com/v1", APIKey: "b-key", Priority: 2, Status: SourceStatusOnline}
+	sourceA := UpstreamSource{Name: "OpenRouter_A", Type: SourceTypeThirdParty, BaseURL: "https://a.example.com/v1", APIKey: "a-key", Priority: 2, Status: SourceStatusOnline}
+	sourceB := UpstreamSource{Name: "OpenRouter_B", Type: SourceTypeThirdParty, BaseURL: "https://b.example.com/v1", APIKey: "b-key", Priority: 1, Status: SourceStatusOnline}
 	if err := app.db.Create(&sourceA).Error; err != nil {
 		t.Fatalf("create source A: %v", err)
 	}
@@ -493,8 +570,8 @@ func TestUserModelsExposeSourceMetadataAndCandidateCount(t *testing.T) {
 		t.Fatalf("create source B: %v", err)
 	}
 	models := []ModelConfig{
-		{SourceID: sourceA.ID, Name: "shared-openai-model", DisplayName: "Shared OpenAI Model", Provider: "OpenAI", Formats: ModelFormatOpenAI, Status: ModelStatusActive},
-		{SourceID: sourceB.ID, Name: "shared-openai-model", DisplayName: "Shared OpenAI Model", Provider: "OpenAI", Formats: ModelFormatOpenAI, Status: ModelStatusActive},
+		{SourceID: sourceA.ID, Name: "shared-openai-model", DisplayName: "Shared OpenAI Model", Provider: "OpenAI", Formats: ModelFormatOpenAI, Status: ModelStatusActive, RoutingWeight: 100},
+		{SourceID: sourceB.ID, Name: "shared-openai-model", DisplayName: "Shared OpenAI Model", Provider: "OpenAI", Formats: ModelFormatOpenAI, Status: ModelStatusActive, RoutingWeight: 1},
 	}
 	if err := app.db.Create(&models).Error; err != nil {
 		t.Fatalf("create models: %v", err)
@@ -507,21 +584,23 @@ func TestUserModelsExposeSourceMetadataAndCandidateCount(t *testing.T) {
 		t.Fatalf("user models: %d %s", w.Code, w.Body.String())
 	}
 	rows := decodeBody(t, w)["data"].([]any)
-	var found map[string]any
+	var found []map[string]any
 	for _, row := range rows {
 		item := row.(map[string]any)
-		if item["name"] == "shared-openai-model" && item["sourceName"] == "OpenRouter_A" {
-			found = item
-			break
+		if item["name"] == "shared-openai-model" {
+			found = append(found, item)
 		}
 	}
-	if found == nil {
-		t.Fatalf("expected model row with sourceName OpenRouter_A, got %v", rows)
+	if len(found) != 1 {
+		t.Fatalf("expected one deduplicated shared-openai-model row, got %v", found)
 	}
-	if found["sourceType"] != SourceTypeThirdParty || found["sourceStatus"] != SourceStatusOnline {
-		t.Fatalf("unexpected source metadata: %v", found)
+	if found[0]["sourceName"] != "OpenRouter_B" {
+		t.Fatalf("expected current scheduled source OpenRouter_B, got %v", found[0])
 	}
-	if got := int64(found["routingCandidates"].(float64)); got != 2 {
+	if found[0]["sourceType"] != SourceTypeThirdParty || found[0]["sourceStatus"] != SourceStatusOnline {
+		t.Fatalf("unexpected source metadata: %v", found[0])
+	}
+	if got := int64(found[0]["routingCandidates"].(float64)); got != 2 {
 		t.Fatalf("routingCandidates = %d, want 2", got)
 	}
 }
@@ -682,7 +761,7 @@ func TestUserCannotLoginThroughAdminEntry(t *testing.T) {
 
 func TestSourceAccountTokenUsageCollectsCLIProxyQueue(t *testing.T) {
 	usageQueueCalls := 0
-	usageTimestamp := time.Now().UTC().Format(time.RFC3339)
+	usageTimestamp := time.Now().Format(time.RFC3339)
 	cliProxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v0/management/usage-queue" {
 			http.NotFound(w, r)
@@ -1384,6 +1463,52 @@ func TestProxyFailoverRecordsSingleUsageAndAttempts(t *testing.T) {
 	}
 	if refreshed.FailureCount == 0 || refreshed.CooldownUntil == nil {
 		t.Fatalf("expected primary source failure and cooldown, got failure=%d cooldown=%v", refreshed.FailureCount, refreshed.CooldownUntil)
+	}
+}
+
+func TestProxyRoutesEnabledModelWhenRoutingFlagIsFalse(t *testing.T) {
+	var calls int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id":      "chatcmpl_enabled_routing_false",
+			"object":  "chat.completion",
+			"choices": []any{map[string]any{"message": map[string]any{"role": "assistant", "content": "ok"}}},
+			"usage":   map[string]any{"prompt_tokens": 2, "completion_tokens": 2, "total_tokens": 4},
+			"model":   "enabled-routing-false-model",
+		})
+	}))
+	defer upstream.Close()
+
+	app := testApp(t)
+	source := UpstreamSource{Name: "Enabled_Routing_False_Source", Type: SourceTypeThirdParty, BaseURL: upstream.URL + "/v1", APIKey: "upstream-key", Priority: 1, Status: SourceStatusOnline}
+	if err := app.db.Create(&source).Error; err != nil {
+		t.Fatalf("create source: %v", err)
+	}
+	model := ModelConfig{SourceID: source.ID, Name: "enabled-routing-false-model", DisplayName: "Enabled Routing False Model", Provider: "OpenAI", Formats: ModelFormatOpenAI, Status: ModelStatusActive, RoutingWeight: 1, RoutingEnabled: true}
+	if err := app.db.Create(&model).Error; err != nil {
+		t.Fatalf("create model: %v", err)
+	}
+	if err := app.db.Model(&ModelConfig{}).Where("id = ?", model.ID).Update("routing_enabled", false).Error; err != nil {
+		t.Fatalf("disable legacy routing flag: %v", err)
+	}
+
+	w := performJSON(app, http.MethodPost, "/v1/chat/completions", createRelayAPIKey(t, app), map[string]any{
+		"model":    "enabled-routing-false-model",
+		"messages": []any{map[string]any{"role": "user", "content": "hello"}},
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("proxy request: %d %s", w.Code, w.Body.String())
+	}
+	if calls != 1 {
+		t.Fatalf("expected upstream to be called once, got %d", calls)
+	}
+	var log UsageLog
+	if err := app.db.Where("model = ?", "enabled-routing-false-model").First(&log).Error; err != nil {
+		t.Fatalf("load usage log: %v", err)
+	}
+	if log.SourceID != source.ID || log.TotalTokens != 4 || log.Status != RequestStatusSuccess {
+		t.Fatalf("unexpected usage log: %+v", log)
 	}
 }
 

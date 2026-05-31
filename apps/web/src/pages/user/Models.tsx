@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Bot, Loader2, RotateCcw, Search, Zap, CheckCircle2 } from 'lucide-react';
+import { Bot, Copy, Loader2, RotateCcw, Search, Zap, CheckCircle2 } from 'lucide-react';
 import { toast } from 'sonner';
 import {
   Badge,
@@ -23,7 +23,7 @@ import {
   SelectValue,
   cn,
 } from '@relay-api/ui';
-import { MODEL_PROVIDERS } from '@relay-api/lib';
+import { MODEL_PROVIDERS, copyToClipboard } from '@relay-api/lib';
 import type { UserModel } from '@relay-api/lib';
 import { getErrorMessage, userApi } from '@/lib/api';
 import { PageHeader } from '@/components/common/PageHeader';
@@ -65,6 +65,15 @@ const modelFormats = (model: UserModel): UserModel['formats'] => {
   return model.provider === 'Anthropic' ? ['anthropic'] : ['openai'];
 };
 
+const dedupeUserModels = (rows: UserModel[]) => {
+  const seen = new Set<string>();
+  return rows.filter((model) => {
+    if (seen.has(model.name)) return false;
+    seen.add(model.name);
+    return true;
+  });
+};
+
 export default function Page() {
   const [provider, setProvider] = useState<ProviderFilter>('all');
   const [format, setFormat] = useState<FormatFilter>('all');
@@ -77,7 +86,7 @@ export default function Page() {
   useEffect(() => {
     userApi
       .models()
-      .then((response) => setModels(response.data))
+      .then((response) => setModels(dedupeUserModels(response.data)))
       .catch((error) => toast.error(getErrorMessage(error, '加载可用模型失败')));
   }, []);
 
@@ -89,8 +98,7 @@ export default function Page() {
         (
           m.name.toLowerCase().includes(query.toLowerCase()) ||
           m.provider.toLowerCase().includes(query.toLowerCase()) ||
-          modelFormats(m).some((item) => item.includes(query.toLowerCase())) ||
-          (m.sourceName ?? '').toLowerCase().includes(query.toLowerCase())
+          modelFormats(m).some((item) => item.includes(query.toLowerCase()))
         ),
     );
   }, [models, provider, format, query]);
@@ -215,7 +223,6 @@ export default function Page() {
               <TableHead className="w-[35%] py-4">模型节点</TableHead>
               <TableHead>模型厂商</TableHead>
               <TableHead>协议格式</TableHead>
-              <TableHead>上游 / 路由</TableHead>
               <TableHead>实时状态</TableHead>
               <TableHead>转发延迟 (Ping)</TableHead>
               <TableHead className="w-[180px] text-right pr-6">操作</TableHead>
@@ -224,7 +231,7 @@ export default function Page() {
           <TableBody>
             {filtered.length === 0 && (
               <TableRow>
-                <TableCell colSpan={7} className="h-32 text-center text-muted-foreground">
+                <TableCell colSpan={6} className="h-32 text-center text-muted-foreground">
                   未匹配到相关模型节点
                 </TableCell>
               </TableRow>
@@ -252,7 +259,23 @@ export default function Page() {
                         </div>
                       </div>
                       <div className="min-w-0">
-                        <div className="font-bold text-foreground truncate">{m.name}</div>
+                        <div className="flex min-w-0 items-center gap-1.5">
+                          <span className="truncate font-bold text-foreground">{m.name}</span>
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            size="icon"
+                            aria-label={`复制模型名称 ${m.name}`}
+                            title="复制模型名称"
+                            className="h-6 w-6 shrink-0 rounded-md text-muted-foreground opacity-70 transition-opacity hover:text-foreground group-hover:opacity-100"
+                            onClick={async () => {
+                              await copyToClipboard(m.name);
+                              toast.success('已复制模型名称', { description: m.name });
+                            }}
+                          >
+                            <Copy className="h-3.5 w-3.5" />
+                          </Button>
+                        </div>
                         <div className="text-[10px] font-mono text-muted-foreground/60 uppercase tracking-wider">
                           {m.id}
                         </div>
@@ -278,23 +301,6 @@ export default function Page() {
                           {item}
                         </Badge>
                       ))}
-                    </div>
-                  </TableCell>
-                  <TableCell>
-                    <div className="space-y-1">
-                      <div className="max-w-[180px] truncate text-sm font-medium">
-                        {m.sourceName ?? '平台中转源'}
-                      </div>
-                      <div className="flex flex-wrap items-center gap-1.5">
-                        <Badge variant="secondary" className="h-5 rounded-md px-1.5 py-0 text-[10px] font-bold">
-                          {m.sourceStatus === 'online' ? '上游在线' : '上游异常'}
-                        </Badge>
-                        {(m.routingCandidates ?? 1) > 1 && (
-                          <Badge variant="outline" className="h-5 rounded-md px-1.5 py-0 text-[10px] font-bold">
-                            多上游 {m.routingCandidates}
-                          </Badge>
-                        )}
-                      </div>
                     </div>
                   </TableCell>
                   <TableCell>

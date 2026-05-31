@@ -43,6 +43,9 @@ import {
   SelectValue,
   SelectContent,
   SelectItem,
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
   cn,
 } from '@relay-api/ui';
 import {
@@ -58,7 +61,7 @@ import {
   PowerOff,
   Cpu,
   Sparkles,
-  Network,
+  Info,
 } from 'lucide-react';
 import { MODEL_PROVIDERS, copyToClipboard } from '@relay-api/lib';
 import type { ModelFormat, PlatformModel, SourceKey, UpstreamSource } from '@relay-api/lib';
@@ -87,45 +90,129 @@ const defaultFormatsForProvider = (provider: Provider): ModelFormat[] => (provid
 const modelFormats = (model: PlatformModel): ModelFormat[] =>
   model.formats?.length ? model.formats : defaultFormatsForProvider(model.provider);
 
+type RouteCandidate = NonNullable<PlatformModel['routingCandidates']>[number];
+type ModelBindingDraft = {
+  clientId: string;
+  id?: string;
+  sourceId: string;
+  sourceKeyId: string;
+  routingWeight: number;
+};
+type ModelGroup = {
+  key: string;
+  name: string;
+  provider: Provider;
+  formats: ModelFormat[];
+  enabled: boolean;
+  ids: string[];
+  models: PlatformModel[];
+  candidates: RouteCandidate[];
+  currentCandidate?: RouteCandidate;
+};
+
+const publicIdNumber = (id: string) => Number(id.split('_').pop() ?? 0) || 0;
+
+const routeCandidateWeight = (candidate: RouteCandidate) => Math.max(1, candidate.routingWeight || 1);
+
+const isRouteCandidateSchedulable = (candidate: RouteCandidate) =>
+  candidate.modelEnabled && candidate.sourceStatus === 'online' && !candidate.coolingDown;
+
+const routeCandidateOrder = (left: RouteCandidate, right: RouteCandidate) => {
+  const leftSchedulable = isRouteCandidateSchedulable(left);
+  const rightSchedulable = isRouteCandidateSchedulable(right);
+  if (leftSchedulable !== rightSchedulable) return leftSchedulable ? -1 : 1;
+  if (left.sourcePriority !== right.sourcePriority) return left.sourcePriority - right.sourcePriority;
+  const weightDiff = routeCandidateWeight(right) - routeCandidateWeight(left);
+  if (weightDiff !== 0) return weightDiff;
+  return publicIdNumber(left.id) - publicIdNumber(right.id);
+};
+
+const sortedRouteCandidates = (model: PlatformModel) => [...(model.routingCandidates ?? [])].sort(routeCandidateOrder);
+
+const currentRouteCandidate = (model: PlatformModel) =>
+  sortedRouteCandidates(model).find(isRouteCandidateSchedulable);
+
 const routeCandidateTone = (candidate: NonNullable<PlatformModel['routingCandidates']>[number]): string => {
-  if (!candidate.modelEnabled || !candidate.routingEnabled) return 'text-muted-foreground';
+  if (!candidate.modelEnabled) return 'text-muted-foreground';
   if (candidate.coolingDown || candidate.sourceStatus === 'offline') return 'text-amber-600 dark:text-amber-400';
   if (candidate.sourceStatus === 'disabled') return 'text-destructive';
   return 'text-emerald-600 dark:text-emerald-400';
 };
 
+function RoutingRuleHint() {
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <button type="button" className="inline-flex h-5 w-5 items-center justify-center rounded-full text-muted-foreground hover:bg-muted hover:text-foreground">
+          <Info className="h-3.5 w-3.5" />
+        </button>
+      </TooltipTrigger>
+      <TooltipContent side="top" align="start" className="max-w-sm text-xs leading-relaxed">
+        启用状态即参与调度。先过滤未启用、上游非在线和冷却中候选；再按源优先级 P 从小到大，同 P 按权重 W 从大到小；失败、超时、429 或 5xx 时切到下一个候选。
+      </TooltipContent>
+    </Tooltip>
+  );
+}
+
+const makeBindingDraft = (sourceId = '', overrides: Partial<ModelBindingDraft> = {}): ModelBindingDraft => ({
+  clientId: `binding_${Date.now()}_${Math.random().toString(36).slice(2)}`,
+  sourceId,
+  sourceKeyId: 'default',
+  routingWeight: 1,
+  ...overrides,
+});
+
+const buildModelGroups = (models: PlatformModel[]): ModelGroup[] => {
+  const grouped = new Map<string, PlatformModel[]>();
+  for (const model of models) {
+    grouped.set(model.name, [...(grouped.get(model.name) ?? []), model]);
+  }
+  return Array.from(grouped.entries())
+    .map(([name, rows]) => {
+      const candidates = sortedRouteCandidates(rows[0]);
+      const currentCandidate = currentRouteCandidate(rows[0]);
+      const currentModel = rows.find((row) => row.id === currentCandidate?.id) ?? rows[0];
+      return {
+        key: name,
+        name,
+        provider: currentModel.provider,
+        formats: modelFormats(currentModel),
+        enabled: rows.some((row) => row.enabled),
+        ids: rows.map((row) => row.id),
+        models: rows,
+        candidates,
+        currentCandidate,
+      };
+    })
+    .sort((left, right) => left.name.localeCompare(right.name));
+};
+
 export default function Page() {
   const [models, setModels] = useState<PlatformModel[]>([]);
   const [sources, setSources] = useState<UpstreamSource[]>([]);
-  const [sourceKeys, setSourceKeys] = useState<SourceKey[]>([]);
+  const [sourceKeysBySource, setSourceKeysBySource] = useState<Record<string, SourceKey[]>>({});
+  const [sourceKeyLoadingBySource, setSourceKeyLoadingBySource] = useState<Record<string, boolean>>({});
   const [search, setSearch] = useState('');
   const [filter, setFilter] = useState<Filter>('all');
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [syncing, setSyncing] = useState(false);
-  const [sourceKeyLoading, setSourceKeyLoading] = useState(false);
   
   const [addOpen, setAddOpen] = useState(false);
   const [editOpen, setEditOpen] = useState(false);
-  const [editingModel, setEditingModel] = useState<PlatformModel | null>(null);
+  const [editingGroup, setEditingGroup] = useState<ModelGroup | null>(null);
 
   // Form state
   const [newName, setNewName] = useState('');
-  const [newSource, setNewSource] = useState('');
-  const [newSourceKey, setNewSourceKey] = useState('default');
   const [newProvider, setNewProvider] = useState<Provider>('OpenAI');
   const [newFormats, setNewFormats] = useState<ModelFormat[]>(['openai']);
-  const [newRoutingWeight, setNewRoutingWeight] = useState(1);
-  const [newRoutingEnabled, setNewRoutingEnabled] = useState(true);
+  const [newBindings, setNewBindings] = useState<ModelBindingDraft[]>([]);
 
   const reloadModels = () => {
     setSyncing(true);
-    Promise.all([adminApi.models(), adminApi.sources()])
+    return Promise.all([adminApi.models(), adminApi.sources()])
       .then(([modelResponse, sourceResponse]) => {
         setModels(modelResponse.data);
         setSources(sourceResponse.data);
-        if (!newSource && sourceResponse.data[0]) {
-          setNewSource(sourceResponse.data[0].id);
-        }
       })
       .catch((error) => toast.error(getErrorMessage(error, '加载模型配置失败')))
       .finally(() => setSyncing(false));
@@ -135,63 +222,57 @@ export default function Page() {
     reloadModels();
   }, []);
 
-  useEffect(() => {
-    if (!addOpen && !editOpen) return;
-    const source = sources.find((item) => item.id === newSource);
+  const ensureSourceKeys = (sourceId: string) => {
+    if (!sourceId || sourceKeysBySource[sourceId] || sourceKeyLoadingBySource[sourceId]) return;
+    const source = sources.find((item) => item.id === sourceId);
     if (!source || source.type === 'CLIProxyAPI') {
-      setSourceKeys([]);
-      setSourceKeyLoading(false);
-      setNewSourceKey('default');
+      setSourceKeysBySource((current) => ({ ...current, [sourceId]: [] }));
       return;
     }
-    let ignore = false;
-    setSourceKeyLoading(true);
+    setSourceKeyLoadingBySource((current) => ({ ...current, [sourceId]: true }));
     adminApi
-      .sourceKeys(source.id)
-      .then((response) => {
-        if (ignore) return;
-        setSourceKeys(response.data);
-        setNewSourceKey((current) =>
-          current !== 'default' && !response.data.some((key) => key.id === current) ? 'default' : current,
-        );
-      })
+      .sourceKeys(sourceId)
+      .then((response) => setSourceKeysBySource((current) => ({ ...current, [sourceId]: response.data })))
       .catch((error) => toast.error(getErrorMessage(error, '加载上游 Key 失败')))
-      .finally(() => {
-        if (!ignore) setSourceKeyLoading(false);
-      });
-    return () => {
-      ignore = true;
-    };
-  }, [addOpen, editOpen, newSource, sources]);
+      .finally(() => setSourceKeyLoadingBySource((current) => ({ ...current, [sourceId]: false })));
+  };
+
+  useEffect(() => {
+    if (!addOpen && !editOpen) return;
+    newBindings.forEach((binding) => ensureSourceKeys(binding.sourceId));
+  }, [addOpen, editOpen, newBindings, sources, sourceKeysBySource, sourceKeyLoadingBySource]);
+
+  const modelGroups = useMemo(() => buildModelGroups(models), [models]);
 
   const filtered = useMemo(() => {
-    return models.filter((m) => {
-      if (search && !m.name.toLowerCase().includes(search.toLowerCase())) return false;
-      if (filter === 'all') return true;
-      if (filter === 'disabled') return !m.enabled;
-      return m.provider === filter;
-    });
-  }, [models, search, filter]);
+    return modelGroups
+      .filter((m) => {
+        if (search && !m.name.toLowerCase().includes(search.toLowerCase())) return false;
+        if (filter === 'all') return true;
+        if (filter === 'disabled') return !m.enabled;
+        return m.provider === filter;
+      });
+  }, [modelGroups, search, filter]);
 
   const stats = useMemo(() => {
-    const enabled = models.filter((m) => m.enabled).length;
-    const disabled = models.length - enabled;
+    const enabled = modelGroups.filter((m) => m.enabled).length;
+    const disabled = modelGroups.length - enabled;
     const sources = new Set(models.map((m) => m.sourceName)).size;
-    return { total: models.length, enabled, disabled, sources };
-  }, [models]);
+    return { total: modelGroups.length, enabled, disabled, sources };
+  }, [models, modelGroups]);
 
-  const allChecked = filtered.length > 0 && filtered.every((m) => selected.has(m.id));
-  const someChecked = filtered.some((m) => selected.has(m.id)) && !allChecked;
+  const allChecked = filtered.length > 0 && filtered.every((m) => selected.has(m.key));
+  const someChecked = filtered.some((m) => selected.has(m.key)) && !allChecked;
   const hasSelection = selected.size > 0;
 
   const toggleAll = () => {
     if (allChecked) {
       const next = new Set(selected);
-      filtered.forEach((m) => next.delete(m.id));
+      filtered.forEach((m) => next.delete(m.key));
       setSelected(next);
     } else {
       const next = new Set(selected);
-      filtered.forEach((m) => next.add(m.id));
+      filtered.forEach((m) => next.add(m.key));
       setSelected(next);
     }
   };
@@ -212,20 +293,68 @@ export default function Page() {
     });
   };
 
+  const resetAddForm = () => {
+    const firstSource = sources[0]?.id ?? '';
+    setNewName('');
+    setNewProvider('OpenAI');
+    setNewFormats(['openai']);
+    setNewBindings([makeBindingDraft(firstSource)]);
+  };
+
+  const updateBinding = (clientId: string, patch: Partial<ModelBindingDraft>) => {
+    setNewBindings((current) =>
+      current.map((binding) =>
+        binding.clientId === clientId
+          ? { ...binding, ...patch, sourceKeyId: patch.sourceId && patch.sourceId !== binding.sourceId ? 'default' : patch.sourceKeyId ?? binding.sourceKeyId }
+          : binding,
+      ),
+    );
+  };
+
+  const addBinding = () => {
+    const used = new Set(newBindings.map((binding) => binding.sourceId));
+    const sourceId = sources.find((source) => !used.has(source.id))?.id ?? sources[0]?.id ?? '';
+    setNewBindings((current) => [...current, makeBindingDraft(sourceId)]);
+  };
+
+  const removeBinding = (clientId: string) => {
+    setNewBindings((current) => (current.length > 1 ? current.filter((binding) => binding.clientId !== clientId) : current));
+  };
+
+  const validateBindings = () => {
+    const validBindings = newBindings.filter((binding) => binding.sourceId);
+    if (validBindings.length === 0) {
+      toast.error('请至少选择一个上游源');
+      return [];
+    }
+    const seen = new Set<string>();
+    for (const binding of validBindings) {
+      if (seen.has(binding.sourceId)) {
+        toast.error('同一个模型下不能重复选择同一个上游源');
+        return [];
+      }
+      seen.add(binding.sourceId);
+    }
+    return validBindings;
+  };
+
+  const selectedModelIds = () =>
+    modelGroups.filter((group) => selected.has(group.key)).flatMap((group) => group.ids);
+
   const runBatch = async (action: 'enable' | 'disable' | 'delete') => {
-    const ids = Array.from(selected);
+    const ids = selectedModelIds();
     if (ids.length === 0) return;
     try {
       await adminApi.batchModels(ids, action);
       if (action === 'delete') {
-        setModels((prev) => prev.filter((model) => !selected.has(model.id)));
+        setModels((prev) => prev.filter((model) => !ids.includes(model.id)));
       } else {
         setModels((prev) =>
-          prev.map((model) => (selected.has(model.id) ? { ...model, enabled: action === 'enable' } : model)),
+          prev.map((model) => (ids.includes(model.id) ? { ...model, enabled: action === 'enable' } : model)),
         );
       }
       setSelected(new Set());
-      toast.success(`已处理 ${ids.length} 个模型`);
+      toast.success(`已处理 ${selected.size} 个模型`);
     } catch (error) {
       toast.error(getErrorMessage(error, '批量操作失败'));
     }
@@ -236,7 +365,7 @@ export default function Page() {
       Promise.all([adminApi.models(), adminApi.sources()]).then(([modelResponse, sourceResponse]) => {
         setModels(modelResponse.data);
         setSources(sourceResponse.data);
-        return modelResponse.data.length;
+        return buildModelGroups(modelResponse.data).length;
       }),
       {
         loading: '正在同步模型配置...',
@@ -266,33 +395,23 @@ export default function Page() {
     }
   };
 
-  const toggleEnabled = async (id: string) => {
-    const model = models.find((item) => item.id === id);
-    if (!model) return;
+  const toggleEnabled = async (group: ModelGroup) => {
+    const action = group.enabled ? 'disable' : 'enable';
     try {
-      const response = await adminApi.updateModel(id, { enabled: !model.enabled });
-      setModels((prev) => prev.map((m) => (m.id === id ? response.data : m)));
+      await adminApi.batchModels(group.ids, action);
+      setModels((prev) => prev.map((m) => (group.ids.includes(m.id) ? { ...m, enabled: action === 'enable' } : m)));
     } catch (error) {
       toast.error(getErrorMessage(error, '更新模型状态失败'));
     }
   };
 
-  const toggleRouting = async (model: PlatformModel) => {
+  const deleteModelGroup = async (group: ModelGroup) => {
     try {
-      const response = await adminApi.updateModel(model.id, { routingEnabled: !model.routingEnabled });
-      setModels((prev) => prev.map((m) => (m.id === model.id ? response.data : m)));
-    } catch (error) {
-      toast.error(getErrorMessage(error, '更新模型调度状态失败'));
-    }
-  };
-
-  const deleteModel = async (id: string) => {
-    try {
-      await adminApi.deleteModel(id);
-      setModels((prev) => prev.filter((m) => m.id !== id));
+      await adminApi.batchModels(group.ids, 'delete');
+      setModels((prev) => prev.filter((m) => !group.ids.includes(m.id)));
       setSelected((prev) => {
           const next = new Set(prev);
-          next.delete(id);
+          next.delete(group.key);
           return next;
       });
       toast.success('模型已删除');
@@ -301,30 +420,41 @@ export default function Page() {
     }
   };
 
-  const handleEdit = (m: PlatformModel) => {
-    setEditingModel(m);
-    setNewSource(m.sourceId);
-    setNewSourceKey(m.sourceKeyId ?? 'default');
-    setNewFormats(modelFormats(m));
-    setNewRoutingWeight(m.routingWeight || 1);
-    setNewRoutingEnabled(m.routingEnabled);
+  const handleEdit = (group: ModelGroup) => {
+    setEditingGroup(group);
+    setNewProvider(group.provider);
+    setNewFormats(group.formats);
+    setNewBindings(
+      group.candidates.map((candidate) =>
+        makeBindingDraft(candidate.sourceId, {
+          id: candidate.id,
+          sourceKeyId: candidate.sourceKeyId ?? 'default',
+          routingWeight: routeCandidateWeight(candidate),
+        }),
+      ),
+    );
     setEditOpen(true);
   };
 
   const saveEdit = async () => {
-    if (!editingModel) return;
+    if (!editingGroup) return;
+    const bindings = validateBindings();
+    if (bindings.length === 0) return;
     try {
-      const response = await adminApi.updateModel(editingModel.id, {
-        sourceId: newSource,
-        sourceKeyId: newSourceKey === 'default' ? 'default' : newSourceKey,
+      await adminApi.updateModel(editingGroup.ids[0], {
+        provider: newProvider,
         formats: newFormats,
-        routingWeight: newRoutingWeight,
-        routingEnabled: newRoutingEnabled,
+        bindings: bindings.map((binding) => ({
+          id: binding.id,
+          sourceId: binding.sourceId,
+          sourceKeyId: binding.sourceKeyId === 'default' ? 'default' : binding.sourceKeyId,
+          routingWeight: binding.routingWeight,
+        })),
       });
-      setModels((prev) => prev.map((m) => (m.id === editingModel.id ? response.data : m)));
+      await reloadModels();
       toast.success('模型配置已更新');
       setEditOpen(false);
-      setEditingModel(null);
+      setEditingGroup(null);
     } catch (error) {
       toast.error(getErrorMessage(error, '更新模型配置失败'));
     }
@@ -335,34 +465,98 @@ export default function Page() {
       toast.error('请输入模型名称');
       return;
     }
-    const sourceId = newSource || sources[0]?.id;
-    if (!sourceId) {
-      toast.error('请先创建上游源');
-      return;
-    }
+    const bindings = validateBindings();
+    if (bindings.length === 0) return;
     try {
-      const response = await adminApi.createModel({
+      await adminApi.createModel({
         name: newName.trim(),
-        sourceId,
-        sourceKeyId: newSourceKey === 'default' ? undefined : newSourceKey,
         provider: newProvider,
         formats: newFormats,
         enabled: true,
-        routingWeight: newRoutingWeight,
-        routingEnabled: newRoutingEnabled,
+        bindings: bindings.map((binding) => ({
+          sourceId: binding.sourceId,
+          sourceKeyId: binding.sourceKeyId === 'default' ? undefined : binding.sourceKeyId,
+          routingWeight: binding.routingWeight,
+        })),
       });
-      setModels((prev) => [response.data, ...prev]);
-      toast.success('自定义模型已添加', { description: response.data.name });
+      await reloadModels();
+      toast.success('自定义模型已添加', { description: newName.trim() });
       setAddOpen(false);
-      setNewName('');
-      setNewSourceKey('default');
-      setNewFormats(defaultFormatsForProvider(newProvider));
-      setNewRoutingWeight(1);
-      setNewRoutingEnabled(true);
+      resetAddForm();
     } catch (error) {
       toast.error(getErrorMessage(error, '添加模型失败'));
     }
   };
+
+  const renderBindingFields = () => (
+    <div className="grid gap-3">
+      {newBindings.map((binding, index) => {
+        const sourceKeys = sourceKeysBySource[binding.sourceId] ?? [];
+        const sourceKeyLoading = sourceKeyLoadingBySource[binding.sourceId];
+        const selectedSourceIds = new Set(newBindings.filter((item) => item.clientId !== binding.clientId).map((item) => item.sourceId));
+        return (
+          <div key={binding.clientId} className="grid gap-3 rounded-lg border bg-muted/20 p-3">
+            <div className="flex items-center justify-between gap-2">
+              <div className="text-xs font-semibold text-muted-foreground">上游绑定 {index + 1}</div>
+              <Button type="button" variant="ghost" size="sm" onClick={() => removeBinding(binding.clientId)} disabled={newBindings.length === 1}>
+                <Trash2 className="mr-1.5 h-3.5 w-3.5" />
+                移除
+              </Button>
+            </div>
+            <div className="grid min-w-0 gap-2 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_112px]">
+              <div className="grid min-w-0 gap-2">
+                <Label>上游源</Label>
+                <Select value={binding.sourceId} onValueChange={(value) => updateBinding(binding.clientId, { sourceId: value })}>
+                  <SelectTrigger className="min-w-0 [&>span]:min-w-0 [&>span]:truncate"><SelectValue placeholder="选择上游源" /></SelectTrigger>
+                  <SelectContent className="max-w-[var(--radix-select-trigger-width)]">
+                    {sources.map((source) => (
+                      <SelectItem key={source.id} value={source.id} disabled={selectedSourceIds.has(source.id)}>
+                        <span className="block max-w-full truncate">{source.name}</span>
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="grid min-w-0 gap-2">
+                <Label>API Key 绑定</Label>
+                <Select
+                  value={binding.sourceKeyId}
+                  onValueChange={(value) => updateBinding(binding.clientId, { sourceKeyId: value })}
+                  disabled={sourceKeyLoading || sourceKeys.length === 0}
+                >
+                  <SelectTrigger className="min-w-0 [&>span]:min-w-0 [&>span]:truncate"><SelectValue placeholder="默认上游 Key" /></SelectTrigger>
+                  <SelectContent className="max-w-[var(--radix-select-trigger-width)]">
+                    <SelectItem value="default">默认上游 Key</SelectItem>
+                    {sourceKeys.map((key) => (
+                      <SelectItem key={key.id} value={key.id} disabled={key.status !== 'valid'}>
+                        <span className="block max-w-full truncate">{key.alias}{key.status !== 'valid' ? '（已禁用）' : ''}</span>
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+              <div className="grid min-w-0 gap-2">
+                <Label className="inline-flex items-center gap-1.5">
+                  调度权重
+                  <RoutingRuleHint />
+                </Label>
+                <Input
+                  type="number"
+                  min={1}
+                  value={binding.routingWeight}
+                  onChange={(e) => updateBinding(binding.clientId, { routingWeight: Math.max(1, Number(e.target.value) || 1) })}
+                />
+              </div>
+            </div>
+          </div>
+        );
+      })}
+      <Button type="button" variant="outline" onClick={addBinding} disabled={sources.length === 0 || newBindings.length >= sources.length}>
+        <Plus className="mr-2 h-4 w-4" />
+        添加上游源
+      </Button>
+    </div>
+  );
 
   return (
     <div className="space-y-6">
@@ -389,52 +583,28 @@ export default function Page() {
               <RefreshCw className={cn('mr-2 h-4 w-4', syncingPricing && 'animate-spin')} />
               从 LiteLLM 同步定价
             </Button>
-            <Dialog open={addOpen} onOpenChange={setAddOpen}>
+            <Dialog
+              open={addOpen}
+              onOpenChange={(open) => {
+                setAddOpen(open);
+                if (open) resetAddForm();
+              }}
+            >
               <DialogTrigger asChild>
                 <Button className="shadow-sm">
                   <Plus className="mr-2 h-4 w-4" />
                   添加自定义模型
                 </Button>
               </DialogTrigger>
-              <DialogContent>
+              <DialogContent className="grid max-h-[calc(100vh-64px)] w-[min(92vw,640px)] max-w-[640px] grid-rows-[auto_minmax(0,1fr)_auto] overflow-hidden">
                 <DialogHeader>
                   <DialogTitle>添加自定义模型</DialogTitle>
                   <DialogDescription>注册一个不在上游列表中的模型，便于内部路由。</DialogDescription>
                 </DialogHeader>
-                <div className="grid gap-4 py-2">
+                <div className="grid min-h-0 gap-4 overflow-y-auto py-2 pr-1">
                   <div className="grid gap-2">
                     <Label htmlFor="m-name">模型名称</Label>
                     <Input id="m-name" placeholder="e.g. my-llama-3-finetune" value={newName} onChange={(e) => setNewName(e.target.value)} />
-                  </div>
-                  <div className="grid gap-2">
-                    <Label>上游源</Label>
-                    <Select value={newSource} onValueChange={(value) => { setNewSource(value); setNewSourceKey('default'); }}>
-                      <SelectTrigger><SelectValue /></SelectTrigger>
-                      <SelectContent>
-                        {sources.map((source) => (
-                          <SelectItem key={source.id} value={source.id}>
-                            {source.name}
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
-                  </div>
-                  <div className="grid gap-2">
-                    <Label>API Key 绑定</Label>
-                    <Select value={newSourceKey} onValueChange={setNewSourceKey} disabled={sourceKeyLoading || sourceKeys.length === 0}>
-                      <SelectTrigger><SelectValue placeholder="默认上游 Key" /></SelectTrigger>
-                      <SelectContent>
-                        <SelectItem value="default">默认上游 Key</SelectItem>
-                        {sourceKeys.map((key) => (
-                          <SelectItem key={key.id} value={key.id} disabled={key.status !== 'valid'}>
-                            {key.alias}{key.status !== 'valid' ? '（已禁用）' : ''}
-                          </SelectItem>
-                        ))}
-                      </SelectContent>
-                    </Select>
-                    <p className="text-xs text-muted-foreground">
-                      {sourceKeyLoading ? '正在加载 Key...' : sourceKeys.length === 0 ? '该上游源暂无可绑定 Key，将使用默认 API Key。' : '绑定后该模型优先使用所选 Key 转发。'}
-                    </p>
                   </div>
                   <div className="grid gap-2">
                     <Label>模型提供商</Label>
@@ -467,22 +637,7 @@ export default function Page() {
                       ))}
                     </div>
                   </div>
-                  <div className="grid gap-3 rounded-lg border bg-muted/20 p-3">
-                    <div className="grid gap-2">
-                      <Label htmlFor="m-routing-weight">调度权重</Label>
-                      <Input
-                        id="m-routing-weight"
-                        type="number"
-                        min={1}
-                        value={newRoutingWeight}
-                        onChange={(e) => setNewRoutingWeight(Math.max(1, Number(e.target.value) || 1))}
-                      />
-                    </div>
-                    <label className="flex items-center justify-between gap-3 text-sm font-medium">
-                      <span>参与自动调度</span>
-                      <Switch checked={newRoutingEnabled} onCheckedChange={setNewRoutingEnabled} />
-                    </label>
-                  </div>
+                  {renderBindingFields()}
                 </div>
                 <DialogFooter>
                   <DialogClose asChild>
@@ -497,36 +652,29 @@ export default function Page() {
       />
 
       <Dialog open={editOpen} onOpenChange={setEditOpen}>
-        <DialogContent>
+        <DialogContent className="grid max-h-[calc(100vh-64px)] w-[min(92vw,640px)] max-w-[640px] grid-rows-[auto_minmax(0,1fr)_auto] overflow-hidden">
           <DialogHeader>
             <DialogTitle>编辑模型配置</DialogTitle>
             <DialogDescription>
-              调整模型 <span className="font-mono font-bold text-foreground">{editingModel?.name}</span> 的上游绑定。
+              调整模型 <span className="font-mono font-bold text-foreground">{editingGroup?.name}</span> 的上游绑定。
             </DialogDescription>
           </DialogHeader>
-          <div className="grid gap-4 py-4">
+          <div className="grid min-h-0 gap-4 overflow-y-auto py-4 pr-1">
             <div className="grid gap-2">
-              <Label>上游源</Label>
-              <Select value={newSource} onValueChange={(value) => { setNewSource(value); setNewSourceKey('default'); }}>
+              <Label>模型提供商</Label>
+              <Select
+                value={newProvider}
+                onValueChange={(v) => {
+                  const provider = v as Provider;
+                  setNewProvider(provider);
+                  setNewFormats(defaultFormatsForProvider(provider));
+                }}
+              >
                 <SelectTrigger><SelectValue /></SelectTrigger>
                 <SelectContent>
-                  {sources.map((source) => (
-                    <SelectItem key={source.id} value={source.id}>
-                      {source.name}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </div>
-            <div className="grid gap-2">
-              <Label>API Key 绑定</Label>
-              <Select value={newSourceKey} onValueChange={setNewSourceKey} disabled={sourceKeyLoading || sourceKeys.length === 0}>
-                <SelectTrigger><SelectValue placeholder="默认上游 Key" /></SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="default">默认上游 Key</SelectItem>
-                  {sourceKeys.map((key) => (
-                    <SelectItem key={key.id} value={key.id} disabled={key.status !== 'valid'}>
-                      {key.alias}{key.status !== 'valid' ? '（已禁用）' : ''}
+                  {MODEL_PROVIDERS.map((provider) => (
+                    <SelectItem key={provider} value={provider}>
+                      {provider}
                     </SelectItem>
                   ))}
                 </SelectContent>
@@ -543,22 +691,7 @@ export default function Page() {
                 ))}
               </div>
             </div>
-            <div className="grid gap-3 rounded-lg border bg-muted/20 p-3">
-              <div className="grid gap-2">
-                <Label htmlFor="edit-routing-weight">调度权重</Label>
-                <Input
-                  id="edit-routing-weight"
-                  type="number"
-                  min={1}
-                  value={newRoutingWeight}
-                  onChange={(e) => setNewRoutingWeight(Math.max(1, Number(e.target.value) || 1))}
-                />
-              </div>
-              <label className="flex items-center justify-between gap-3 text-sm font-medium">
-                <span>参与自动调度</span>
-                <Switch checked={newRoutingEnabled} onCheckedChange={setNewRoutingEnabled} />
-              </label>
-            </div>
+            {renderBindingFields()}
           </div>
           <DialogFooter>
              <Button variant="ghost" onClick={() => setEditOpen(false)}>取消</Button>
@@ -620,146 +753,141 @@ export default function Page() {
               </TableHead>
               <TableHead>模型名称</TableHead>
               <TableHead>上游源</TableHead>
-              <TableHead>路由候选</TableHead>
               <TableHead>支持格式</TableHead>
               <TableHead className="text-center">状态</TableHead>
               <TableHead className="w-20 text-right">操作</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
-            {filtered.map((m, i) => (
-              <motion.tr
-                key={m.id}
-                initial={{ opacity: 0, y: 6 }}
-                animate={{ opacity: 1, y: 0 }}
-                transition={{ delay: i * 0.02, ease: [0.22, 1, 0.36, 1] }}
-                className={cn(
-                  'group border-b transition-colors hover:bg-muted/40',
-                  !m.enabled && 'opacity-60',
-                )}
-              >
-                <TableCell>
-                  <Checkbox checked={selected.has(m.id)} onCheckedChange={() => toggleOne(m.id)} />
-                </TableCell>
-                <TableCell>
-                  <div className="flex items-center gap-2.5">
-                    <ProviderIcon provider={m.provider} />
-                    <div>
-                      <div className="font-mono text-sm font-medium">{m.name}</div>
-                      <div className="text-xs text-muted-foreground">{m.provider}</div>
-                    </div>
-                  </div>
-                </TableCell>
-                <TableCell>
-                  <div className="flex min-w-0 flex-col items-start gap-1">
-                    <Badge variant="secondary" className="max-w-[220px] truncate font-mono text-[11px]">{m.sourceName}</Badge>
-                    {m.sourceKeyAlias && (
-                      <span className="max-w-[220px] truncate rounded-md bg-muted px-2 py-0.5 font-mono text-[10px] text-muted-foreground">
-                        Key: {m.sourceKeyAlias}
-                      </span>
-                    )}
-                    <span className="inline-flex items-center gap-1 rounded-md bg-muted px-2 py-0.5 text-[10px] text-muted-foreground">
-                      <Network className="h-3 w-3" />
-                      权重 {m.routingWeight || 1} · {m.routingEnabled ? '参与调度' : '不参与调度'}
-                    </span>
-                  </div>
-                </TableCell>
-                <TableCell>
-                  <div className="flex max-w-[320px] flex-col gap-1.5">
-                    <Badge variant={m.candidateCount && m.candidateCount > 1 ? 'default' : 'secondary'} className="w-fit text-[10px]">
-                      候选 {m.candidateCount ?? 1}
-                    </Badge>
-                    {(m.routingCandidates ?? []).slice(0, 3).map((candidate) => (
-                      <div key={candidate.id} className="flex min-w-0 items-center gap-1.5 text-[11px]">
-                        <span className={cn('h-1.5 w-1.5 rounded-full bg-current', routeCandidateTone(candidate))} />
-                        <span className="truncate">{candidate.sourceName || candidate.sourceId}</span>
-                        <span className="shrink-0 font-mono text-muted-foreground">
-                          P{candidate.sourcePriority} W{candidate.routingWeight}
-                        </span>
+            {filtered.map((group, i) => {
+              const currentCandidateId = group.currentCandidate?.id;
+              return (
+                <motion.tr
+                  key={group.key}
+                  initial={{ opacity: 0, y: 6 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  transition={{ delay: i * 0.02, ease: [0.22, 1, 0.36, 1] }}
+                  className={cn(
+                    'group border-b transition-colors hover:bg-muted/40',
+                    !group.enabled && 'opacity-60',
+                  )}
+                >
+                  <TableCell>
+                    <Checkbox checked={selected.has(group.key)} onCheckedChange={() => toggleOne(group.key)} />
+                  </TableCell>
+                  <TableCell>
+                    <div className="flex items-center gap-2.5">
+                      <ProviderIcon provider={group.provider} />
+                      <div>
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="font-mono text-sm font-medium">{group.name}</span>
+                        </div>
+                        <div className="text-xs text-muted-foreground">{group.provider}</div>
                       </div>
-                    ))}
-                    {(m.routingCandidates?.length ?? 0) > 3 && (
-                      <div className="text-[11px] text-muted-foreground">+{(m.routingCandidates?.length ?? 0) - 3} 个候选</div>
-                    )}
-                  </div>
-                </TableCell>
-                <TableCell>
-                  <div className="flex flex-wrap items-center gap-1.5">
-                    {modelFormats(m).map((format) => (
-                      <Badge
-                        key={format}
-                        variant="outline"
-                        className={cn(
-                          'h-6 rounded-md px-2 py-0 font-mono text-[10px] font-bold uppercase tracking-wider shadow-none',
-                          format === 'openai'
-                            ? 'border-sky-500/20 bg-sky-500/5 text-sky-600'
-                            : 'border-orange-500/20 bg-orange-500/5 text-orange-600',
-                        )}
-                      >
-                        {format}
-                      </Badge>
-                    ))}
-                  </div>
-                </TableCell>
-                <TableCell className="text-center">
-                  <div className="inline-flex items-center gap-2">
-                    <Switch checked={m.enabled} onCheckedChange={() => toggleEnabled(m.id)} />
-                    <StatusBadge tone={m.enabled ? 'success' : 'neutral'} label={m.enabled ? '启用' : '已禁用'} />
-                  </div>
-                </TableCell>
-                <TableCell className="text-right">
-                  <DropdownMenu>
-                    <DropdownMenuTrigger asChild>
-                      <Button variant="ghost" size="icon" className="h-8 w-8">
-                        <MoreHorizontal className="h-4 w-4" />
-                      </Button>
-                    </DropdownMenuTrigger>
-                    <DropdownMenuContent align="end">
-                      <DropdownMenuItem onClick={() => handleEdit(m)}>
-                        <Edit className="mr-2 h-4 w-4" />编辑配置
-                      </DropdownMenuItem>
-                      <DropdownMenuItem onClick={() => toggleRouting(m)}>
-                        {m.routingEnabled ? <PowerOff className="mr-2 h-4 w-4" /> : <Power className="mr-2 h-4 w-4" />}
-                        {m.routingEnabled ? '暂停调度' : '参与调度'}
-                      </DropdownMenuItem>
-                      <DropdownMenuItem
-                        onClick={async () => {
-                          await copyToClipboard(m.name);
-                          toast.success('已复制', { description: m.name });
-                        }}
-                      >
-                        <Copy className="mr-2 h-4 w-4" />复制名称
-                      </DropdownMenuItem>
-                      <DropdownMenuSeparator />
-                      <AlertDialog>
-                        <AlertDialogTrigger asChild>
-                          <DropdownMenuItem className="text-destructive focus:text-destructive" onSelect={(e) => e.preventDefault()}>
-                            <Trash2 className="mr-2 h-4 w-4" />删除
-                          </DropdownMenuItem>
-                        </AlertDialogTrigger>
-                        <AlertDialogContent>
-                          <AlertDialogHeader>
-                            <AlertDialogTitle>删除模型 {m.name}?</AlertDialogTitle>
-                            <AlertDialogDescription>
-                              此操作不可撤销。该模型将从路由列表移除，所有引用此模型的 API 请求将返回 404。
-                            </AlertDialogDescription>
-                          </AlertDialogHeader>
-                          <AlertDialogFooter>
-                            <AlertDialogCancel>取消</AlertDialogCancel>
-                            <AlertDialogAction onClick={() => deleteModel(m.id)} className="bg-destructive text-destructive-foreground hover:bg-destructive/90">
-                              确认删除
-                            </AlertDialogAction>
-                          </AlertDialogFooter>
-                        </AlertDialogContent>
-                      </AlertDialog>
-                    </DropdownMenuContent>
-                  </DropdownMenu>
-                </TableCell>
-              </motion.tr>
-            ))}
+                    </div>
+                  </TableCell>
+                  <TableCell>
+                    <div className="flex min-w-0 flex-col items-start gap-1.5">
+                      {group.candidates.map((candidate) => {
+                        const isCurrent = candidate.id === currentCandidateId;
+                        const muted = group.candidates.length > 1 && !isCurrent;
+                        return (
+                          <div
+                            key={candidate.id}
+                            className={cn(
+                              'flex max-w-[320px] flex-wrap items-center gap-1.5 text-[11px]',
+                              muted && 'text-muted-foreground',
+                            )}
+                          >
+                            <span className={cn('h-1.5 w-1.5 rounded-full bg-current', muted ? 'text-muted-foreground' : routeCandidateTone(candidate))} />
+                            <span className={cn('truncate font-mono', !muted && 'font-semibold text-foreground')}>
+                              {candidate.sourceName}
+                            </span>
+                            {candidate.sourceKeyAlias && (
+                              <span className="rounded-md bg-muted px-1.5 py-0.5 font-mono text-[10px]">
+                                Key: {candidate.sourceKeyAlias}
+                              </span>
+                            )}
+                            <span className="font-mono">W{routeCandidateWeight(candidate)}</span>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </TableCell>
+                  <TableCell>
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      {group.formats.map((format) => (
+                        <Badge
+                          key={format}
+                          variant="outline"
+                          className={cn(
+                            'h-6 rounded-md px-2 py-0 font-mono text-[10px] font-bold uppercase tracking-wider shadow-none',
+                            format === 'openai'
+                              ? 'border-sky-500/20 bg-sky-500/5 text-sky-600'
+                              : 'border-orange-500/20 bg-orange-500/5 text-orange-600',
+                          )}
+                        >
+                          {format}
+                        </Badge>
+                      ))}
+                    </div>
+                  </TableCell>
+                  <TableCell className="text-center">
+                    <div className="inline-flex items-center gap-2">
+                      <Switch checked={group.enabled} onCheckedChange={() => toggleEnabled(group)} />
+                      <StatusBadge tone={group.enabled ? 'success' : 'neutral'} label={group.enabled ? '启用' : '已禁用'} />
+                    </div>
+                  </TableCell>
+                  <TableCell className="text-right">
+                    <DropdownMenu>
+                      <DropdownMenuTrigger asChild>
+                        <Button variant="ghost" size="icon" className="h-8 w-8">
+                          <MoreHorizontal className="h-4 w-4" />
+                        </Button>
+                      </DropdownMenuTrigger>
+                      <DropdownMenuContent align="end">
+                        <DropdownMenuItem onClick={() => handleEdit(group)}>
+                          <Edit className="mr-2 h-4 w-4" />编辑配置
+                        </DropdownMenuItem>
+                        <DropdownMenuItem
+                          onClick={async () => {
+                            await copyToClipboard(group.name);
+                            toast.success('已复制', { description: group.name });
+                          }}
+                        >
+                          <Copy className="mr-2 h-4 w-4" />复制名称
+                        </DropdownMenuItem>
+                        <DropdownMenuSeparator />
+                        <AlertDialog>
+                          <AlertDialogTrigger asChild>
+                            <DropdownMenuItem className="text-destructive focus:text-destructive" onSelect={(e) => e.preventDefault()}>
+                              <Trash2 className="mr-2 h-4 w-4" />删除
+                            </DropdownMenuItem>
+                          </AlertDialogTrigger>
+                          <AlertDialogContent>
+                            <AlertDialogHeader>
+                              <AlertDialogTitle>删除模型 {group.name}?</AlertDialogTitle>
+                              <AlertDialogDescription>
+                                此操作不可撤销。该模型下的所有上游绑定将从路由列表移除，所有引用此模型的 API 请求将返回 404。
+                              </AlertDialogDescription>
+                            </AlertDialogHeader>
+                            <AlertDialogFooter>
+                              <AlertDialogCancel>取消</AlertDialogCancel>
+                              <AlertDialogAction onClick={() => deleteModelGroup(group)} className="bg-destructive text-destructive-foreground hover:bg-destructive/90">
+                                确认删除
+                              </AlertDialogAction>
+                            </AlertDialogFooter>
+                          </AlertDialogContent>
+                        </AlertDialog>
+                      </DropdownMenuContent>
+                    </DropdownMenu>
+                  </TableCell>
+                </motion.tr>
+              );
+            })}
             {filtered.length === 0 && (
               <TableRow>
-                <TableCell colSpan={7}>
+                <TableCell colSpan={6}>
                   <div className="py-12 text-center text-sm text-muted-foreground">
                     <Cpu className="mx-auto mb-2 h-8 w-8 opacity-40" />
                     没有匹配的模型
@@ -770,7 +898,7 @@ export default function Page() {
           </TableBody>
         </Table>
         <CardContent className="flex items-center justify-between border-t bg-muted/20 py-3 text-xs text-muted-foreground">
-          <div>显示 {filtered.length} 条 · 共 {models.length} 个模型</div>
+          <div>显示 {filtered.length} 条 · 共 {modelGroups.length} 个模型</div>
           <div className="text-[11px] uppercase tracking-wider">同步周期 · 每 6 小时</div>
         </CardContent>
       </Card>

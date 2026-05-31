@@ -52,6 +52,24 @@ const emptyUsage: UsageStats = {
   byUser: [],
 };
 
+const rowTotalTokens = (row: UsageDetailRow) => row.totalTokens ?? row.promptTokens + row.completionTokens;
+const rowCacheReadTokens = (row: UsageDetailRow) => row.cacheReadTokens ?? 0;
+const rowCacheWriteTokens = (row: UsageDetailRow) => row.cacheWriteTokens ?? 0;
+const rowReasoningTokens = (row: UsageDetailRow) => row.reasoningTokens ?? 0;
+
+const usageRowsToCsvRows = (rows: UsageDetailRow[]) =>
+  rows.map((row) => ({
+    日期: row.date,
+    请求数: row.requests,
+    输入Tokens: row.promptTokens,
+    输出Tokens: row.completionTokens,
+    缓存读取Tokens: rowCacheReadTokens(row),
+    缓存写入Tokens: rowCacheWriteTokens(row),
+    推理Tokens: rowReasoningTokens(row),
+    总Tokens: rowTotalTokens(row),
+    成本: row.estimatedCost,
+  }));
+
 export default function Page() {
   const [range, setRange] = useState<Range>('week');
   const [apiKey, setApiKey] = useState('all');
@@ -76,7 +94,7 @@ export default function Page() {
       const response = await userApi.usage(range, apiKey);
       downloadTextFile(
         `relay-usage-${range}-${new Date().toISOString().slice(0, 10)}.csv`,
-        toCsv(response.data.rows),
+        toCsv(usageRowsToCsvRows(response.data.rows)),
         'text/csv;charset=utf-8',
       );
       toast.success('对账单已准备就绪，开始下载');
@@ -89,7 +107,7 @@ export default function Page() {
 
   const totals = useMemo(() => {
     const requests = rows.reduce((sum, row) => sum + row.requests, 0);
-    const tokens = rows.reduce((sum, row) => sum + row.promptTokens + row.completionTokens, 0);
+    const tokens = rows.reduce((sum, row) => sum + rowTotalTokens(row), 0);
     const cost = rows.reduce((sum, row) => sum + row.estimatedCost, 0);
     const avg = rows.length === 0 ? 0 : Math.round(tokens / rows.length);
     return { requests, tokens, cost, avg };
@@ -171,27 +189,33 @@ export default function Page() {
         <CardHeader className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between border-b bg-muted/10">
           <div>
             <CardTitle>明细记录</CardTitle>
-            <CardDescription>Prompt、Completion 和成本按日期汇总。</CardDescription>
+            <CardDescription>输入、输出、缓存和成本按日期汇总。</CardDescription>
           </div>
           <Badge variant="secondary" className="w-fit border-primary/20 bg-primary/5 text-primary font-bold">
             <KeyRound className="mr-1.5 h-3.5 w-3.5" />
             {apiKey === 'all' ? '全部 API Key' : keys.find((key) => key.id === apiKey)?.name}
           </Badge>
         </CardHeader>
-        <Table>
+        <Table className="min-w-[980px]">
           <TableHeader>
             <TableRow className="bg-muted/40 hover:bg-muted/40">
               <TableHead className="px-6">日期</TableHead>
               <TableHead className="text-right">请求数</TableHead>
-              <TableHead className="text-right">Prompt Tokens</TableHead>
-              <TableHead className="text-right">Completion Tokens</TableHead>
+              <TableHead className="text-right">输入 Tokens</TableHead>
+              <TableHead className="text-right">输出 Tokens</TableHead>
+              <TableHead className="text-right">缓存读取</TableHead>
+              <TableHead className="text-right">缓存写入</TableHead>
+              <TableHead className="text-right">推理 Tokens</TableHead>
               <TableHead className="text-right">总 Tokens</TableHead>
               <TableHead className="text-right pr-6">成本</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
             {rows.map((row, index) => {
-              const total = row.promptTokens + row.completionTokens;
+              const cacheRead = rowCacheReadTokens(row);
+              const cacheWrite = rowCacheWriteTokens(row);
+              const reasoning = rowReasoningTokens(row);
+              const total = rowTotalTokens(row);
               return (
                 <motion.tr
                   key={`${row.date}-${index}`}
@@ -204,6 +228,9 @@ export default function Page() {
                   <TableCell className="text-right font-mono text-sm">{formatNumberFull(row.requests)}</TableCell>
                   <TableCell className="text-right font-mono text-sm text-muted-foreground">{formatNumberFull(row.promptTokens)}</TableCell>
                   <TableCell className="text-right font-mono text-sm text-muted-foreground">{formatNumberFull(row.completionTokens)}</TableCell>
+                  <TableCell className="text-right font-mono text-sm text-muted-foreground">{formatNumberFull(cacheRead)}</TableCell>
+                  <TableCell className="text-right font-mono text-sm text-muted-foreground">{formatNumberFull(cacheWrite)}</TableCell>
+                  <TableCell className="text-right font-mono text-sm text-muted-foreground">{formatNumberFull(reasoning)}</TableCell>
                   <TableCell className="text-right font-mono font-bold">{formatNumberFull(total)}</TableCell>
                   <TableCell className="text-right font-mono pr-6 font-semibold text-foreground">{formatCurrency(row.estimatedCost)}</TableCell>
                 </motion.tr>
