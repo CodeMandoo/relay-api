@@ -8,13 +8,12 @@ import {
   Clock,
   Coins,
   Copy,
-  DatabaseZap,
   FilterX,
   Hash,
   KeyRound,
   Loader2,
   Search,
-  Server,
+  ScrollText,
   TerminalSquare,
   type LucideIcon,
 } from 'lucide-react';
@@ -52,69 +51,125 @@ import {
   formatCurrency,
   formatDateTime,
   formatNumberFull,
+  type ApiKey,
   type RequestAttemptLog,
   type RequestLog,
 } from '@relay-api/lib';
-import { adminApi, getErrorMessage } from '@/lib/api';
 import { PageHeader } from '@/components/common/PageHeader';
 import { StatCard } from '@/components/common/StatCard';
 import { StatusBadge } from '@/components/common/StatusBadge';
 import { EmptyState } from '@/components/common/EmptyState';
+import { getErrorMessage, userApi } from '@/lib/api';
 
 type StatusFilter = 'all' | 'success' | 'error';
+type TimeRange = 'all' | 'day' | 'week' | 'month';
 
-const latencyClass = (ms: number): string => {
-  if (ms < 500) return 'text-emerald-600 dark:text-emerald-400';
-  if (ms < 1500) return 'text-amber-600 dark:text-amber-400';
+interface TokenUsage {
+  prompt: number;
+  completion: number;
+  cacheRead: number;
+  cacheWrite: number;
+  reasoning: number;
+  total: number;
+}
+
+const rangeOptions: { value: TimeRange; label: string }[] = [
+  { value: 'all', label: '全部时间' },
+  { value: 'day', label: '近 24 小时' },
+  { value: 'week', label: '近 7 天' },
+  { value: 'month', label: '近 30 天' },
+];
+
+const latencyTone = (latency: number) => {
+  if (latency < 800) return 'text-emerald-600 dark:text-emerald-400';
+  if (latency < 2000) return 'text-amber-600 dark:text-amber-400';
   return 'text-destructive';
 };
 
-const prettyJson = (payload: unknown): string => JSON.stringify(payload ?? {}, null, 2);
+const statusTone = (status: RequestLog['statusText']) => (status === 'success' ? 'success' : 'destructive');
+const pretty = (value: unknown) => JSON.stringify(value ?? {}, null, 2);
+
+const rangeStartISO = (range: TimeRange) => {
+  if (range === 'all') return undefined;
+  const hours = range === 'day' ? 24 : range === 'week' ? 24 * 7 : 24 * 30;
+  return new Date(Date.now() - hours * 60 * 60 * 1000).toISOString();
+};
+
+const getTokenUsage = (log: RequestLog): TokenUsage => ({
+  prompt: log.tokensPrompt,
+  completion: log.tokensCompletion,
+  cacheRead: log.tokensCacheRead ?? 0,
+  cacheWrite: log.tokensCacheWrite ?? 0,
+  reasoning: log.tokensReasoning ?? 0,
+  total: log.tokensTotal,
+});
 
 export default function Page() {
   const [query, setQuery] = useState('');
   const [status, setStatus] = useState<StatusFilter>('all');
   const [model, setModel] = useState('all');
-  const [from, setFrom] = useState('');
-  const [to, setTo] = useState('');
+  const [apiKey, setApiKey] = useState('all');
+  const [range, setRange] = useState<TimeRange>('week');
   const [page, setPage] = useState(1);
   const [pageSize] = useState(20);
-  const [selectedLog, setSelectedLog] = useState<RequestLog | null>(null);
   const [logs, setLogs] = useState<RequestLog[]>([]);
+  const [apiKeys, setApiKeys] = useState<ApiKey[]>([]);
   const [pagination, setPagination] = useState({ page: 1, pageSize: 20, total: 0, totalPages: 1 });
+  const [selectedLog, setSelectedLog] = useState<RequestLog | null>(null);
   const [attemptsByLog, setAttemptsByLog] = useState<Record<string, RequestAttemptLog[]>>({});
   const [attemptsLoading, setAttemptsLoading] = useState<Record<string, boolean>>({});
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
+    userApi
+      .apiKeys()
+      .then((response) => setApiKeys(response.data))
+      .catch((error) => toast.error(getErrorMessage(error, '加载 API Key 失败')));
+  }, []);
+
+  useEffect(() => {
     setLoading(true);
-    adminApi
-      .logs({ status, model, q: query, page, pageSize, from, to })
+    userApi
+      .logs({
+        status,
+        model,
+        apiKeyId: apiKey,
+        q: query,
+        page,
+        pageSize,
+        from: rangeStartISO(range),
+      })
       .then((response) => {
         setLogs(response.data);
         setPagination(response.pagination);
       })
       .catch((error) => toast.error(getErrorMessage(error, '加载请求日志失败')))
       .finally(() => setLoading(false));
-  }, [from, model, page, pageSize, query, status, to]);
+  }, [apiKey, model, page, pageSize, query, range, status]);
 
-  const models = useMemo(() => Array.from(new Set(logs.map((log) => log.model).filter(Boolean))), [logs]);
+  const models = useMemo(() => Array.from(new Set(logs.map((log) => log.model).filter(Boolean))).sort(), [logs]);
 
   const stats = useMemo(() => {
     const success = logs.filter((log) => log.statusText === 'success').length;
-    const error = logs.length - success;
-    const tokens = logs.reduce((sum, log) => sum + log.tokensTotal, 0);
+    const totalTokens = logs.reduce((sum, log) => sum + log.tokensTotal, 0);
+    const cost = logs.reduce((sum, log) => sum + (log.estimatedCost ?? 0), 0);
     const avgLatency =
       logs.length === 0 ? 0 : Math.round(logs.reduce((sum, log) => sum + log.latencyMs, 0) / logs.length);
-    return { success, error, tokens, avgLatency };
+    return {
+      total: logs.length,
+      successRate: logs.length === 0 ? 0 : Math.round((success / logs.length) * 100),
+      totalTokens,
+      cost,
+      avgLatency,
+    };
   }, [logs]);
 
   const reset = () => {
     setQuery('');
     setStatus('all');
     setModel('all');
-    setFrom('');
-    setTo('');
+    setApiKey('all');
+    setRange('week');
     setPage(1);
     setSelectedLog(null);
   };
@@ -131,10 +186,10 @@ export default function Page() {
       return;
     }
     setAttemptsLoading((current) => ({ ...current, [log.id]: true }));
-    adminApi
+    userApi
       .logAttempts(log.id)
       .then((response) => setAttemptsByLog((current) => ({ ...current, [log.id]: response.data })))
-      .catch((error) => toast.error(getErrorMessage(error, '加载上游尝试链失败')))
+      .catch((error) => toast.error(getErrorMessage(error, '加载尝试链失败')))
       .finally(() => setAttemptsLoading((current) => ({ ...current, [log.id]: false })));
   };
 
@@ -143,7 +198,7 @@ export default function Page() {
       <PageHeader
         eyebrow="请求观测"
         title="请求日志"
-        description="检索用户、模型、上游和 API Key 的调用记录，快速定位失败请求。"
+        description="按请求查看模型调用、Token 明细、成本、延迟和结果状态。"
         actions={
           <Button variant="outline" onClick={reset}>
             <FilterX className="mr-2 h-4 w-4" />
@@ -153,65 +208,86 @@ export default function Page() {
       />
 
       <div className="grid gap-6 md:grid-cols-2 lg:grid-cols-4">
-        <StatCard label="成功请求" value={stats.success} icon={DatabaseZap} tone="success" delay={0} hint="当前页" />
-        <StatCard label="失败请求" value={stats.error} icon={AlertTriangle} tone={stats.error > 0 ? 'destructive' : 'neutral'} delay={0.05} hint="含上游错误与超时" />
-        <StatCard label="总 Tokens" value={formatNumberFull(stats.tokens)} icon={TerminalSquare} tone="primary" delay={0.1} hint="Prompt + Completion" />
-        <StatCard label="平均延迟" value={`${stats.avgLatency}ms`} icon={Clock} tone="warning" delay={0.15} hint="端到端响应耗时" />
+        <StatCard label="当前页请求" value={stats.total} icon={ScrollText} tone="primary" delay={0} hint="按当前筛选" />
+        <StatCard label="成功率" value={`${stats.successRate}%`} icon={Hash} tone="success" delay={0.05} hint="当前页" />
+        <StatCard label="总 Tokens" value={formatNumberFull(stats.totalTokens)} icon={TerminalSquare} tone="neutral" delay={0.1} hint="输入 + 输出" />
+        <StatCard label="预估成本" value={formatCurrency(stats.cost)} icon={Coins} tone="warning" delay={0.15} hint="USD" />
       </div>
 
       <Card className="overflow-hidden">
-        <div className="grid gap-3 border-b p-4 md:grid-cols-[1fr_150px_180px_190px_190px]">
-          <div className="relative">
-            <Search className="pointer-events-none absolute left-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
-            <Input
-              className="pl-9"
-              placeholder="搜索用户、API Key、模型或上游..."
-              value={query}
-              onChange={(e) => updateFilter(() => setQuery(e.target.value))}
-            />
+        <div className="overflow-x-auto border-b">
+          <div className="grid min-w-[980px] grid-cols-[minmax(260px,1fr)_140px_170px_170px_170px] gap-3 p-4">
+            <div className="relative">
+              <Search className="pointer-events-none absolute left-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
+              <Input
+                className="pl-9"
+                placeholder="搜索 Request ID、模型、路径或错误..."
+                value={query}
+                onChange={(event) => updateFilter(() => setQuery(event.target.value))}
+              />
+            </div>
+            <Select value={status} onValueChange={(value) => updateFilter(() => setStatus(value as StatusFilter))}>
+              <SelectTrigger>
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">全部状态</SelectItem>
+                <SelectItem value="success">成功</SelectItem>
+                <SelectItem value="error">失败</SelectItem>
+              </SelectContent>
+            </Select>
+            <Select value={model} onValueChange={(value) => updateFilter(() => setModel(value))}>
+              <SelectTrigger>
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">全部模型</SelectItem>
+                {models.map((item) => (
+                  <SelectItem key={item} value={item}>
+                    {item}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <Select value={apiKey} onValueChange={(value) => updateFilter(() => setApiKey(value))}>
+              <SelectTrigger>
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="all">全部 API Key</SelectItem>
+                {apiKeys.map((item) => (
+                  <SelectItem key={item.id} value={item.id}>
+                    {item.name}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+            <Select value={range} onValueChange={(value) => updateFilter(() => setRange(value as TimeRange))}>
+              <SelectTrigger>
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {rangeOptions.map((item) => (
+                  <SelectItem key={item.value} value={item.value}>
+                    {item.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
           </div>
-          <Select value={status} onValueChange={(value) => updateFilter(() => setStatus(value as StatusFilter))}>
-            <SelectTrigger>
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="all">全部状态</SelectItem>
-              <SelectItem value="success">成功</SelectItem>
-              <SelectItem value="error">失败</SelectItem>
-            </SelectContent>
-          </Select>
-          <Select value={model} onValueChange={(value) => updateFilter(() => setModel(value))}>
-            <SelectTrigger>
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              <SelectItem value="all">全部模型</SelectItem>
-              {models.map((item) => (
-                <SelectItem key={item} value={item}>
-                  {item}
-                </SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-          <Input type="datetime-local" className="min-w-0" aria-label="开始时间" value={from} onChange={(e) => updateFilter(() => setFrom(e.target.value))} />
-          <Input type="datetime-local" className="min-w-0" aria-label="结束时间" value={to} onChange={(e) => updateFilter(() => setTo(e.target.value))} />
         </div>
 
         {loading ? (
           <div className="p-10 text-center text-sm text-muted-foreground">正在加载请求日志...</div>
-        ) : logs.length === 0 ? (
-          <div className="p-6">
-            <EmptyState icon={Search} title="没有匹配的日志" description="修改筛选条件后重新查询。" />
-          </div>
         ) : (
-          <Table>
+          <Table className="min-w-[1040px]">
             <TableHeader>
               <TableRow className="bg-muted/40 hover:bg-muted/40">
                 <TableHead>时间 / 请求</TableHead>
-                <TableHead>用户 / API Key</TableHead>
                 <TableHead>模型</TableHead>
-                <TableHead>上游</TableHead>
+                <TableHead>API Key</TableHead>
                 <TableHead className="text-right">Token</TableHead>
+                <TableHead className="text-right">缓存</TableHead>
                 <TableHead className="text-right">成本</TableHead>
                 <TableHead>延迟</TableHead>
                 <TableHead>状态</TableHead>
@@ -219,14 +295,17 @@ export default function Page() {
               </TableRow>
             </TableHeader>
             <TableBody>
-              {logs.map((log, index) => (
-                <LogRow
-                  key={log.id}
-                  log={log}
-                  index={index}
-                  onOpen={() => openLog(log)}
-                />
-              ))}
+              {logs.length === 0 ? (
+                <TableRow className="hover:bg-transparent">
+                  <TableCell colSpan={9} className="p-6">
+                    <EmptyState icon={Search} title="没有匹配的请求" description="修改筛选条件后重新查询。" />
+                  </TableCell>
+                </TableRow>
+              ) : (
+                logs.map((log, index) => (
+                  <LogRow key={log.id} log={log} index={index} onOpen={() => openLog(log)} />
+                ))
+              )}
             </TableBody>
           </Table>
         )}
@@ -256,16 +335,8 @@ export default function Page() {
   );
 }
 
-interface LogRowProps {
-  log: RequestLog;
-  index: number;
-  onOpen: () => void;
-}
-
-function LogRow({ log, index, onOpen }: LogRowProps) {
-  const tokensCacheRead = log.tokensCacheRead ?? 0;
-  const tokensCacheWrite = log.tokensCacheWrite ?? 0;
-  const tokensReasoning = log.tokensReasoning ?? 0;
+function LogRow({ log, index, onOpen }: { log: RequestLog; index: number; onOpen: () => void }) {
+  const tokens = getTokenUsage(log);
 
   return (
     <motion.tr
@@ -280,41 +351,33 @@ function LogRow({ log, index, onOpen }: LogRowProps) {
         <div className="font-mono text-[11px] text-muted-foreground">{log.requestId ?? log.id}</div>
       </TableCell>
       <TableCell>
-        <div className="text-sm font-medium">{log.userEmail}</div>
-        <div className="text-xs text-muted-foreground">{log.apiKeyName}</div>
-      </TableCell>
-      <TableCell>
         <Badge variant="secondary" className="max-w-[220px] truncate font-mono text-[11px]">
           {log.model}
         </Badge>
+        {log.path && <div className="mt-1 max-w-[240px] truncate font-mono text-[11px] text-muted-foreground">{log.path}</div>}
       </TableCell>
       <TableCell>
-        <div className="inline-flex max-w-[220px] items-center gap-1 text-sm">
-          <Server className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-          <span className="truncate">{log.upstreamName || '-'}</span>
-        </div>
-        {log.sourceKeyAlias && <div className="mt-1 text-xs text-muted-foreground">Key: {log.sourceKeyAlias}</div>}
+        <div className="font-medium">{log.apiKeyName}</div>
+        {log.apiKeyId && <div className="mt-1 font-mono text-[11px] text-muted-foreground">{log.apiKeyId}</div>}
       </TableCell>
       <TableCell className="text-right">
-        <div className="font-mono text-sm">{formatNumberFull(log.tokensTotal)}</div>
-        <div className="font-mono text-[11px] text-muted-foreground">
-          P {formatNumberFull(log.tokensPrompt)} / C {formatNumberFull(log.tokensCompletion)}
+        <div className="font-mono font-semibold">{formatNumberFull(tokens.total)}</div>
+        <div className="mt-1 font-mono text-[11px] text-muted-foreground">
+          {formatNumberFull(tokens.prompt)} / {formatNumberFull(tokens.completion)}
         </div>
-        {(tokensCacheRead > 0 || tokensCacheWrite > 0 || tokensReasoning > 0) && (
-          <div className="font-mono text-[10px] text-muted-foreground/70">
-            {tokensCacheRead > 0 && <span>缓存读 {formatNumberFull(tokensCacheRead)} </span>}
-            {tokensCacheWrite > 0 && <span>缓存写 {formatNumberFull(tokensCacheWrite)} </span>}
-            {tokensReasoning > 0 && <span>推理 {formatNumberFull(tokensReasoning)}</span>}
-          </div>
-        )}
       </TableCell>
-      <TableCell className="text-right font-mono text-sm font-medium">{formatCurrency(log.estimatedCost ?? 0)}</TableCell>
+      <TableCell className="text-right">
+        <div className="font-mono text-sm">{formatNumberFull(tokens.cacheRead)}</div>
+        <div className="mt-1 font-mono text-[11px] text-muted-foreground">写 {formatNumberFull(tokens.cacheWrite)}</div>
+      </TableCell>
+      <TableCell className="text-right font-mono font-semibold">{formatCurrency(log.estimatedCost ?? 0)}</TableCell>
       <TableCell>
-        <span className={cn('font-mono text-sm font-medium', latencyClass(log.latencyMs))}>{log.latencyMs}ms</span>
+        <span className={cn('font-mono font-semibold', latencyTone(log.latencyMs))}>{log.latencyMs}ms</span>
+        {(log.attemptCount ?? 0) > 1 && <div className="mt-1 text-[11px] text-muted-foreground">{log.attemptCount} 次尝试</div>}
       </TableCell>
       <TableCell>
         <StatusBadge
-          tone={log.statusText === 'success' ? 'success' : 'destructive'}
+          tone={statusTone(log.statusText)}
           label={log.statusText === 'success' ? `成功 ${log.statusCode}` : `失败 ${log.statusCode}`}
         />
       </TableCell>
@@ -333,24 +396,6 @@ function LogRow({ log, index, onOpen }: LogRowProps) {
     </motion.tr>
   );
 }
-
-interface TokenUsage {
-  prompt: number;
-  completion: number;
-  cacheRead: number;
-  cacheWrite: number;
-  reasoning: number;
-  total: number;
-}
-
-const getTokenUsage = (log: RequestLog): TokenUsage => ({
-  prompt: log.tokensPrompt,
-  completion: log.tokensCompletion,
-  cacheRead: log.tokensCacheRead ?? 0,
-  cacheWrite: log.tokensCacheWrite ?? 0,
-  reasoning: log.tokensReasoning ?? 0,
-  total: log.tokensTotal,
-});
 
 function RequestLogSheet({
   log,
@@ -376,7 +421,7 @@ function RequestLogSheet({
                   <SheetTitle className="flex flex-wrap items-center gap-2">
                     <span className="truncate font-mono">{log.model}</span>
                     <StatusBadge
-                      tone={log.statusText === 'success' ? 'success' : 'destructive'}
+                      tone={statusTone(log.statusText)}
                       label={log.statusText === 'success' ? `成功 ${log.statusCode}` : `失败 ${log.statusCode}`}
                     />
                   </SheetTitle>
@@ -392,21 +437,17 @@ function RequestLogSheet({
             <ScrollArea className="min-h-0 flex-1">
               <div className="space-y-5 p-6">
                 <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
-                  <InfoTile icon={KeyRound} label="用户" value={log.userEmail} />
-                  <InfoTile icon={TerminalSquare} label="模型" value={log.model} />
-                  <InfoTile icon={Server} label="上游" value={log.upstreamName || '-'} />
-                  <InfoTile icon={KeyRound} label="API Key" value={log.apiKeyName} />
-                  <InfoTile icon={Clock} label="延迟" value={`${log.latencyMs}ms`} tone={latencyClass(log.latencyMs)} />
+                  <InfoTile icon={Clock} label="延迟" value={`${log.latencyMs}ms`} tone={latencyTone(log.latencyMs)} />
                   <InfoTile icon={Hash} label="总 Tokens" value={formatNumberFull(tokens.total)} />
-                  <InfoTile icon={Coins} label="成本" value={formatCurrency(log.estimatedCost ?? 0)} />
-                  <InfoTile icon={Server} label="尝试次数" value={String(log.attemptCount ?? attempts.length ?? 0)} />
+                  <InfoTile icon={KeyRound} label="API Key" value={log.apiKeyName} />
+                  <InfoTile icon={ScrollText} label="尝试次数" value={String(log.attemptCount ?? attempts.length ?? 0)} />
                 </div>
 
                 <div className="grid gap-3 rounded-lg border bg-muted/15 p-4 text-xs md:grid-cols-2 xl:grid-cols-4">
                   <MetaItem label="协议" value={log.protocol ?? '-'} />
                   <MetaItem label="路径" value={log.path ?? '-'} mono />
                   <MetaItem label="流式" value={log.stream ? '是' : '否'} />
-                  <MetaItem label="上游 Key" value={log.sourceKeyAlias ?? log.sourceKeyId ?? '-'} />
+                  <MetaItem label="时间" value={formatDateTime(log.timestamp)} />
                 </div>
 
                 <Card className="border-border/50">
@@ -440,8 +481,8 @@ function RequestLogSheet({
                   </TabsList>
 
                   <TabsContent value="payload" className="space-y-4">
-                    <PayloadPanel title="请求输入" value={prettyJson(log.requestPayload)} />
-                    <PayloadPanel title="响应输出" value={prettyJson(log.responsePayload)} />
+                    <PayloadPanel title="请求输入" value={pretty(log.requestPayload)} />
+                    <PayloadPanel title="响应输出" value={pretty(log.responsePayload)} />
                   </TabsContent>
 
                   <TabsContent value="attempts">
@@ -449,8 +490,8 @@ function RequestLogSheet({
                   </TabsContent>
 
                   <TabsContent value="headers" className="space-y-4">
-                    <PayloadPanel title="请求 Headers" value={prettyJson(log.requestHeaders)} />
-                    <PayloadPanel title="响应 Headers" value={prettyJson(log.responseHeaders)} />
+                    <PayloadPanel title="请求 Headers" value={pretty(log.requestHeaders)} />
+                    <PayloadPanel title="响应 Headers" value={pretty(log.responseHeaders)} />
                   </TabsContent>
                 </Tabs>
               </div>
@@ -488,40 +529,30 @@ function AttemptList({ attempts, loading }: { attempts: RequestAttemptLog[]; loa
     return (
       <div className="flex items-center gap-2 rounded-lg border bg-background p-3 text-sm text-muted-foreground">
         <Loader2 className="h-4 w-4 animate-spin" />
-        正在加载上游尝试链...
+        正在加载尝试链...
       </div>
     );
   }
   if (attempts.length === 0) {
-    return (
-      <div className="rounded-lg border bg-background p-3 text-sm text-muted-foreground">
-        此日志没有记录上游尝试链。
-      </div>
-    );
+    return <div className="rounded-lg border bg-background p-3 text-sm text-muted-foreground">此日志没有记录尝试链。</div>;
   }
   return (
-    <div className="overflow-hidden rounded-lg border bg-background">
-      <div className="border-b px-3 py-2 text-xs font-semibold text-muted-foreground">上游尝试链</div>
-      <div className="divide-y">
-        {attempts.map((attempt) => (
-          <div key={attempt.id} className="grid gap-3 p-3 text-xs md:grid-cols-[72px_1fr_120px_120px_120px]">
-            <div className="font-mono text-muted-foreground">#{attempt.attemptIndex}</div>
-            <div className="min-w-0">
-              <div className="truncate font-medium">{attempt.upstreamName || attempt.sourceId || '-'}</div>
-              <div className="mt-1 truncate font-mono text-muted-foreground">{attempt.model}</div>
-              {attempt.errorMessage && <div className="mt-1 truncate text-destructive">{attempt.errorMessage}</div>}
-            </div>
-            <div>
-              <StatusBadge
-                tone={attempt.statusText === 'success' ? 'success' : 'destructive'}
-                label={`${attempt.statusText === 'success' ? '成功' : '失败'} ${attempt.statusCode}`}
-              />
-            </div>
-            <div className={cn('font-mono font-medium', latencyClass(attempt.latencyMs))}>{attempt.latencyMs}ms</div>
-            <div className="font-mono text-muted-foreground">{formatDateTime(attempt.startedAt)}</div>
+    <div className="overflow-hidden rounded-lg border">
+      {attempts.map((attempt) => (
+        <div key={attempt.id} className="grid gap-3 border-b p-4 text-xs last:border-b-0 md:grid-cols-[80px_1fr_120px_110px]">
+          <div className="font-mono text-sm text-muted-foreground">#{attempt.attemptIndex}</div>
+          <div className="min-w-0">
+            <div className="text-sm font-medium">{formatDateTime(attempt.startedAt)}</div>
+            <div className="mt-1 truncate font-mono text-muted-foreground">{attempt.model}</div>
+            {attempt.errorMessage && <div className="mt-1 truncate text-xs text-destructive">{attempt.errorMessage}</div>}
           </div>
-        ))}
-      </div>
+          <StatusBadge
+            tone={attempt.statusText === 'success' ? 'success' : 'destructive'}
+            label={attempt.statusText === 'success' ? `成功 ${attempt.statusCode}` : `失败 ${attempt.statusCode}`}
+          />
+          <div className={cn('font-mono text-sm font-semibold', latencyTone(attempt.latencyMs))}>{attempt.latencyMs}ms</div>
+        </div>
+      ))}
     </div>
   );
 }

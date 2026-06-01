@@ -274,6 +274,7 @@ func (a *App) adminUpdateSource(c *gin.Context) {
 		}
 	}
 	updates := map[string]any{}
+	resetSourceHealth := false
 	stringFields := map[string]string{
 		"name":             "name",
 		"type":             "type",
@@ -302,6 +303,12 @@ func (a *App) adminUpdateSource(c *gin.Context) {
 				value = normalizeBaseURL(value)
 			}
 			updates[dbKey] = strings.TrimSpace(value)
+			switch jsonKey {
+			case "apiBase", "openaiBaseUrl", "anthropicBaseUrl", "apiKey":
+				resetSourceHealth = true
+			case "status":
+				resetSourceHealth = resetSourceHealth || strings.TrimSpace(value) == SourceStatusOnline
+			}
 		}
 	}
 	if value, ok := numberFromMap(req, "priority"); ok {
@@ -320,9 +327,20 @@ func (a *App) adminUpdateSource(c *gin.Context) {
 		errorJSON(c, http.StatusBadRequest, "no fields to update")
 		return
 	}
+	if resetSourceHealth {
+		updates["failure_count"] = 0
+		updates["cooldown_until"] = nil
+		updates["last_failure_at"] = nil
+	}
 	if err := a.db.Model(&UpstreamSource{}).Where("id = ?", sourceID).Updates(updates).Error; err != nil {
 		errorJSON(c, http.StatusBadRequest, "update source failed")
 		return
+	}
+	if resetSourceHealth {
+		if err := a.recoverSourceBindings(sourceID); err != nil {
+			errorJSON(c, http.StatusBadRequest, "recover source bindings failed")
+			return
+		}
 	}
 	var source UpstreamSource
 	if err := a.db.First(&source, sourceID).Error; err != nil {
@@ -361,6 +379,10 @@ func (a *App) adminCheckSource(c *gin.Context) {
 			sourceID,
 		).Error; err != nil {
 			errorJSON(c, http.StatusBadRequest, "update source health failed")
+			return
+		}
+		if err := a.recoverSourceBindings(sourceID); err != nil {
+			errorJSON(c, http.StatusBadRequest, "recover source bindings failed")
 			return
 		}
 	} else if err := a.db.Model(&UpstreamSource{}).Where("id = ?", sourceID).Updates(updates).Error; err != nil {
@@ -408,6 +430,10 @@ func (a *App) adminRecoverSource(c *gin.Context) {
 	}
 	if err := a.db.Model(&UpstreamSource{}).Where("id = ?", sourceID).Update("last_failure_at", nil).Error; err != nil {
 		errorJSON(c, http.StatusBadRequest, "recover source failed")
+		return
+	}
+	if err := a.recoverSourceBindings(sourceID); err != nil {
+		errorJSON(c, http.StatusBadRequest, "recover source bindings failed")
 		return
 	}
 	var refreshed UpstreamSource
@@ -1037,12 +1063,33 @@ func (a *App) adminCreateModel(c *gin.Context) {
 		model.Provider = "OpenAI"
 		model.Formats = normalizeModelFormats(req.Formats, model.Provider)
 	}
+	var existing ModelConfig
+	if err := a.db.Where("name = ?", model.Name).Order("id asc").First(&existing).Error; err == nil {
+		merged, err := a.appendModelBindingsToExisting(existing, model, parsedBindings)
+		if err != nil {
+			errorJSON(c, http.StatusBadRequest, "merge model bindings failed")
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"data": a.modelDTOWithRouting(merged)})
+		return
+	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
+		errorJSON(c, http.StatusBadRequest, "load model failed")
+		return
+	}
 	if err := a.db.Create(&model).Error; err != nil {
 		errorJSON(c, http.StatusBadRequest, "create model failed")
 		return
 	}
 	if err := a.replaceModelBindings(model.ID, parsedBindings); err != nil {
 		errorJSON(c, http.StatusBadRequest, "create model bindings failed")
+		return
+	}
+	if err := a.syncModelLegacyBindingFields(model.ID, a.primaryModelBindingRequest(parsedBindings)); err != nil {
+		errorJSON(c, http.StatusBadRequest, "create model binding mirror failed")
+		return
+	}
+	if err := a.db.First(&model, model.ID).Error; err != nil {
+		errorJSON(c, http.StatusNotFound, "model not found")
 		return
 	}
 	c.JSON(http.StatusCreated, gin.H{"data": a.modelDTOWithRouting(model)})
@@ -1161,11 +1208,15 @@ func (a *App) adminUpdateModel(c *gin.Context) {
 		return
 	}
 	if hasBindingRequests {
+		if err := a.deleteModelSiblings(model.Name, model.ID); err != nil {
+			errorJSON(c, http.StatusBadRequest, "delete duplicate model rows failed")
+			return
+		}
 		if err := a.replaceModelBindings(model.ID, parsedBindings); err != nil {
 			errorJSON(c, http.StatusBadRequest, "update model bindings failed")
 			return
 		}
-		if err := a.syncModelLegacyBindingFields(model.ID, parsedBindings[0]); err != nil {
+		if err := a.syncModelLegacyBindingFields(model.ID, a.primaryModelBindingRequest(parsedBindings)); err != nil {
 			errorJSON(c, http.StatusBadRequest, "update model binding mirror failed")
 			return
 		}
@@ -1185,12 +1236,85 @@ func (a *App) adminUpdateModel(c *gin.Context) {
 			errorJSON(c, http.StatusBadRequest, err.Error())
 			return
 		}
+		if err := a.deleteModelSiblings(model.Name, model.ID); err != nil {
+			errorJSON(c, http.StatusBadRequest, "delete duplicate model rows failed")
+			return
+		}
 		if err := a.replaceModelBindings(model.ID, parsed); err != nil {
 			errorJSON(c, http.StatusBadRequest, "update model bindings failed")
 			return
 		}
+		if err := a.syncModelLegacyBindingFields(model.ID, a.primaryModelBindingRequest(parsed)); err != nil {
+			errorJSON(c, http.StatusBadRequest, "update model binding mirror failed")
+			return
+		}
+		if err := a.db.First(&model, modelID).Error; err != nil {
+			errorJSON(c, http.StatusNotFound, "model not found")
+			return
+		}
 	}
 	c.JSON(http.StatusOK, gin.H{"data": a.modelDTOWithRouting(model)})
+}
+
+func (a *App) appendModelBindingsToExisting(existing ModelConfig, incoming ModelConfig, bindings []modelBindingRequest) (ModelConfig, error) {
+	var group []ModelConfig
+	if err := a.db.Where("name = ?", existing.Name).Order("id asc").Find(&group).Error; err != nil {
+		return ModelConfig{}, err
+	}
+	currentBindings, err := a.modelBindingRequestsForGroup(existing.ID, group)
+	if err != nil {
+		return ModelConfig{}, err
+	}
+	nextBindings := append(currentBindings, bindings...)
+	updates := modelCreateMergeUpdates(incoming)
+	if len(updates) > 0 {
+		if err := a.db.Model(&ModelConfig{}).Where("id = ?", existing.ID).Updates(updates).Error; err != nil {
+			return ModelConfig{}, err
+		}
+	}
+	if err := a.deleteModelSiblings(existing.Name, existing.ID); err != nil {
+		return ModelConfig{}, err
+	}
+	if err := a.replaceModelBindings(existing.ID, nextBindings); err != nil {
+		return ModelConfig{}, err
+	}
+	if err := a.syncModelLegacyBindingFields(existing.ID, a.primaryModelBindingRequest(nextBindings)); err != nil {
+		return ModelConfig{}, err
+	}
+	var refreshed ModelConfig
+	if err := a.db.First(&refreshed, existing.ID).Error; err != nil {
+		return ModelConfig{}, err
+	}
+	return refreshed, nil
+}
+
+func modelCreateMergeUpdates(model ModelConfig) map[string]any {
+	updates := map[string]any{
+		"provider": model.Provider,
+		"formats":  model.Formats,
+		"status":   model.Status,
+	}
+	if model.InputPrice != 0 || model.BillingInput != 0 {
+		updates["input_price"] = model.InputPrice
+		updates["input_multiple"] = nonZeroFloat(model.InputMultiple, 1)
+		updates["billing_input"] = model.BillingInput
+	}
+	if model.OutputPrice != 0 || model.BillingOutput != 0 {
+		updates["output_price"] = model.OutputPrice
+		updates["output_multiple"] = nonZeroFloat(model.OutputMultiple, 1)
+		updates["billing_output"] = model.BillingOutput
+	}
+	if model.CacheWritePrice != 0 || model.BillingCacheWrite != 0 {
+		updates["cache_write_price"] = model.CacheWritePrice
+		updates["cache_write_multiple"] = nonZeroFloat(model.CacheWriteMultiple, 1)
+		updates["billing_cache_write"] = model.BillingCacheWrite
+	}
+	if model.CacheReadPrice != 0 || model.BillingCacheRead != 0 {
+		updates["cache_read_price"] = model.CacheReadPrice
+		updates["cache_read_multiple"] = nonZeroFloat(model.CacheReadMultiple, 1)
+		updates["billing_cache_read"] = model.BillingCacheRead
+	}
+	return updates
 }
 
 func modelPricingUpdates(req map[string]any, existing ModelConfig) map[string]any {
@@ -1836,11 +1960,11 @@ func (a *App) modelRouteCandidatesByName(models []ModelConfig, sources map[uint]
 		sort.SliceStable(out[name], func(i, j int) bool {
 			left := out[name][i]
 			right := out[name][j]
-			if left.SourcePriority != right.SourcePriority {
-				return left.SourcePriority < right.SourcePriority
-			}
 			if left.RoutingWeight != right.RoutingWeight {
 				return left.RoutingWeight > right.RoutingWeight
+			}
+			if left.SourcePriority != right.SourcePriority {
+				return left.SourcePriority < right.SourcePriority
 			}
 			return publicIDNumber(left.ID) < publicIDNumber(right.ID)
 		})

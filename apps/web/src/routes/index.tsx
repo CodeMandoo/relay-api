@@ -20,6 +20,7 @@ const UserDashboard = lazy(() => import('@/pages/user/Dashboard'));
 const UserModels = lazy(() => import('@/pages/user/Models'));
 const UserApiKeys = lazy(() => import('@/pages/user/ApiKeys'));
 const UserUsage = lazy(() => import('@/pages/user/Usage'));
+const UserRequestLogs = lazy(() => import('@/pages/user/RequestLogs'));
 
 const page = (node: ReactNode) => (
   <Suspense fallback={<div className="p-8 text-sm text-muted-foreground">正在加载页面...</div>}>
@@ -59,6 +60,7 @@ export const router = createBrowserRouter([
       { path: '/user/models', element: page(<UserModels />) },
       { path: '/user/api-keys', element: page(<UserApiKeys />) },
       { path: '/user/usage', element: page(<UserUsage />) },
+      { path: '/user/logs', element: page(<UserRequestLogs />) },
     ],
   },
   { path: '*', element: <Navigate to="/login" replace /> },

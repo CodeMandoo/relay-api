@@ -3,6 +3,7 @@ package app
 import (
 	"errors"
 	"sort"
+	"time"
 
 	"gorm.io/gorm"
 )
@@ -99,6 +100,7 @@ func ensureBindingsForLegacyModels(db *gorm.DB, canonical ModelConfig, models []
 			RoutingEnabled: model.RoutingEnabled,
 			Enabled:        model.Status == ModelStatusActive,
 			LatencyMS:      model.LatencyMS,
+			SchedulerState: schedulerStateClosed,
 		}
 		if err := db.Create(&binding).Error; err != nil {
 			return err
@@ -177,6 +179,89 @@ func (a *App) modelBindings(model ModelConfig) ([]ModelRouteBinding, error) {
 	return bindings, nil
 }
 
+func modelBindingRequestFromBinding(binding ModelRouteBinding, keepID bool) modelBindingRequest {
+	req := modelBindingRequest{
+		SourceID:      id("s", binding.SourceID),
+		SourceKeyID:   "default",
+		RoutingWeight: nonZeroInt(binding.RoutingWeight, 1),
+	}
+	if keepID && binding.ID != 0 {
+		req.ID = id("mb", binding.ID)
+	}
+	if binding.SourceKeyID != nil && *binding.SourceKeyID > 0 {
+		req.SourceKeyID = id("sk", *binding.SourceKeyID)
+	}
+	routingEnabled := binding.RoutingEnabled
+	enabled := binding.Enabled
+	req.RoutingEnabled = &routingEnabled
+	req.Enabled = &enabled
+	return req
+}
+
+func (a *App) modelBindingRequestsForGroup(canonicalID uint, models []ModelConfig) ([]modelBindingRequest, error) {
+	requests := make([]modelBindingRequest, 0)
+	for _, model := range models {
+		bindings, err := a.modelBindings(model)
+		if err != nil {
+			return nil, err
+		}
+		for _, binding := range bindings {
+			requests = append(requests, modelBindingRequestFromBinding(binding, model.ID == canonicalID))
+		}
+	}
+	return requests, nil
+}
+
+func (a *App) deleteModelSiblings(name string, keepID uint) error {
+	var siblings []ModelConfig
+	if err := a.db.Where("name = ? AND id <> ?", name, keepID).Find(&siblings).Error; err != nil {
+		return err
+	}
+	if len(siblings) == 0 {
+		return nil
+	}
+	ids := make([]uint, 0, len(siblings))
+	for _, sibling := range siblings {
+		ids = append(ids, sibling.ID)
+	}
+	if err := a.db.Where("model_id IN ?", ids).Delete(&ModelRouteBinding{}).Error; err != nil {
+		return err
+	}
+	return a.db.Delete(&ModelConfig{}, ids).Error
+}
+
+func (a *App) primaryModelBindingRequest(bindings []modelBindingRequest) modelBindingRequest {
+	if len(bindings) == 0 {
+		return modelBindingRequest{}
+	}
+	out := append([]modelBindingRequest(nil), bindings...)
+	sources := a.sourceMap()
+	now := time.Now()
+	sort.SliceStable(out, func(i, j int) bool {
+		leftSourceID, _ := parseNumericID(out[i].SourceID)
+		rightSourceID, _ := parseNumericID(out[j].SourceID)
+		leftSource := sources[leftSourceID]
+		rightSource := sources[rightSourceID]
+		leftEnabled := out[i].Enabled == nil || *out[i].Enabled
+		rightEnabled := out[j].Enabled == nil || *out[j].Enabled
+		leftSchedulable := leftEnabled && leftSource.Status == SourceStatusOnline && (leftSource.CooldownUntil == nil || !leftSource.CooldownUntil.After(now))
+		rightSchedulable := rightEnabled && rightSource.Status == SourceStatusOnline && (rightSource.CooldownUntil == nil || !rightSource.CooldownUntil.After(now))
+		if leftSchedulable != rightSchedulable {
+			return leftSchedulable
+		}
+		leftWeight := nonZeroInt(out[i].RoutingWeight, 1)
+		rightWeight := nonZeroInt(out[j].RoutingWeight, 1)
+		if leftWeight != rightWeight {
+			return leftWeight > rightWeight
+		}
+		if leftSource.Priority != rightSource.Priority {
+			return leftSource.Priority < rightSource.Priority
+		}
+		return leftSourceID < rightSourceID
+	})
+	return out[0]
+}
+
 func sourceKeyIDValueFromBinding(binding ModelRouteBinding) uint {
 	if binding.SourceKeyID == nil {
 		return 0
@@ -228,16 +313,11 @@ func normalizeBindingRequests(bindings []modelBindingRequest, fallback modelBind
 
 func (a *App) validateModelBindingRequests(bindings []modelBindingRequest) ([]modelBindingRequest, error) {
 	out := make([]modelBindingRequest, 0, len(bindings))
-	seen := map[uint]bool{}
 	for _, binding := range bindings {
 		sourceID, err := parseNumericID(binding.SourceID)
 		if err != nil {
 			return nil, err
 		}
-		if seen[sourceID] {
-			return nil, errors.New("duplicate source binding")
-		}
-		seen[sourceID] = true
 		if _, err := a.getSourceForModel(sourceID); err != nil {
 			return nil, err
 		}
@@ -319,6 +399,11 @@ func (a *App) replaceModelBindings(modelID uint, bindings []modelBindingRequest)
 				"routing_weight":  weight,
 				"routing_enabled": routingEnabled,
 				"enabled":         enabled,
+				"scheduler_state": schedulerStateClosed,
+				"failure_count":   0,
+				"success_streak":  0,
+				"cooldown_until":  nil,
+				"last_failure_at": nil,
 			}
 			result := a.db.Model(&ModelRouteBinding{}).Where("id = ? AND model_id = ?", bindingID, modelID).Updates(updates)
 			if result.Error != nil {
@@ -326,6 +411,7 @@ func (a *App) replaceModelBindings(modelID uint, bindings []modelBindingRequest)
 			}
 			if result.RowsAffected > 0 {
 				keep = append(keep, bindingID)
+				a.resetSchedulerBindingMemory(bindingID)
 				continue
 			}
 		}
@@ -336,6 +422,7 @@ func (a *App) replaceModelBindings(modelID uint, bindings []modelBindingRequest)
 			RoutingWeight:  weight,
 			RoutingEnabled: routingEnabled,
 			Enabled:        enabled,
+			SchedulerState: schedulerStateClosed,
 		}
 		if err := a.db.Create(&row).Error; err != nil {
 			return err

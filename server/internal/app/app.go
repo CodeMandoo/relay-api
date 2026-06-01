@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -15,9 +16,11 @@ import (
 )
 
 type App struct {
-	cfg    Config
-	db     *gorm.DB
-	router *gin.Engine
+	cfg              Config
+	db               *gorm.DB
+	router           *gin.Engine
+	schedulerMu      sync.Mutex
+	schedulerCurrent map[string]int
 }
 
 func New(cfg Config) (*App, error) {
@@ -29,7 +32,7 @@ func New(cfg Config) (*App, error) {
 		return nil, err
 	}
 
-	app := &App{cfg: cfg, db: db}
+	app := &App{cfg: cfg, db: db, schedulerCurrent: map[string]int{}}
 	if err := app.bootstrap(); err != nil {
 		return nil, err
 	}

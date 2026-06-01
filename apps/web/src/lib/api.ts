@@ -240,6 +240,20 @@ export const userApi = {
   dashboard: () => apiRequest<ApiEnvelope<UserDashboardResponse>>('/user/dashboard'),
   usage: (range: 'day' | 'week' | 'month', apiKeyId = 'all') =>
     apiRequest<ApiEnvelope<UserUsageResponse>>(`/user/usage?range=${range}&apiKeyId=${apiKeyId}`),
+  logs: (params: { model?: string; status?: string; apiKeyId?: string; q?: string; page?: number; pageSize?: number; from?: string; to?: string } = {}) => {
+    const search = new URLSearchParams();
+    if (params.model && params.model !== 'all') search.set('model', params.model);
+    if (params.status && params.status !== 'all') search.set('status', params.status);
+    if (params.apiKeyId && params.apiKeyId !== 'all') search.set('apiKeyId', params.apiKeyId);
+    if (params.q?.trim()) search.set('q', params.q.trim());
+    if (params.page) search.set('page', String(params.page));
+    if (params.pageSize) search.set('pageSize', String(params.pageSize));
+    if (params.from) search.set('from', params.from);
+    if (params.to) search.set('to', params.to);
+    const suffix = search.size ? `?${search.toString()}` : '';
+    return apiRequest<PaginatedApiEnvelope<RequestLog[]>>(`/user/logs${suffix}`);
+  },
+  logAttempts: (id: string) => apiRequest<ApiEnvelope<RequestAttemptLog[]>>(`/user/logs/${id}/attempts`),
   models: () => apiRequest<ApiEnvelope<UserModel[]>>('/user/models'),
   testModel: (id: string) => apiRequest<ApiEnvelope<{ latencyMs: number }>>(`/user/models/${id}/test`, { method: 'POST' }),
   invokeTestModel: (id: string) =>

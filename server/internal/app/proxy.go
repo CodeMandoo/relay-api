@@ -9,7 +9,6 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"sort"
 	"strings"
 	"time"
 
@@ -31,11 +30,6 @@ const (
 	relayProtocolOpenAI    relayProtocol = "openai"
 	relayProtocolAnthropic relayProtocol = "anthropic"
 	relayProtocolGemini    relayProtocol = "gemini"
-)
-
-const (
-	sourceFailureCooldownThreshold = 1
-	sourceFailureCooldownDuration  = 5 * time.Minute
 )
 
 type usageTokens struct {
@@ -487,6 +481,7 @@ func (a *App) routeTargets(modelName string, protocol relayProtocol) ([]routeTar
 				}
 				target.SourceKey = &sourceKey
 			}
+			target.Binding = a.refreshSchedulerState(target.Binding, now)
 			candidates = append(candidates, target)
 		}
 	}
@@ -503,26 +498,15 @@ func (a *App) routeTargets(modelName string, protocol relayProtocol) ([]routeTar
 		if target.Source.CooldownUntil != nil && target.Source.CooldownUntil.After(now) {
 			continue
 		}
+		if effectiveRoutingWeight(target, now) <= 0 {
+			continue
+		}
 		targets = append(targets, target)
 	}
 	if len(targets) == 0 {
 		return nil, errors.New("no online source for model")
 	}
-	sort.SliceStable(targets, func(i, j int) bool {
-		if targets[i].Source.Priority != targets[j].Source.Priority {
-			return targets[i].Source.Priority < targets[j].Source.Priority
-		}
-		leftWeight := nonZeroInt(targets[i].Binding.RoutingWeight, 1)
-		rightWeight := nonZeroInt(targets[j].Binding.RoutingWeight, 1)
-		if leftWeight != rightWeight {
-			return leftWeight > rightWeight
-		}
-		if targets[i].Binding.ID != targets[j].Binding.ID {
-			return targets[i].Binding.ID < targets[j].Binding.ID
-		}
-		return targets[i].Model.ID < targets[j].Model.ID
-	})
-	return targets, nil
+	return a.scheduleTargets(targets, now), nil
 }
 
 func (a *App) checkQuota(user User) error {
@@ -732,6 +716,7 @@ func (a *App) markTargetSuccess(target routeTarget) {
 		return
 	}
 	now := time.Now()
+	a.markBindingSuccess(target, now)
 	_ = a.db.Model(&UpstreamSource{}).Where("id = ?", target.Source.ID).Updates(map[string]any{
 		"failure_count":   0,
 		"cooldown_until":  nil,
@@ -746,12 +731,10 @@ func (a *App) markTargetFailure(target routeTarget, statusCode int) {
 		return
 	}
 	now := time.Now()
+	a.markBindingFailure(target, now)
 	updates := map[string]any{
 		"failure_count":   gorm.Expr("failure_count + ?", 1),
 		"last_failure_at": now,
-	}
-	if !target.SingleSource && target.Source.FailureCount+1 >= sourceFailureCooldownThreshold {
-		updates["cooldown_until"] = now.Add(sourceFailureCooldownDuration)
 	}
 	_ = a.db.Model(&UpstreamSource{}).Where("id = ?", target.Source.ID).Updates(updates).Error
 }

@@ -21,6 +21,7 @@ const userMap: Record<string, PageMeta> = {
   '/user/models': { title: '可用模型', subtitle: '在线模型与实时延迟' },
   '/user/api-keys': { title: 'API Keys', subtitle: '创建、管理、回收 sk-xxx' },
   '/user/usage': { title: '用量明细', subtitle: '按时间 / Key / 模型钻取' },
+  '/user/logs': { title: '请求日志', subtitle: '逐次请求、Token、成本与结果' },
 };
 
 export function adminPageMeta(pathname: string): PageMeta {

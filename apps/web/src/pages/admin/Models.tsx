@@ -121,9 +121,9 @@ const routeCandidateOrder = (left: RouteCandidate, right: RouteCandidate) => {
   const leftSchedulable = isRouteCandidateSchedulable(left);
   const rightSchedulable = isRouteCandidateSchedulable(right);
   if (leftSchedulable !== rightSchedulable) return leftSchedulable ? -1 : 1;
-  if (left.sourcePriority !== right.sourcePriority) return left.sourcePriority - right.sourcePriority;
   const weightDiff = routeCandidateWeight(right) - routeCandidateWeight(left);
   if (weightDiff !== 0) return weightDiff;
+  if (left.sourcePriority !== right.sourcePriority) return left.sourcePriority - right.sourcePriority;
   return publicIdNumber(left.id) - publicIdNumber(right.id);
 };
 
@@ -148,7 +148,7 @@ function RoutingRuleHint() {
         </button>
       </TooltipTrigger>
       <TooltipContent side="top" align="start" className="max-w-sm text-xs leading-relaxed">
-        启用状态即参与调度。先过滤未启用、上游非在线和冷却中候选；再按源优先级 P 从小到大，同 P 按权重 W 从大到小；失败、超时、429 或 5xx 时切到下一个候选。
+        启用状态即参与调度。先过滤未启用、上游非在线和冷却中候选；正常请求按权重 W 做平滑加权轮询，失败、超时、429 或 5xx 会切到下一个候选，并按连续失败进入短/中/长冷却。
       </TooltipContent>
     </Tooltip>
   );
@@ -312,8 +312,7 @@ export default function Page() {
   };
 
   const addBinding = () => {
-    const used = new Set(newBindings.map((binding) => binding.sourceId));
-    const sourceId = sources.find((source) => !used.has(source.id))?.id ?? sources[0]?.id ?? '';
+    const sourceId = sources[0]?.id ?? '';
     setNewBindings((current) => [...current, makeBindingDraft(sourceId)]);
   };
 
@@ -326,14 +325,6 @@ export default function Page() {
     if (validBindings.length === 0) {
       toast.error('请至少选择一个上游源');
       return [];
-    }
-    const seen = new Set<string>();
-    for (const binding of validBindings) {
-      if (seen.has(binding.sourceId)) {
-        toast.error('同一个模型下不能重复选择同一个上游源');
-        return [];
-      }
-      seen.add(binding.sourceId);
     }
     return validBindings;
   };
@@ -493,7 +484,6 @@ export default function Page() {
       {newBindings.map((binding, index) => {
         const sourceKeys = sourceKeysBySource[binding.sourceId] ?? [];
         const sourceKeyLoading = sourceKeyLoadingBySource[binding.sourceId];
-        const selectedSourceIds = new Set(newBindings.filter((item) => item.clientId !== binding.clientId).map((item) => item.sourceId));
         return (
           <div key={binding.clientId} className="grid gap-3 rounded-lg border bg-muted/20 p-3">
             <div className="flex items-center justify-between gap-2">
@@ -510,7 +500,7 @@ export default function Page() {
                   <SelectTrigger className="min-w-0 [&>span]:min-w-0 [&>span]:truncate"><SelectValue placeholder="选择上游源" /></SelectTrigger>
                   <SelectContent className="max-w-[var(--radix-select-trigger-width)]">
                     {sources.map((source) => (
-                      <SelectItem key={source.id} value={source.id} disabled={selectedSourceIds.has(source.id)}>
+                      <SelectItem key={source.id} value={source.id}>
                         <span className="block max-w-full truncate">{source.name}</span>
                       </SelectItem>
                     ))}
@@ -551,7 +541,7 @@ export default function Page() {
           </div>
         );
       })}
-      <Button type="button" variant="outline" onClick={addBinding} disabled={sources.length === 0 || newBindings.length >= sources.length}>
+      <Button type="button" variant="outline" onClick={addBinding} disabled={sources.length === 0}>
         <Plus className="mr-2 h-4 w-4" />
         添加上游源
       </Button>

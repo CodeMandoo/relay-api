@@ -439,6 +439,124 @@ func TestAdminModelsExposeRoutingCandidatesAndControls(t *testing.T) {
 	}
 }
 
+func TestAdminModelDuplicateSourceBindingsCanBeRemoved(t *testing.T) {
+	app := testApp(t)
+	adminToken := loginToken(t, app, testAdminEmail, testAdminPassword, RoleAdmin)
+	source := UpstreamSource{Name: "Duplicate_Source_Remove", Type: SourceTypeThirdParty, BaseURL: "https://dup.example.com/v1", APIKey: "dup-key", Priority: 1, Status: SourceStatusOnline}
+	if err := app.db.Create(&source).Error; err != nil {
+		t.Fatalf("create source: %v", err)
+	}
+
+	create := performJSON(app, http.MethodPost, "/api/admin/models", adminToken, map[string]any{
+		"name":     "duplicate-source-model",
+		"sourceId": id("s", source.ID),
+		"provider": "OpenAI",
+		"formats":  []string{ModelFormatOpenAI},
+		"bindings": []map[string]any{
+			{"sourceId": id("s", source.ID), "routingWeight": 1},
+			{"sourceId": id("s", source.ID), "routingWeight": 5},
+		},
+	})
+	if create.Code != http.StatusCreated {
+		t.Fatalf("create duplicate bindings model: %d %s", create.Code, create.Body.String())
+	}
+	created := decodeBody(t, create)["data"].(map[string]any)
+	modelID := created["id"].(string)
+	candidates := created["routingCandidates"].([]any)
+	if len(candidates) != 2 {
+		t.Fatalf("candidate count = %d, want 2 in %v", len(candidates), created)
+	}
+	kept := candidates[1].(map[string]any)
+
+	update := performJSON(app, http.MethodPut, "/api/admin/models/"+modelID, adminToken, map[string]any{
+		"bindings": []map[string]any{
+			{
+				"id":            kept["id"],
+				"sourceId":      kept["sourceId"],
+				"sourceKeyId":   "default",
+				"routingWeight": kept["routingWeight"],
+			},
+		},
+	})
+	if update.Code != http.StatusOK {
+		t.Fatalf("remove duplicate binding: %d %s", update.Code, update.Body.String())
+	}
+	updated := decodeBody(t, update)["data"].(map[string]any)
+	updatedCandidates := updated["routingCandidates"].([]any)
+	if len(updatedCandidates) != 1 {
+		t.Fatalf("candidate count after delete = %d, want 1 in %v", len(updatedCandidates), updated)
+	}
+	var bindingCount int64
+	if err := app.db.Model(&ModelRouteBinding{}).Where("model_id = ?", publicIDNumber(modelID)).Count(&bindingCount).Error; err != nil {
+		t.Fatalf("count route bindings: %v", err)
+	}
+	if bindingCount != 1 {
+		t.Fatalf("route binding count = %d, want 1", bindingCount)
+	}
+}
+
+func TestAdminModelUpdateRemovesDuplicateSiblingRows(t *testing.T) {
+	app := testApp(t)
+	adminToken := loginToken(t, app, testAdminEmail, testAdminPassword, RoleAdmin)
+	source := UpstreamSource{Name: "Duplicate_Sibling_Source", Type: SourceTypeThirdParty, BaseURL: "https://sibling.example.com/v1", APIKey: "sibling-key", Priority: 1, Status: SourceStatusOnline}
+	if err := app.db.Create(&source).Error; err != nil {
+		t.Fatalf("create source: %v", err)
+	}
+	models := []ModelConfig{
+		{SourceID: source.ID, Name: "duplicate-sibling-model", Provider: "OpenAI", Formats: ModelFormatOpenAI, Status: ModelStatusActive, RoutingWeight: 1},
+		{SourceID: source.ID, Name: "duplicate-sibling-model", Provider: "OpenAI", Formats: ModelFormatOpenAI, Status: ModelStatusActive, RoutingWeight: 2},
+	}
+	if err := app.db.Create(&models).Error; err != nil {
+		t.Fatalf("create duplicate model rows: %v", err)
+	}
+	if err := app.replaceModelBindings(models[0].ID, []modelBindingRequest{{SourceID: id("s", source.ID), SourceKeyID: "default", RoutingWeight: 1}}); err != nil {
+		t.Fatalf("create first binding: %v", err)
+	}
+	if err := app.replaceModelBindings(models[1].ID, []modelBindingRequest{{SourceID: id("s", source.ID), SourceKeyID: "default", RoutingWeight: 2}}); err != nil {
+		t.Fatalf("create sibling binding: %v", err)
+	}
+
+	list := performJSON(app, http.MethodGet, "/api/admin/models?q=duplicate-sibling-model", adminToken, nil)
+	if list.Code != http.StatusOK {
+		t.Fatalf("list duplicate sibling model: %d %s", list.Code, list.Body.String())
+	}
+	rows := decodeBody(t, list)["data"].([]any)
+	first := rows[0].(map[string]any)
+	candidates := first["routingCandidates"].([]any)
+	if len(candidates) != 2 {
+		t.Fatalf("expected dirty state with two duplicate candidates, got %v", first)
+	}
+	kept := candidates[0].(map[string]any)
+
+	update := performJSON(app, http.MethodPut, "/api/admin/models/"+first["id"].(string), adminToken, map[string]any{
+		"bindings": []map[string]any{
+			{
+				"id":            kept["id"],
+				"sourceId":      kept["sourceId"],
+				"sourceKeyId":   "default",
+				"routingWeight": kept["routingWeight"],
+			},
+		},
+	})
+	if update.Code != http.StatusOK {
+		t.Fatalf("remove duplicate sibling binding: %d %s", update.Code, update.Body.String())
+	}
+	var modelCount int64
+	if err := app.db.Model(&ModelConfig{}).Where("name = ?", "duplicate-sibling-model").Count(&modelCount).Error; err != nil {
+		t.Fatalf("count model rows: %v", err)
+	}
+	if modelCount != 1 {
+		t.Fatalf("model row count = %d, want 1", modelCount)
+	}
+	var bindingCount int64
+	if err := app.db.Model(&ModelRouteBinding{}).Where("model_id = ?", models[0].ID).Count(&bindingCount).Error; err != nil {
+		t.Fatalf("count route bindings: %v", err)
+	}
+	if bindingCount != 1 {
+		t.Fatalf("route binding count = %d, want 1", bindingCount)
+	}
+}
+
 func TestModelBindingMigrationMergesLegacyDuplicateModels(t *testing.T) {
 	app := testApp(t)
 	sourceA := UpstreamSource{Name: "Legacy_Source_A", Type: SourceTypeThirdParty, BaseURL: "https://legacy-a.example.com/v1", APIKey: "a-key", Priority: 2, Status: SourceStatusOnline}
@@ -505,6 +623,25 @@ func TestAdminRecoverSourceClearsCooldown(t *testing.T) {
 	if err := app.db.Create(&source).Error; err != nil {
 		t.Fatalf("create recover source: %v", err)
 	}
+	model := ModelConfig{SourceID: source.ID, Name: "recover-binding-model", Provider: "OpenAI", Formats: ModelFormatOpenAI, Status: ModelStatusActive}
+	if err := app.db.Create(&model).Error; err != nil {
+		t.Fatalf("create recover binding model: %v", err)
+	}
+	if err := app.replaceModelBindings(model.ID, []modelBindingRequest{{SourceID: id("s", source.ID), SourceKeyID: "default", RoutingWeight: 1}}); err != nil {
+		t.Fatalf("create recover binding: %v", err)
+	}
+	var binding ModelRouteBinding
+	if err := app.db.Where("model_id = ?", model.ID).First(&binding).Error; err != nil {
+		t.Fatalf("load recover binding: %v", err)
+	}
+	if err := app.db.Model(&ModelRouteBinding{}).Where("id = ?", binding.ID).Updates(map[string]any{
+		"scheduler_state": schedulerStateOpen,
+		"failure_count":   4,
+		"cooldown_until":  cooldownUntil,
+		"last_failure_at": lastFailure,
+	}).Error; err != nil {
+		t.Fatalf("cool recover binding: %v", err)
+	}
 
 	w := performJSON(app, http.MethodPost, "/api/admin/sources/"+id("s", source.ID)+"/recover", adminToken, nil)
 	if w.Code != http.StatusOK {
@@ -520,6 +657,222 @@ func TestAdminRecoverSourceClearsCooldown(t *testing.T) {
 	}
 	if refreshed.FailureCount != 0 || refreshed.CooldownUntil != nil || refreshed.LastFailureAt != nil {
 		t.Fatalf("expected cooldown fields cleared, got %+v", refreshed)
+	}
+	var recoveredBinding ModelRouteBinding
+	if err := app.db.First(&recoveredBinding, binding.ID).Error; err != nil {
+		t.Fatalf("load recovered binding: %v", err)
+	}
+	if schedulerBindingState(recoveredBinding) != schedulerStateClosed || recoveredBinding.FailureCount != 0 || recoveredBinding.CooldownUntil != nil || recoveredBinding.LastFailureAt != nil {
+		t.Fatalf("expected binding cooldown fields cleared, got %+v", recoveredBinding)
+	}
+}
+
+func TestSchedulerSmoothWeightedRoundRobinUsesRoutingWeight(t *testing.T) {
+	app := testApp(t)
+	primary, backup, _ := createSchedulerModel(t, app, "weighted-scheduler-model", 3, 1)
+
+	hits := map[uint]int{}
+	for i := 0; i < 4; i++ {
+		targets, err := app.routeTargets("weighted-scheduler-model", relayProtocolOpenAI)
+		if err != nil {
+			t.Fatalf("route targets: %v", err)
+		}
+		if len(targets) == 0 {
+			t.Fatalf("expected route targets")
+		}
+		hits[targets[0].Source.ID]++
+	}
+	if hits[primary.ID] != 3 || hits[backup.ID] != 1 {
+		t.Fatalf("expected 3:1 weighted schedule, got primary=%d backup=%d", hits[primary.ID], hits[backup.ID])
+	}
+}
+
+func TestSchedulerFailureLadderAndHalfOpenProbe(t *testing.T) {
+	app := testApp(t)
+	primary, _, _ := createSchedulerModel(t, app, "failure-ladder-model", 5, 1)
+	target := firstSchedulerTarget(t, app, "failure-ladder-model")
+	if target.Source.ID != primary.ID {
+		t.Fatalf("expected primary target first, got %+v", target.Source)
+	}
+
+	app.markTargetFailure(target, http.StatusBadGateway)
+	binding := loadRouteBinding(t, app, target.Binding.ID)
+	if schedulerBindingState(binding) != schedulerStateClosed || binding.FailureCount != 1 || binding.CooldownUntil != nil {
+		t.Fatalf("first failure should stay closed without cooldown, got %+v", binding)
+	}
+
+	app.markTargetFailure(target, http.StatusBadGateway)
+	binding = loadRouteBinding(t, app, target.Binding.ID)
+	if schedulerBindingState(binding) != schedulerStateOpen || binding.FailureCount != 2 {
+		t.Fatalf("second failure should open breaker, got %+v", binding)
+	}
+	assertCooldownNear(t, binding.CooldownUntil, schedulerShortCooldown)
+
+	app.markTargetFailure(target, http.StatusBadGateway)
+	binding = loadRouteBinding(t, app, target.Binding.ID)
+	assertCooldownNear(t, binding.CooldownUntil, schedulerMediumCooldown)
+
+	app.markTargetFailure(target, http.StatusBadGateway)
+	binding = loadRouteBinding(t, app, target.Binding.ID)
+	assertCooldownNear(t, binding.CooldownUntil, schedulerLongCooldown)
+
+	past := time.Now().Add(-time.Second)
+	if err := app.db.Model(&ModelRouteBinding{}).Where("id = ?", target.Binding.ID).Updates(map[string]any{
+		"scheduler_state": schedulerStateOpen,
+		"cooldown_until":  past,
+	}).Error; err != nil {
+		t.Fatalf("expire cooldown: %v", err)
+	}
+	app.resetSchedulerMemory()
+	targets, err := app.routeTargets("failure-ladder-model", relayProtocolOpenAI)
+	if err != nil {
+		t.Fatalf("route half-open target: %v", err)
+	}
+	if len(targets) == 0 || targets[0].Binding.ID != target.Binding.ID {
+		t.Fatalf("expected expired binding to be probed first, got %+v", targets)
+	}
+	binding = loadRouteBinding(t, app, target.Binding.ID)
+	if schedulerBindingState(binding) != schedulerStateHalfOpen {
+		t.Fatalf("expected expired open binding to become half-open, got %+v", binding)
+	}
+
+	app.markTargetFailure(targets[0], http.StatusBadGateway)
+	binding = loadRouteBinding(t, app, target.Binding.ID)
+	if schedulerBindingState(binding) != schedulerStateOpen {
+		t.Fatalf("half-open failure should reopen breaker, got %+v", binding)
+	}
+	assertCooldownNear(t, binding.CooldownUntil, schedulerLongCooldown)
+}
+
+func TestSchedulerRecoveringSuccessAndFailure(t *testing.T) {
+	app := testApp(t)
+	_, _, _ = createSchedulerModel(t, app, "recovering-scheduler-model", 5, 1)
+	target := firstSchedulerTarget(t, app, "recovering-scheduler-model")
+	if err := app.db.Model(&ModelRouteBinding{}).Where("id = ?", target.Binding.ID).Updates(map[string]any{
+		"scheduler_state": schedulerStateHalfOpen,
+		"failure_count":   4,
+		"success_streak":  0,
+		"cooldown_until":  nil,
+	}).Error; err != nil {
+		t.Fatalf("set half-open binding: %v", err)
+	}
+
+	app.markTargetSuccess(target)
+	binding := loadRouteBinding(t, app, target.Binding.ID)
+	if schedulerBindingState(binding) != schedulerStateRecovering || binding.SuccessStreak != 1 || binding.CooldownUntil != nil {
+		t.Fatalf("half-open success should enter recovering, got %+v", binding)
+	}
+	app.markTargetSuccess(target)
+	app.markTargetSuccess(target)
+	binding = loadRouteBinding(t, app, target.Binding.ID)
+	if schedulerBindingState(binding) != schedulerStateClosed || binding.FailureCount != 0 || binding.SuccessStreak != 0 || binding.CooldownUntil != nil {
+		t.Fatalf("three recovering successes should close breaker, got %+v", binding)
+	}
+
+	if err := app.db.Model(&ModelRouteBinding{}).Where("id = ?", target.Binding.ID).Updates(map[string]any{
+		"scheduler_state": schedulerStateRecovering,
+		"failure_count":   2,
+		"success_streak":  1,
+		"cooldown_until":  nil,
+	}).Error; err != nil {
+		t.Fatalf("set recovering binding: %v", err)
+	}
+	app.markTargetFailure(target, http.StatusBadGateway)
+	binding = loadRouteBinding(t, app, target.Binding.ID)
+	if schedulerBindingState(binding) != schedulerStateOpen || binding.SuccessStreak != 0 {
+		t.Fatalf("recovering failure should reopen breaker, got %+v", binding)
+	}
+	assertCooldownNear(t, binding.CooldownUntil, schedulerLongCooldown)
+}
+
+func TestModelBindingUpdateResetsSchedulerCooldownAndAppliesWeight(t *testing.T) {
+	app := testApp(t)
+	primary, backup, model := createSchedulerModel(t, app, "binding-update-scheduler-model", 10, 1)
+	var bindings []ModelRouteBinding
+	if err := app.db.Where("model_id = ?", model.ID).Order("id asc").Find(&bindings).Error; err != nil {
+		t.Fatalf("load scheduler bindings: %v", err)
+	}
+	if len(bindings) != 2 {
+		t.Fatalf("binding count = %d, want 2", len(bindings))
+	}
+	cooldownUntil := time.Now().Add(10 * time.Minute)
+	if err := app.db.Model(&ModelRouteBinding{}).Where("id = ?", bindings[0].ID).Updates(map[string]any{
+		"scheduler_state": schedulerStateOpen,
+		"failure_count":   4,
+		"cooldown_until":  cooldownUntil,
+	}).Error; err != nil {
+		t.Fatalf("cool primary binding: %v", err)
+	}
+
+	if err := app.replaceModelBindings(model.ID, []modelBindingRequest{
+		{ID: id("mb", bindings[0].ID), SourceID: id("s", primary.ID), SourceKeyID: "default", RoutingWeight: 1},
+		{ID: id("mb", bindings[1].ID), SourceID: id("s", backup.ID), SourceKeyID: "default", RoutingWeight: 10},
+	}); err != nil {
+		t.Fatalf("update scheduler bindings: %v", err)
+	}
+
+	refreshed := loadRouteBinding(t, app, bindings[0].ID)
+	if schedulerBindingState(refreshed) != schedulerStateClosed || refreshed.FailureCount != 0 || refreshed.CooldownUntil != nil {
+		t.Fatalf("expected binding update to reset scheduler state, got %+v", refreshed)
+	}
+	target := firstSchedulerTarget(t, app, "binding-update-scheduler-model")
+	if target.Source.ID != backup.ID {
+		t.Fatalf("expected updated higher weight backup to route first, got %+v", target.Source)
+	}
+}
+
+func createSchedulerModel(t *testing.T, app *App, name string, primaryWeight int, backupWeight int) (UpstreamSource, UpstreamSource, ModelConfig) {
+	t.Helper()
+	primary := UpstreamSource{Name: name + "_Primary", Type: SourceTypeThirdParty, BaseURL: "https://primary.example.com/v1", APIKey: "primary-key", Priority: 1, Status: SourceStatusOnline}
+	backup := UpstreamSource{Name: name + "_Backup", Type: SourceTypeThirdParty, BaseURL: "https://backup.example.com/v1", APIKey: "backup-key", Priority: 1, Status: SourceStatusOnline}
+	if err := app.db.Create(&primary).Error; err != nil {
+		t.Fatalf("create primary source: %v", err)
+	}
+	if err := app.db.Create(&backup).Error; err != nil {
+		t.Fatalf("create backup source: %v", err)
+	}
+	model := ModelConfig{SourceID: primary.ID, Name: name, Provider: "OpenAI", Formats: ModelFormatOpenAI, Status: ModelStatusActive, RoutingWeight: primaryWeight, RoutingEnabled: true}
+	if err := app.db.Create(&model).Error; err != nil {
+		t.Fatalf("create scheduler model: %v", err)
+	}
+	if err := app.replaceModelBindings(model.ID, []modelBindingRequest{
+		{SourceID: id("s", primary.ID), SourceKeyID: "default", RoutingWeight: primaryWeight},
+		{SourceID: id("s", backup.ID), SourceKeyID: "default", RoutingWeight: backupWeight},
+	}); err != nil {
+		t.Fatalf("create scheduler bindings: %v", err)
+	}
+	return primary, backup, model
+}
+
+func firstSchedulerTarget(t *testing.T, app *App, modelName string) routeTarget {
+	t.Helper()
+	targets, err := app.routeTargets(modelName, relayProtocolOpenAI)
+	if err != nil {
+		t.Fatalf("route targets: %v", err)
+	}
+	if len(targets) == 0 {
+		t.Fatalf("expected route targets")
+	}
+	return targets[0]
+}
+
+func loadRouteBinding(t *testing.T, app *App, bindingID uint) ModelRouteBinding {
+	t.Helper()
+	var binding ModelRouteBinding
+	if err := app.db.First(&binding, bindingID).Error; err != nil {
+		t.Fatalf("load route binding: %v", err)
+	}
+	return binding
+}
+
+func assertCooldownNear(t *testing.T, until *time.Time, want time.Duration) {
+	t.Helper()
+	if until == nil {
+		t.Fatalf("expected cooldown near %s, got nil", want)
+	}
+	remaining := time.Until(*until)
+	if remaining < want-5*time.Second || remaining > want+5*time.Second {
+		t.Fatalf("cooldown remaining = %s, want near %s", remaining, want)
 	}
 }
 
@@ -594,8 +947,8 @@ func TestUserModelsExposeCurrentScheduledModelAndCandidateCount(t *testing.T) {
 	if len(found) != 1 {
 		t.Fatalf("expected one deduplicated shared-openai-model row, got %v", found)
 	}
-	if found[0]["sourceName"] != "OpenRouter_B" {
-		t.Fatalf("expected current scheduled source OpenRouter_B, got %v", found[0])
+	if found[0]["sourceName"] != "OpenRouter_A" {
+		t.Fatalf("expected current scheduled source OpenRouter_A by routing weight, got %v", found[0])
 	}
 	if found[0]["sourceType"] != SourceTypeThirdParty || found[0]["sourceStatus"] != SourceStatusOnline {
 		t.Fatalf("unexpected source metadata: %v", found[0])
@@ -1577,8 +1930,8 @@ func TestProxyFailoverRecordsSingleUsageAndAttempts(t *testing.T) {
 	if err := app.db.First(&refreshed, firstSource.ID).Error; err != nil {
 		t.Fatalf("load primary source: %v", err)
 	}
-	if refreshed.FailureCount == 0 || refreshed.CooldownUntil == nil {
-		t.Fatalf("expected primary source failure and cooldown, got failure=%d cooldown=%v", refreshed.FailureCount, refreshed.CooldownUntil)
+	if refreshed.FailureCount == 0 || refreshed.CooldownUntil != nil {
+		t.Fatalf("expected primary source failure count without source-level cooldown, got failure=%d cooldown=%v", refreshed.FailureCount, refreshed.CooldownUntil)
 	}
 }
 
@@ -1825,8 +2178,8 @@ func TestProxyTimeoutFailoverCoolsPrimary(t *testing.T) {
 	if err := app.db.First(&refreshed, primarySource.ID).Error; err != nil {
 		t.Fatalf("load primary source: %v", err)
 	}
-	if refreshed.CooldownUntil == nil || refreshed.FailureCount == 0 {
-		t.Fatalf("expected primary timeout to set cooldown, got failure=%d cooldown=%v", refreshed.FailureCount, refreshed.CooldownUntil)
+	if refreshed.FailureCount == 0 || refreshed.CooldownUntil != nil {
+		t.Fatalf("expected primary timeout to update source failure count without source-level cooldown, got failure=%d cooldown=%v", refreshed.FailureCount, refreshed.CooldownUntil)
 	}
 	var log UsageLog
 	if err := app.db.Where("model = ?", "timeout-failover-model").First(&log).Error; err != nil {

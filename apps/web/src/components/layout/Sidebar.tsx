@@ -57,6 +57,7 @@ export const userNav: NavGroup[] = [
       { to: '/user/models', label: '可用模型', icon: Blocks },
       { to: '/user/api-keys', label: 'API Keys', icon: Key },
       { to: '/user/usage', label: '用量明细', icon: BarChart3 },
+      { to: '/user/logs', label: '请求日志', icon: ScrollText },
     ],
   },
 ];

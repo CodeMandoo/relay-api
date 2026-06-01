@@ -50,6 +50,7 @@ const userCommands: CommandItem[] = [
   { id: 'user-models', label: '可用模型', to: '/user/models', icon: Blocks, category: '导航' },
   { id: 'user-keys', label: 'API Keys', to: '/user/api-keys', icon: Key, category: '用户' },
   { id: 'user-usage', label: '用量明细', to: '/user/usage', icon: BarChart3, category: '用户' },
+  { id: 'user-logs', label: '请求日志', to: '/user/logs', icon: ScrollText, category: '用户' },
 ];
 
 const systemCommands: CommandItem[] = [

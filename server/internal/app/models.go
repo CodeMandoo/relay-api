@@ -210,6 +210,12 @@ type ModelRouteBinding struct {
 	RoutingEnabled bool `gorm:"not null;default:true"`
 	Enabled        bool `gorm:"not null;default:true"`
 	LatencyMS      int
+	SchedulerState string `gorm:"size:20;index;not null;default:closed"`
+	FailureCount   int
+	SuccessStreak  int
+	CooldownUntil  *time.Time `gorm:"index"`
+	LastFailureAt  *time.Time
+	LastSuccessAt  *time.Time
 	CreatedAt      time.Time
 	UpdatedAt      time.Time
 	DeletedAt      gorm.DeletedAt `gorm:"index"`
@@ -443,6 +449,7 @@ type ModelRouteCandidateDTO struct {
 	ModelEnabled   bool   `json:"modelEnabled"`
 	CoolingDown    bool   `json:"coolingDown"`
 	CooldownUntil  string `json:"cooldownUntil,omitempty"`
+	SchedulerState string `json:"schedulerState,omitempty"`
 }
 
 type APIKeyDTO struct {
@@ -650,6 +657,11 @@ func modelRouteCandidateDTOFromBinding(model ModelConfig, binding ModelRouteBind
 	if binding.ID == 0 {
 		candidateID = id("m", model.ID)
 	}
+	now := time.Now()
+	cooldownUntil := source.CooldownUntil
+	if binding.CooldownUntil != nil {
+		cooldownUntil = binding.CooldownUntil
+	}
 	out := ModelRouteCandidateDTO{
 		ID:             candidateID,
 		SourceID:       id("s", binding.SourceID),
@@ -659,14 +671,15 @@ func modelRouteCandidateDTOFromBinding(model ModelConfig, binding ModelRouteBind
 		RoutingWeight:  nonZeroInt(binding.RoutingWeight, 1),
 		RoutingEnabled: binding.RoutingEnabled,
 		ModelEnabled:   model.Status == ModelStatusActive && binding.Enabled,
-		CoolingDown:    source.CooldownUntil != nil && source.CooldownUntil.After(time.Now()),
+		CoolingDown:    cooldownUntil != nil && cooldownUntil.After(now),
+		SchedulerState: schedulerBindingState(binding),
 	}
 	if binding.SourceKeyID != nil && *binding.SourceKeyID > 0 {
 		out.SourceKeyID = id("sk", *binding.SourceKeyID)
 		out.SourceKeyAlias = sourceKeyAlias
 	}
-	if source.CooldownUntil != nil {
-		out.CooldownUntil = source.CooldownUntil.UTC().Format(time.RFC3339)
+	if cooldownUntil != nil {
+		out.CooldownUntil = cooldownUntil.UTC().Format(time.RFC3339)
 	}
 	return out
 }

@@ -159,9 +159,6 @@ func currentUserModels(models []ModelConfig, sources map[uint]UpstreamSource, so
 			}
 			leftSource := sources[group[i].SourceID]
 			rightSource := sources[group[j].SourceID]
-			if leftSource.Priority != rightSource.Priority {
-				return leftSource.Priority < rightSource.Priority
-			}
 			leftWeight := group[i].RoutingWeight
 			if leftWeight <= 0 {
 				leftWeight = 1
@@ -172,6 +169,9 @@ func currentUserModels(models []ModelConfig, sources map[uint]UpstreamSource, so
 			}
 			if leftWeight != rightWeight {
 				return leftWeight > rightWeight
+			}
+			if leftSource.Priority != rightSource.Priority {
+				return leftSource.Priority < rightSource.Priority
 			}
 			return group[i].ID < group[j].ID
 		})
