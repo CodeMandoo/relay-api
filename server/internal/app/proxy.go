@@ -18,10 +18,11 @@ import (
 )
 
 type routeTarget struct {
-	Model     ModelConfig
-	Binding   ModelRouteBinding
-	Source    UpstreamSource
-	SourceKey *SourceKey
+	Model        ModelConfig
+	Binding      ModelRouteBinding
+	Source       UpstreamSource
+	SourceKey    *SourceKey
+	SingleSource bool
 }
 
 type relayProtocol string
@@ -448,7 +449,7 @@ func (a *App) routeTargets(modelName string, protocol relayProtocol) ([]routeTar
 	if len(models) == 0 {
 		return nil, errors.New("model not configured")
 	}
-	targets := make([]routeTarget, 0, len(models))
+	candidates := make([]routeTarget, 0, len(models))
 	now := time.Now()
 	for _, model := range models {
 		if !modelSupportsRelayProtocol(model, protocol) {
@@ -463,13 +464,13 @@ func (a *App) routeTargets(modelName string, protocol relayProtocol) ([]routeTar
 				continue
 			}
 			var source UpstreamSource
-			if err := a.db.Where("id = ? AND status = ?", binding.SourceID, SourceStatusOnline).First(&source).Error; err != nil {
+			if err := a.db.First(&source, binding.SourceID).Error; err != nil {
 				if errors.Is(err, gorm.ErrRecordNotFound) {
 					continue
 				}
 				return nil, err
 			}
-			if source.CooldownUntil != nil && source.CooldownUntil.After(now) {
+			if source.Status == SourceStatusDisabled {
 				continue
 			}
 			target := routeTarget{Model: model, Binding: binding, Source: source}
@@ -484,8 +485,23 @@ func (a *App) routeTargets(modelName string, protocol relayProtocol) ([]routeTar
 				}
 				target.SourceKey = &sourceKey
 			}
-			targets = append(targets, target)
+			candidates = append(candidates, target)
 		}
+	}
+	if len(candidates) == 1 {
+		// A single upstream is a direct route, not a schedulable pool.
+		candidates[0].SingleSource = true
+		return candidates, nil
+	}
+	targets := make([]routeTarget, 0, len(candidates))
+	for _, target := range candidates {
+		if target.Source.Status != SourceStatusOnline {
+			continue
+		}
+		if target.Source.CooldownUntil != nil && target.Source.CooldownUntil.After(now) {
+			continue
+		}
+		targets = append(targets, target)
 	}
 	if len(targets) == 0 {
 		return nil, errors.New("no online source for model")
@@ -601,7 +617,11 @@ func (a *App) recordUsage(c *gin.Context, user User, key APIKey, target routeTar
 		_ = a.db.Model(&User{}).Where("id = ?", user.ID).Update("balance", gorm.Expr("balance - ?", cost)).Error
 	}
 	if target.Source.ID != 0 && latency > 0 {
-		_ = a.db.Model(&UpstreamSource{}).Where("id = ?", target.Source.ID).Updates(map[string]any{"latency_ms": int(latency), "status": target.Source.Status}).Error
+		updates := map[string]any{"latency_ms": int(latency)}
+		if status == RequestStatusSuccess && target.Source.Status != SourceStatusDisabled {
+			updates["status"] = SourceStatusOnline
+		}
+		_ = a.db.Model(&UpstreamSource{}).Where("id = ?", target.Source.ID).Updates(updates).Error
 		_ = a.db.Model(&ModelConfig{}).Where("id = ?", target.Model.ID).Update("latency_ms", int(latency)).Error
 		if target.Binding.ID != 0 {
 			_ = a.db.Model(&ModelRouteBinding{}).Where("id = ?", target.Binding.ID).Update("latency_ms", int(latency)).Error
@@ -713,6 +733,7 @@ func (a *App) markTargetSuccess(target routeTarget) {
 	_ = a.db.Model(&UpstreamSource{}).Where("id = ?", target.Source.ID).Updates(map[string]any{
 		"failure_count":   0,
 		"cooldown_until":  nil,
+		"status":          SourceStatusOnline,
 		"success_count":   gorm.Expr("success_count + ?", 1),
 		"last_success_at": now,
 	}).Error
@@ -727,7 +748,7 @@ func (a *App) markTargetFailure(target routeTarget, statusCode int) {
 		"failure_count":   gorm.Expr("failure_count + ?", 1),
 		"last_failure_at": now,
 	}
-	if target.Source.FailureCount+1 >= sourceFailureCooldownThreshold {
+	if !target.SingleSource && target.Source.FailureCount+1 >= sourceFailureCooldownThreshold {
 		updates["cooldown_until"] = now.Add(sourceFailureCooldownDuration)
 	}
 	_ = a.db.Model(&UpstreamSource{}).Where("id = ?", target.Source.ID).Updates(updates).Error

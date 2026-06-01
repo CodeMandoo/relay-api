@@ -1573,6 +1573,87 @@ func TestProxySkipsCoolingSource(t *testing.T) {
 	}
 }
 
+func TestProxySingleSourceRoutesDirectlyWithStaleCooldown(t *testing.T) {
+	var calls int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id":      "chatcmpl_single_cooldown",
+			"object":  "chat.completion",
+			"choices": []any{map[string]any{"message": map[string]any{"role": "assistant", "content": "ok"}}},
+			"usage":   map[string]any{"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+			"model":   "single-cooldown-model",
+		})
+	}))
+	defer upstream.Close()
+
+	app := testApp(t)
+	cooldownUntil := time.Now().Add(10 * time.Minute)
+	source := UpstreamSource{Name: "Single_Cooling_Source", Type: SourceTypeThirdParty, BaseURL: upstream.URL + "/v1", APIKey: "single-key", Priority: 1, Status: SourceStatusOnline, FailureCount: 2, CooldownUntil: &cooldownUntil}
+	if err := app.db.Create(&source).Error; err != nil {
+		t.Fatalf("create source: %v", err)
+	}
+	model := ModelConfig{SourceID: source.ID, Name: "single-cooldown-model", DisplayName: "Single Cooldown Model", Provider: "OpenAI", Formats: ModelFormatOpenAI, Status: ModelStatusActive}
+	if err := app.db.Create(&model).Error; err != nil {
+		t.Fatalf("create model: %v", err)
+	}
+
+	w := performJSON(app, http.MethodPost, "/v1/chat/completions", createRelayAPIKey(t, app), map[string]any{
+		"model":    "single-cooldown-model",
+		"messages": []any{map[string]any{"role": "user", "content": "hello"}},
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("proxy single cooldown request: %d %s", w.Code, w.Body.String())
+	}
+	if calls != 1 {
+		t.Fatalf("expected single direct source to be called once, got %d", calls)
+	}
+	var refreshed UpstreamSource
+	if err := app.db.First(&refreshed, source.ID).Error; err != nil {
+		t.Fatalf("load source: %v", err)
+	}
+	if refreshed.CooldownUntil != nil || refreshed.FailureCount != 0 || refreshed.Status != SourceStatusOnline {
+		t.Fatalf("expected single direct source success to clear stale cooldown, got status=%s failure=%d cooldown=%v", refreshed.Status, refreshed.FailureCount, refreshed.CooldownUntil)
+	}
+}
+
+func TestProxySingleSourceFailureDoesNotCooldown(t *testing.T) {
+	var calls int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		http.Error(w, "temporary single upstream failure", http.StatusInternalServerError)
+	}))
+	defer upstream.Close()
+
+	app := testApp(t)
+	source := UpstreamSource{Name: "Single_Failing_Source", Type: SourceTypeThirdParty, BaseURL: upstream.URL + "/v1", APIKey: "single-key", Priority: 1, Status: SourceStatusOnline}
+	if err := app.db.Create(&source).Error; err != nil {
+		t.Fatalf("create source: %v", err)
+	}
+	model := ModelConfig{SourceID: source.ID, Name: "single-failure-model", DisplayName: "Single Failure Model", Provider: "OpenAI", Formats: ModelFormatOpenAI, Status: ModelStatusActive}
+	if err := app.db.Create(&model).Error; err != nil {
+		t.Fatalf("create model: %v", err)
+	}
+
+	w := performJSON(app, http.MethodPost, "/v1/chat/completions", createRelayAPIKey(t, app), map[string]any{
+		"model":    "single-failure-model",
+		"messages": []any{map[string]any{"role": "user", "content": "hello"}},
+	})
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("expected upstream 500 to pass through, got %d %s", w.Code, w.Body.String())
+	}
+	if calls != 1 {
+		t.Fatalf("expected single source to be called once, got %d", calls)
+	}
+	var refreshed UpstreamSource
+	if err := app.db.First(&refreshed, source.ID).Error; err != nil {
+		t.Fatalf("load source: %v", err)
+	}
+	if refreshed.FailureCount == 0 || refreshed.CooldownUntil != nil {
+		t.Fatalf("expected failure count without cooldown, got failure=%d cooldown=%v", refreshed.FailureCount, refreshed.CooldownUntil)
+	}
+}
+
 func TestProxyTimeoutFailoverCoolsPrimary(t *testing.T) {
 	var primaryCalls int
 	var backupCalls int
