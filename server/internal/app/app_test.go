@@ -326,6 +326,125 @@ func TestUserUsageStatsAPIKeyFilterAffectsTotals(t *testing.T) {
 	}
 }
 
+func TestUserLogsAreScopedAndExposeTokenDetails(t *testing.T) {
+	app := testApp(t)
+	user := loadTestUser(t, app)
+	key := createStoredAPIKey(t, app, user.ID, "frontend-key")
+	otherHash, err := hashPassword("other123456")
+	if err != nil {
+		t.Fatalf("hash other password: %v", err)
+	}
+	other := User{Email: "other-logs@example.com", Name: "Other Logs", PasswordHash: otherHash, Role: RoleUser, Status: UserStatusNormal}
+	if err := app.db.Create(&other).Error; err != nil {
+		t.Fatalf("create other user: %v", err)
+	}
+	otherKey := createStoredAPIKey(t, app, other.ID, "other-key")
+	now := time.Now()
+	ownLog := createUsageLog(t, app, UsageLog{
+		UserID:           user.ID,
+		APIKeyID:         key.ID,
+		RequestID:        "req-user-visible",
+		Protocol:         string(relayProtocolOpenAI),
+		Path:             "/v1/chat/completions",
+		Stream:           true,
+		Model:            "user-log-model",
+		UpstreamName:     "internal-upstream",
+		PromptTokens:     10,
+		CompletionTokens: 20,
+		CacheReadTokens:  4,
+		CacheWriteTokens: 2,
+		ReasoningTokens:  3,
+		TotalTokens:      30,
+		EstimatedCost:    0.12,
+		LatencyMS:        456,
+		StatusCode:       http.StatusOK,
+		Status:           RequestStatusSuccess,
+		RequestHeaders:   jsonString(map[string]any{"Authorization": "<redacted>"}),
+		ResponseHeaders:  jsonString(map[string]any{"Content-Type": "application/json"}),
+		RequestPayload:   jsonString(map[string]any{"model": "user-log-model"}),
+		ResponsePayload:  jsonString(map[string]any{"ok": true}),
+		AttemptCount:     1,
+		CreatedAt:        now,
+	})
+	otherLog := createUsageLog(t, app, UsageLog{
+		UserID:       other.ID,
+		APIKeyID:     otherKey.ID,
+		RequestID:    "req-other-hidden",
+		Model:        "user-log-model",
+		UpstreamName: "other-upstream",
+		TotalTokens:  99,
+		CreatedAt:    now,
+	})
+	if err := app.db.Create(&RequestAttempt{
+		UsageLogID:   ownLog.ID,
+		RequestID:    ownLog.RequestID,
+		AttemptIndex: 1,
+		SourceID:     99,
+		SourceKeyID:  100,
+		Model:        ownLog.Model,
+		UpstreamName: ownLog.UpstreamName,
+		Protocol:     ownLog.Protocol,
+		Path:         ownLog.Path,
+		StatusCode:   http.StatusOK,
+		Status:       RequestStatusSuccess,
+		LatencyMS:    456,
+		StartedAt:    now,
+		EndedAt:      now.Add(456 * time.Millisecond),
+	}).Error; err != nil {
+		t.Fatalf("create request attempt: %v", err)
+	}
+
+	userToken := loginToken(t, app, testUserEmail, testUserPassword, RoleUser)
+	w := performJSON(app, http.MethodGet, "/api/user/logs?page=1&pageSize=10&q=visible", userToken, nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("user logs: %d %s", w.Code, w.Body.String())
+	}
+	body := decodeBody(t, w)
+	rows := body["data"].([]any)
+	if len(rows) != 1 {
+		t.Fatalf("expected one scoped user log, got %v", rows)
+	}
+	row := rows[0].(map[string]any)
+	if row["requestId"] != ownLog.RequestID || row["apiKeyName"] != key.Name || row["userEmail"] != testUserEmail {
+		t.Fatalf("unexpected user log row identity: %v", row)
+	}
+	if row["sourceId"] != "" || row["sourceKeyId"] != "" || row["sourceKeyAlias"] != "" {
+		t.Fatalf("user log should not expose source internals: %v", row)
+	}
+	if int64(row["tokensPrompt"].(float64)) != 10 ||
+		int64(row["tokensCompletion"].(float64)) != 20 ||
+		int64(row["tokensCacheRead"].(float64)) != 4 ||
+		int64(row["tokensCacheWrite"].(float64)) != 2 ||
+		int64(row["tokensReasoning"].(float64)) != 3 {
+		t.Fatalf("unexpected token details: %v", row)
+	}
+	requestPayload := row["requestPayload"].(map[string]any)
+	if requestPayload["model"] != "user-log-model" {
+		t.Fatalf("unexpected request payload: %v", requestPayload)
+	}
+	pagination := body["pagination"].(map[string]any)
+	if pagination["total"].(float64) != 1 {
+		t.Fatalf("expected other user's logs to be hidden, pagination=%v", pagination)
+	}
+
+	attemptResp := performJSON(app, http.MethodGet, "/api/user/logs/"+id("log", ownLog.ID)+"/attempts", userToken, nil)
+	if attemptResp.Code != http.StatusOK {
+		t.Fatalf("user log attempts: %d %s", attemptResp.Code, attemptResp.Body.String())
+	}
+	attempts := decodeBody(t, attemptResp)["data"].([]any)
+	if len(attempts) != 1 {
+		t.Fatalf("expected one attempt, got %v", attempts)
+	}
+	attempt := attempts[0].(map[string]any)
+	if attempt["sourceId"] != "" || attempt["sourceKeyId"] != "" {
+		t.Fatalf("user attempts should not expose source internals: %v", attempt)
+	}
+	otherAttemptResp := performJSON(app, http.MethodGet, "/api/user/logs/"+id("log", otherLog.ID)+"/attempts", userToken, nil)
+	if otherAttemptResp.Code != http.StatusNotFound {
+		t.Fatalf("expected other user's log attempts to be hidden, got %d %s", otherAttemptResp.Code, otherAttemptResp.Body.String())
+	}
+}
+
 func TestAdminLogsAreServerPaginated(t *testing.T) {
 	app := testApp(t)
 	user := loadTestUser(t, app)

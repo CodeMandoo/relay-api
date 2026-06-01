@@ -161,6 +161,8 @@ func (a *App) buildRouter() *gin.Engine {
 		{
 			user.GET("/dashboard", a.userDashboard)
 			user.GET("/usage", a.userUsage)
+			user.GET("/logs", a.userLogs)
+			user.GET("/logs/:id/attempts", a.userLogAttempts)
 			user.GET("/models", a.userModels)
 			user.POST("/models/:id/test", a.userTestModel)
 			user.POST("/models/:id/invoke-test", a.userInvokeTestModel)

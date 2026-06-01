@@ -67,6 +67,97 @@ func (a *App) userUsage(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"data": gin.H{"stats": stats, "rows": rows}})
 }
 
+func (a *App) userLogs(c *gin.Context) {
+	user, ok := currentUser(c)
+	if !ok {
+		errorJSON(c, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	var logs []UsageLog
+	page := parseBoundedInt(c.Query("page"), 1, 1, 1000000)
+	pageSize := parseBoundedInt(c.Query("pageSize"), 20, 1, 100)
+	query := a.db.Model(&UsageLog{}).Where("user_id = ?", user.ID)
+	if model := strings.TrimSpace(c.Query("model")); model != "" && model != "all" {
+		query = query.Where("model = ?", model)
+	}
+	if status := strings.TrimSpace(c.Query("status")); status != "" && status != "all" {
+		query = query.Where("status = ?", status)
+	}
+	if apiKeyID := userAPIKeyFilter(c.Query("apiKeyId")); apiKeyID != nil {
+		query = query.Where("api_key_id = ?", *apiKeyID)
+	}
+	if from, ok := parseQueryTime(c.Query("from")); ok {
+		query = query.Where("created_at >= ?", from)
+	}
+	if to, ok := parseQueryTime(c.Query("to")); ok {
+		query = query.Where("created_at < ?", to)
+	}
+	if q := strings.TrimSpace(c.Query("q")); q != "" {
+		like := "%" + q + "%"
+		keyIDs := []uint{0}
+		var matchedKeys []APIKey
+		if err := a.db.Where("user_id = ? AND (name LIKE ? OR masked LIKE ?)", user.ID, like, like).Find(&matchedKeys).Error; err == nil {
+			for _, key := range matchedKeys {
+				keyIDs = append(keyIDs, key.ID)
+			}
+		}
+		query = query.Where(
+			"request_id LIKE ? OR model LIKE ? OR path LIKE ? OR error_message LIKE ? OR api_key_id IN ?",
+			like,
+			like,
+			like,
+			like,
+			keyIDs,
+		)
+	}
+	var total int64
+	if err := query.Count(&total).Error; err != nil {
+		errorJSON(c, http.StatusInternalServerError, "database error")
+		return
+	}
+	if err := query.Order("created_at desc").Limit(pageSize).Offset((page - 1) * pageSize).Find(&logs).Error; err != nil {
+		errorJSON(c, http.StatusInternalServerError, "database error")
+		return
+	}
+	totalPages := int((total + int64(pageSize) - 1) / int64(pageSize))
+	if totalPages == 0 {
+		totalPages = 1
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"data": a.userRequestLogDTOs(user, logs),
+		"pagination": gin.H{
+			"page":       page,
+			"pageSize":   pageSize,
+			"total":      total,
+			"totalPages": totalPages,
+		},
+	})
+}
+
+func (a *App) userLogAttempts(c *gin.Context) {
+	user, ok := currentUser(c)
+	if !ok {
+		errorJSON(c, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	logID, err := parseNumericID(c.Param("id"))
+	if err != nil {
+		errorJSON(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	var log UsageLog
+	if err := a.db.Where("id = ? AND user_id = ?", logID, user.ID).First(&log).Error; err != nil {
+		errorJSON(c, http.StatusNotFound, "log not found")
+		return
+	}
+	var attempts []RequestAttempt
+	if err := a.db.Where("usage_log_id = ?", logID).Order("attempt_index asc").Find(&attempts).Error; err != nil {
+		errorJSON(c, http.StatusInternalServerError, "database error")
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"data": a.userRequestAttemptDTOs(attempts)})
+}
+
 func (a *App) userModels(c *gin.Context) {
 	var models []ModelConfig
 	if err := a.db.Where("status = ?", ModelStatusActive).Order("name asc").Find(&models).Error; err != nil {
@@ -519,6 +610,91 @@ func (a *App) userRevealAPIKey(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, gin.H{"data": apiKeyDTO(key, true)})
+}
+
+func (a *App) userRequestLogDTOs(user User, logs []UsageLog) []gin.H {
+	keyIDs := make([]uint, 0, len(logs))
+	for _, row := range logs {
+		keyIDs = append(keyIDs, row.APIKeyID)
+	}
+	var keys []APIKey
+	a.db.Where("user_id = ? AND id IN ?", user.ID, keyIDs).Find(&keys)
+	keyName := map[uint]string{}
+	for _, key := range keys {
+		keyName[key.ID] = key.Name
+	}
+	settings, _ := a.getSettings()
+	out := make([]gin.H, 0, len(logs))
+	for _, row := range logs {
+		out = append(out, gin.H{
+			"id":               id("log", row.ID),
+			"timestamp":        row.CreatedAt.UTC().Format(time.RFC3339),
+			"requestId":        row.RequestID,
+			"userEmail":        user.Email,
+			"apiKeyName":       keyName[row.APIKeyID],
+			"apiKeyId":         optionalPublicID("k", row.APIKeyID),
+			"sourceId":         "",
+			"sourceKeyId":      "",
+			"sourceKeyAlias":   "",
+			"protocol":         row.Protocol,
+			"path":             row.Path,
+			"stream":           row.Stream,
+			"model":            row.Model,
+			"upstreamName":     userUpstreamName(row.UpstreamName, settings.HideUpstreamNameFromUsers),
+			"tokensPrompt":     row.PromptTokens,
+			"tokensCompletion": row.CompletionTokens,
+			"tokensCacheRead":  row.CacheReadTokens,
+			"tokensCacheWrite": row.CacheWriteTokens,
+			"tokensReasoning":  row.ReasoningTokens,
+			"tokensTotal":      row.TotalTokens,
+			"estimatedCost":    row.EstimatedCost,
+			"latencyMs":        row.LatencyMS,
+			"statusCode":       row.StatusCode,
+			"statusText":       row.Status,
+			"errorMessage":     row.ErrorMessage,
+			"requestHeaders":   mustJSONMap([]byte(row.RequestHeaders)),
+			"responseHeaders":  mustJSONMap([]byte(row.ResponseHeaders)),
+			"requestPayload":   mustJSONMap([]byte(row.RequestPayload)),
+			"responsePayload":  mustJSONMap([]byte(row.ResponsePayload)),
+			"attemptCount":     row.AttemptCount,
+			"finalAttemptId":   optionalPublicID("att", row.FinalAttemptID),
+		})
+	}
+	return out
+}
+
+func (a *App) userRequestAttemptDTOs(attempts []RequestAttempt) []gin.H {
+	settings, _ := a.getSettings()
+	out := make([]gin.H, 0, len(attempts))
+	for _, attempt := range attempts {
+		out = append(out, gin.H{
+			"id":            optionalPublicID("att", attempt.ID),
+			"usageLogId":    optionalPublicID("log", attempt.UsageLogID),
+			"requestId":     attempt.RequestID,
+			"attemptIndex":  attempt.AttemptIndex,
+			"modelConfigId": optionalPublicID("m", attempt.ModelConfigID),
+			"sourceId":      "",
+			"sourceKeyId":   "",
+			"model":         attempt.Model,
+			"upstreamName":  userUpstreamName(attempt.UpstreamName, settings.HideUpstreamNameFromUsers),
+			"protocol":      attempt.Protocol,
+			"path":          attempt.Path,
+			"statusCode":    attempt.StatusCode,
+			"statusText":    attempt.Status,
+			"errorMessage":  attempt.ErrorMessage,
+			"latencyMs":     attempt.LatencyMS,
+			"startedAt":     attempt.StartedAt.UTC().Format(time.RFC3339),
+			"endedAt":       attempt.EndedAt.UTC().Format(time.RFC3339),
+		})
+	}
+	return out
+}
+
+func userUpstreamName(name string, hide bool) string {
+	if hide && strings.TrimSpace(name) != "" {
+		return "平台中转源"
+	}
+	return name
 }
 
 func (a *App) usageRows(userID uint, rawRange string, apiKeyRaw string) []gin.H {
