@@ -879,6 +879,112 @@ func TestAPIKeyProxyRecordsUsage(t *testing.T) {
 	}
 }
 
+func TestExtractUsageRecordsCacheTokenVariants(t *testing.T) {
+	cases := []struct {
+		name                        string
+		body                        string
+		wantPrompt                  int64
+		wantCompletion              int64
+		wantCacheRead               int64
+		wantCacheWrite              int64
+		wantReasoning               int64
+		wantTotal                   int64
+		wantPromptIncludesCacheRead bool
+	}{
+		{
+			name:                        "OpenAI prompt token details",
+			body:                        `{"usage":{"prompt_tokens":100,"completion_tokens":20,"total_tokens":120,"prompt_tokens_details":{"cached_tokens":40},"completion_tokens_details":{"reasoning_tokens":7}}}`,
+			wantPrompt:                  100,
+			wantCompletion:              20,
+			wantCacheRead:               40,
+			wantReasoning:               7,
+			wantTotal:                   120,
+			wantPromptIncludesCacheRead: true,
+		},
+		{
+			name:                        "OpenAI responses nested input details",
+			body:                        `{"response":{"usage":{"input_tokens":100,"output_tokens":20,"total_tokens":120,"input_tokens_details":{"cached_tokens":30},"output_tokens_details":{"reasoning_tokens":5}}}}`,
+			wantPrompt:                  100,
+			wantCompletion:              20,
+			wantCacheRead:               30,
+			wantReasoning:               5,
+			wantTotal:                   120,
+			wantPromptIncludesCacheRead: true,
+		},
+		{
+			name:           "Anthropic native cache read and write",
+			body:           `{"usage":{"input_tokens":11,"output_tokens":5,"cache_read_input_tokens":7,"cache_creation_input_tokens":3}}`,
+			wantPrompt:     11,
+			wantCompletion: 5,
+			wantCacheRead:  7,
+			wantCacheWrite: 3,
+			wantTotal:      16,
+		},
+		{
+			name:                        "Claude OpenAI style cache creation split",
+			body:                        `{"usage":{"prompt_tokens":130,"completion_tokens":8,"prompt_tokens_details":{"cached_tokens":30,"cached_creation_tokens":50},"claude_cache_creation_5_m_tokens":20,"claude_cache_creation_1_h_tokens":40}}`,
+			wantPrompt:                  130,
+			wantCompletion:              8,
+			wantCacheRead:               30,
+			wantCacheWrite:              60,
+			wantTotal:                   138,
+			wantPromptIncludesCacheRead: true,
+		},
+		{
+			name: "Anthropic stream split usage",
+			body: "event: message_start\n" +
+				"data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":11,\"cache_read_input_tokens\":7,\"cache_creation_input_tokens\":3}}}\n\n" +
+				"event: message_delta\n" +
+				"data: {\"type\":\"message_delta\",\"usage\":{\"output_tokens\":5}}\n\n",
+			wantPrompt:     11,
+			wantCompletion: 5,
+			wantCacheRead:  7,
+			wantCacheWrite: 3,
+			wantTotal:      16,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := extractUsage([]byte(tc.body))
+			if got.Prompt != tc.wantPrompt {
+				t.Fatalf("Prompt = %d, want %d", got.Prompt, tc.wantPrompt)
+			}
+			if got.Completion != tc.wantCompletion {
+				t.Fatalf("Completion = %d, want %d", got.Completion, tc.wantCompletion)
+			}
+			if got.CacheRead != tc.wantCacheRead {
+				t.Fatalf("CacheRead = %d, want %d", got.CacheRead, tc.wantCacheRead)
+			}
+			if got.CacheWrite != tc.wantCacheWrite {
+				t.Fatalf("CacheWrite = %d, want %d", got.CacheWrite, tc.wantCacheWrite)
+			}
+			if got.Reasoning != tc.wantReasoning {
+				t.Fatalf("Reasoning = %d, want %d", got.Reasoning, tc.wantReasoning)
+			}
+			if got.Total != tc.wantTotal {
+				t.Fatalf("Total = %d, want %d", got.Total, tc.wantTotal)
+			}
+			if got.PromptIncludesCacheRead != tc.wantPromptIncludesCacheRead {
+				t.Fatalf("PromptIncludesCacheRead = %v, want %v", got.PromptIncludesCacheRead, tc.wantPromptIncludesCacheRead)
+			}
+		})
+	}
+}
+
+func TestEstimateCostDetailedDoesNotSubtractSeparateAnthropicCache(t *testing.T) {
+	model := ModelConfig{BillingInput: 10, BillingOutput: 20, BillingCacheRead: 1, BillingCacheWrite: 2}
+	openAIUsage := usageTokens{Prompt: 1_000_000, Completion: 100_000, CacheRead: 400_000, PromptIncludesCacheRead: true, Total: 1_100_000}
+	anthropicUsage := usageTokens{Prompt: 1_000_000, Completion: 100_000, CacheRead: 400_000, Total: 1_100_000}
+
+	if got := estimateCostDetailed(openAIUsage, model); got != 8.4 {
+		t.Fatalf("OpenAI-style cost = %.2f, want 8.40", got)
+	}
+	if got := estimateCostDetailed(anthropicUsage, model); got != 12.4 {
+		t.Fatalf("Anthropic-style cost = %.2f, want 12.40", got)
+	}
+}
+
 func TestAnthropicMessagesUseNativeDirectSource(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/messages" {
@@ -899,7 +1005,7 @@ func TestAnthropicMessagesUseNativeDirectSource(t *testing.T) {
 			"role":    "assistant",
 			"content": []any{map[string]any{"type": "text", "text": "ok"}},
 			"model":   "claude-direct-test",
-			"usage":   map[string]any{"input_tokens": 11, "output_tokens": 5},
+			"usage":   map[string]any{"input_tokens": 11, "output_tokens": 5, "cache_read_input_tokens": 7, "cache_creation_input_tokens": 3},
 		})
 	}))
 	defer upstream.Close()
@@ -930,6 +1036,16 @@ func TestAnthropicMessagesUseNativeDirectSource(t *testing.T) {
 	}
 	if count != 1 {
 		t.Fatalf("expected one usage row, got %d", count)
+	}
+	var log UsageLog
+	if err := app.db.Where("model = ?", "claude-direct-test").First(&log).Error; err != nil {
+		t.Fatalf("load usage row: %v", err)
+	}
+	if log.CacheReadTokens != 7 {
+		t.Fatalf("cache read tokens = %d, want 7", log.CacheReadTokens)
+	}
+	if log.CacheWriteTokens != 3 {
+		t.Fatalf("cache write tokens = %d, want 3", log.CacheWriteTokens)
 	}
 }
 

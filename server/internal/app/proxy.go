@@ -39,12 +39,14 @@ const (
 )
 
 type usageTokens struct {
-	Prompt     int64 // input tokens
-	Completion int64 // output tokens
-	CacheRead  int64 // cache read tokens
-	CacheWrite int64 // cache creation tokens
-	Reasoning  int64 // reasoning/thinking tokens
-	Total      int64
+	Prompt                   int64 // input tokens
+	Completion               int64 // output tokens
+	CacheRead                int64 // cache read tokens
+	CacheWrite               int64 // cache creation tokens
+	Reasoning                int64 // reasoning/thinking tokens
+	Total                    int64
+	PromptIncludesCacheRead  bool
+	PromptIncludesCacheWrite bool
 }
 
 type usageRecordMeta struct {
@@ -778,9 +780,12 @@ func extractSSEUsage(text string) usageTokens {
 			continue
 		}
 		next := extractJSONUsage([]byte(data))
-		if next.Total > 0 || next.Prompt > 0 || next.Completion > 0 {
-			usage = next
+		if hasUsageTokens(next) {
+			usage = mergeUsageTokens(usage, next)
 		}
+	}
+	if computed := usage.Prompt + usage.Completion; computed > usage.Total {
+		usage.Total = computed
 	}
 	return usage
 }
@@ -790,26 +795,46 @@ func extractJSONUsage(body []byte) usageTokens {
 	if err := json.Unmarshal(body, &payload); err != nil {
 		return usageTokens{}
 	}
+	var usage usageTokens
 	if raw, ok := payload["usage"].(map[string]any); ok {
-		return extractOpenAIUsage(raw)
+		usage = mergeUsageTokens(usage, extractOpenAIUsage(raw))
 	}
 	if raw, ok := payload["usageMetadata"].(map[string]any); ok {
-		return extractGeminiUsage(raw)
+		usage = mergeUsageTokens(usage, extractGeminiUsage(raw))
+	}
+	if message, ok := payload["message"].(map[string]any); ok {
+		if raw, ok := message["usage"].(map[string]any); ok {
+			usage = mergeUsageTokens(usage, extractOpenAIUsage(raw))
+		}
 	}
 	if response, ok := payload["response"].(map[string]any); ok {
 		if raw, ok := response["usage"].(map[string]any); ok {
-			return extractAnthropicUsage(raw)
+			usage = mergeUsageTokens(usage, extractOpenAIUsage(raw))
 		}
 	}
-	return usageTokens{}
+	usage = mergeUsageTokens(usage, extractChoiceUsage(payload))
+	usage = mergeUsageTokens(usage, extractTimingUsage(payload))
+	if usage.Total == 0 {
+		usage.Total = usage.Prompt + usage.Completion
+	}
+	return usage
 }
 
 // extractOpenAIUsage extracts token usage from OpenAI-style response.
+// It also accepts OpenAI-compatible usage variants returned by Anthropic,
+// Responses API, and common third-party providers.
 func extractOpenAIUsage(raw map[string]any) usageTokens {
 	prompt := int64(numberAny(raw["prompt_tokens"]))
+	promptSource := ""
+	if prompt > 0 {
+		promptSource = "prompt_tokens"
+	}
 	completion := int64(numberAny(raw["completion_tokens"]))
 	if prompt == 0 {
 		prompt = int64(numberAny(raw["input_tokens"]))
+		if prompt > 0 {
+			promptSource = "input_tokens"
+		}
 	}
 	if completion == 0 {
 		completion = int64(numberAny(raw["output_tokens"]))
@@ -819,24 +844,83 @@ func extractOpenAIUsage(raw map[string]any) usageTokens {
 		total = prompt + completion
 	}
 
-	// Cache tokens from prompt_tokens_details
 	var cacheRead int64
+	var cacheWrite int64
+	var promptIncludesCacheRead bool
+	var promptIncludesCacheWrite bool
 	if details, ok := raw["prompt_tokens_details"].(map[string]any); ok {
-		cacheRead = int64(numberAny(details["cached_tokens"]))
+		if value := int64(numberAny(details["cached_tokens"])); value > cacheRead {
+			cacheRead = value
+			promptIncludesCacheRead = promptSource != ""
+		}
+		if value := int64(numberAny(details["cached_creation_tokens"])); value > cacheWrite {
+			cacheWrite = value
+			promptIncludesCacheWrite = promptSource != ""
+		}
+	}
+	if details, ok := raw["input_tokens_details"].(map[string]any); ok {
+		if value := int64(numberAny(details["cached_tokens"])); value > cacheRead {
+			cacheRead = value
+			promptIncludesCacheRead = promptSource != ""
+		}
+		if value := int64(numberAny(details["cached_creation_tokens"])); value > cacheWrite {
+			cacheWrite = value
+			promptIncludesCacheWrite = promptSource != ""
+		}
+	}
+	if value := int64(numberAny(raw["cached_tokens"])); value > cacheRead {
+		cacheRead = value
+		promptIncludesCacheRead = promptSource != ""
+	}
+	if value := int64(numberAny(raw["prompt_cache_hit_tokens"])); value > cacheRead {
+		cacheRead = value
+		promptIncludesCacheRead = promptSource != ""
+	}
+	if value := int64(numberAny(raw["cache_read_input_tokens"])); value > cacheRead {
+		cacheRead = value
+		promptIncludesCacheRead = false
+	}
+	if value := int64(numberAny(raw["cache_creation_input_tokens"])); value > cacheWrite {
+		cacheWrite = value
+		promptIncludesCacheWrite = false
+	}
+	if value := int64(numberAny(raw["cache_creation_tokens"])); value > cacheWrite {
+		cacheWrite = value
+	}
+	if split := int64(numberAny(raw["claude_cache_creation_5_m_tokens"])) + int64(numberAny(raw["claude_cache_creation_1_h_tokens"])); split > cacheWrite {
+		cacheWrite = split
+		promptIncludesCacheWrite = promptSource != ""
+	}
+	if creation, ok := raw["cache_creation"].(map[string]any); ok {
+		split := int64(numberAny(creation["ephemeral_5m_input_tokens"])) + int64(numberAny(creation["ephemeral_1h_input_tokens"]))
+		if split > cacheWrite {
+			cacheWrite = split
+			promptIncludesCacheWrite = false
+		}
 	}
 
-	// Reasoning tokens from completion_tokens_details
 	var reasoning int64
 	if details, ok := raw["completion_tokens_details"].(map[string]any); ok {
 		reasoning = int64(numberAny(details["reasoning_tokens"]))
 	}
+	if details, ok := raw["output_tokens_details"].(map[string]any); ok {
+		if value := int64(numberAny(details["reasoning_tokens"])); value > reasoning {
+			reasoning = value
+		}
+	}
+	if value := int64(numberAny(raw["reasoning_tokens"])); value > reasoning {
+		reasoning = value
+	}
 
 	return usageTokens{
-		Prompt:     prompt,
-		Completion: completion,
-		CacheRead:  cacheRead,
-		Reasoning:  reasoning,
-		Total:      total,
+		Prompt:                   prompt,
+		Completion:               completion,
+		CacheRead:                cacheRead,
+		CacheWrite:               cacheWrite,
+		Reasoning:                reasoning,
+		Total:                    total,
+		PromptIncludesCacheRead:  promptIncludesCacheRead,
+		PromptIncludesCacheWrite: promptIncludesCacheWrite,
 	}
 }
 
@@ -850,10 +934,11 @@ func extractGeminiUsage(raw map[string]any) usageTokens {
 	}
 	cacheRead := int64(numberAny(raw["cachedContentTokenCount"]))
 	return usageTokens{
-		Prompt:     prompt,
-		Completion: completion,
-		CacheRead:  cacheRead,
-		Total:      total,
+		Prompt:                  prompt,
+		Completion:              completion,
+		CacheRead:               cacheRead,
+		Total:                   total,
+		PromptIncludesCacheRead: cacheRead > 0,
 	}
 }
 
@@ -876,6 +961,77 @@ func extractAnthropicUsage(raw map[string]any) usageTokens {
 		Reasoning:  reasoning,
 		Total:      total,
 	}
+}
+
+func extractChoiceUsage(payload map[string]any) usageTokens {
+	choices, ok := payload["choices"].([]any)
+	if !ok {
+		return usageTokens{}
+	}
+	var usage usageTokens
+	for _, choice := range choices {
+		choiceMap, ok := choice.(map[string]any)
+		if !ok {
+			continue
+		}
+		raw, ok := choiceMap["usage"].(map[string]any)
+		if !ok {
+			continue
+		}
+		usage = mergeUsageTokens(usage, extractOpenAIUsage(raw))
+	}
+	return usage
+}
+
+func extractTimingUsage(payload map[string]any) usageTokens {
+	timings, ok := payload["timings"].(map[string]any)
+	if !ok {
+		return usageTokens{}
+	}
+	cacheRead := int64(numberAny(timings["cache_n"]))
+	if cacheRead == 0 {
+		return usageTokens{}
+	}
+	return usageTokens{CacheRead: cacheRead}
+}
+
+func hasUsageTokens(usage usageTokens) bool {
+	return usage.Prompt > 0 ||
+		usage.Completion > 0 ||
+		usage.CacheRead > 0 ||
+		usage.CacheWrite > 0 ||
+		usage.Reasoning > 0 ||
+		usage.Total > 0
+}
+
+func mergeUsageTokens(current usageTokens, next usageTokens) usageTokens {
+	if !hasUsageTokens(next) {
+		return current
+	}
+	if next.Prompt > 0 {
+		current.Prompt = next.Prompt
+		current.PromptIncludesCacheRead = next.PromptIncludesCacheRead
+		current.PromptIncludesCacheWrite = next.PromptIncludesCacheWrite
+	} else {
+		current.PromptIncludesCacheRead = current.PromptIncludesCacheRead || next.PromptIncludesCacheRead
+		current.PromptIncludesCacheWrite = current.PromptIncludesCacheWrite || next.PromptIncludesCacheWrite
+	}
+	if next.Completion > 0 {
+		current.Completion = next.Completion
+	}
+	if next.CacheRead > 0 {
+		current.CacheRead = next.CacheRead
+	}
+	if next.CacheWrite > 0 {
+		current.CacheWrite = next.CacheWrite
+	}
+	if next.Reasoning > 0 {
+		current.Reasoning = next.Reasoning
+	}
+	if next.Total > 0 {
+		current.Total = next.Total
+	}
+	return current
 }
 
 func numberAny(value any) float64 {

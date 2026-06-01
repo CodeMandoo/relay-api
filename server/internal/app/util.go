@@ -220,8 +220,13 @@ func estimateCostDetailed(usage usageTokens, model ModelConfig) float64 {
 		return estimateCost(usage.Total, inputRate, outputRate)
 	}
 
-	// Non-cache input tokens = total input - cache read tokens
-	nonCacheInput := usage.Prompt - usage.CacheRead
+	nonCacheInput := usage.Prompt
+	if usage.PromptIncludesCacheRead {
+		nonCacheInput -= usage.CacheRead
+	}
+	if usage.PromptIncludesCacheWrite {
+		nonCacheInput -= usage.CacheWrite
+	}
 	if nonCacheInput < 0 {
 		nonCacheInput = 0
 	}
