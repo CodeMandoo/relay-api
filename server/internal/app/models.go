@@ -128,6 +128,7 @@ type SourceAccount struct {
 	ChatGPTAccountID      string `gorm:"size:255"`
 	WorkspaceID           string `gorm:"size:255"`
 	PlanType              string `gorm:"size:50"`
+	OpenAIPlanType        string `gorm:"column:openai_plan_type;size:100"`
 	SubscriptionPlan      string `gorm:"size:50"`
 	HasSubscription       bool
 	SubscriptionExpiresAt *time.Time
@@ -385,6 +386,7 @@ type SourceAccountDTO struct {
 	Provider              string  `json:"provider"`
 	AuthIndex             string  `json:"authIndex,omitempty"`
 	PlanType              string  `json:"planType,omitempty"`
+	OpenAIPlanType        string  `json:"openaiPlanType,omitempty"`
 	SubscriptionPlan      string  `json:"subscriptionPlan,omitempty"`
 	HasSubscription       bool    `json:"hasSubscription"`
 	SubscriptionExpiresAt string  `json:"subscriptionExpiresAt,omitempty"`
@@ -584,6 +586,7 @@ func sourceAccountDTO(account SourceAccount) SourceAccountDTO {
 		Provider:         cliProxyProviderLabel(account.Provider),
 		AuthIndex:        account.AuthIndex,
 		PlanType:         account.PlanType,
+		OpenAIPlanType:   account.OpenAIPlanType,
 		SubscriptionPlan: account.SubscriptionPlan,
 		HasSubscription:  account.HasSubscription,
 		Status:           account.Status,

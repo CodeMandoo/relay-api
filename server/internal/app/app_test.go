@@ -2764,7 +2764,7 @@ func TestCLIProxyAccountSyncAndOAuth(t *testing.T) {
 	if row["used5h"] != float64(25) || row["limit5h"] != float64(100) || row["used7d"] != float64(60) || row["limit7d"] != float64(100) {
 		t.Fatalf("expected codex usage quota, got %v", row)
 	}
-	if row["provider"] != "ChatGPT" || row["planType"] != "pro_5x" || row["subscriptionPlan"] != "pro_5x" || row["hasSubscription"] != true {
+	if row["provider"] != "ChatGPT" || row["planType"] != "pro_5x" || row["openaiPlanType"] != "pro" || row["subscriptionPlan"] != "pro_5x" || row["hasSubscription"] != true {
 		t.Fatalf("expected platform and subscription fields, got %v", row)
 	}
 	if seenUsageAccountID != "org-usage" {
@@ -2949,7 +2949,7 @@ func TestPlanExtractionKeepsOfficialChatGPTPlanNames(t *testing.T) {
 			"has_active_subscription": true,
 		},
 	})
-	if snapshot.AccountPlanType != "pro_20x" || snapshot.SubscriptionPlan != "pro_20x" {
+	if snapshot.AccountPlanType != "pro_20x" || snapshot.OpenAIPlanType != "pro" || snapshot.SubscriptionPlan != "pro_20x" {
 		t.Fatalf("expected nested official plan name to win, got %+v", snapshot)
 	}
 }

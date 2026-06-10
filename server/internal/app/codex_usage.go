@@ -25,13 +25,14 @@ type codexUsageSnapshot struct {
 type codexSubscriptionSnapshot struct {
 	HasSubscription  bool
 	AccountPlanType  string
+	OpenAIPlanType   string
 	SubscriptionPlan string
 	ExpiresAt        *time.Time
 	RenewsAt         *time.Time
 }
 
 func (s codexSubscriptionSnapshot) HasData() bool {
-	return s.AccountPlanType != "" || s.SubscriptionPlan != "" || s.ExpiresAt != nil || s.RenewsAt != nil
+	return s.AccountPlanType != "" || s.OpenAIPlanType != "" || s.SubscriptionPlan != "" || s.ExpiresAt != nil || s.RenewsAt != nil
 }
 
 func (a *App) refreshCodexUsageForAccount(ctx context.Context, source UpstreamSource, account *SourceAccount, listed map[string]any) error {
@@ -94,6 +95,7 @@ func (a *App) refreshCodexUsageForAccount(ctx context.Context, source UpstreamSo
 		"ChatGPTAccountID",
 		"WorkspaceID",
 		"PlanType",
+		"OpenAIPlanType",
 		"SubscriptionPlan",
 		"HasSubscription",
 		"SubscriptionExpiresAt",
@@ -295,6 +297,7 @@ func selectCodexSubscriptionSnapshot(accounts map[string]any, accountID string) 
 func parseCodexSubscriptionSnapshot(entry map[string]any) codexSubscriptionSnapshot {
 	account, _ := asMap(entry["account"])
 	entitlement, _ := asMap(entry["entitlement"])
+	openAIPlanType := strings.TrimSpace(firstString(account, "plan_type", "planType"))
 	accountPlanType := choosePlanType(
 		firstString(account, "plan_type", "planType", "account_plan_type", "accountPlanType"),
 		firstPlanStringRecursive(account),
@@ -337,6 +340,7 @@ func parseCodexSubscriptionSnapshot(entry map[string]any) codexSubscriptionSnaps
 	return codexSubscriptionSnapshot{
 		HasSubscription:  hasSubscription,
 		AccountPlanType:  accountPlanType,
+		OpenAIPlanType:   openAIPlanType,
 		SubscriptionPlan: subscriptionPlan,
 		ExpiresAt:        expiresAt,
 		RenewsAt:         renewsAt,
@@ -347,6 +351,7 @@ func applyCodexSubscriptionSnapshot(account *SourceAccount, snapshot codexSubscr
 	if snapshot.AccountPlanType != "" {
 		account.PlanType = snapshot.AccountPlanType
 	}
+	account.OpenAIPlanType = snapshot.OpenAIPlanType
 	if snapshot.SubscriptionPlan != "" {
 		account.SubscriptionPlan = snapshot.SubscriptionPlan
 	}
