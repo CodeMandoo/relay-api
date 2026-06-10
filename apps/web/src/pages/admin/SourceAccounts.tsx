@@ -207,6 +207,7 @@ export default function Page() {
   const [submittingCallback, setSubmittingCallback] = useState(false);
   const [callbackUrl, setCallbackUrl] = useState('');
   const [manualToken, setManualToken] = useState('');
+  const [manualAccessToken, setManualAccessToken] = useState('');
   const [oauthSession, setOauthSession] = useState<{ authUrl?: string; sessionId?: string; statusUrl?: string } | null>(null);
   const autoRefreshedSourcesRef = useRef<Set<string>>(new Set());
   const source = useMemo(() => sources.find((item) => item.id === sourceId) ?? sources[0], [sourceId, sources]);
@@ -357,6 +358,7 @@ export default function Page() {
           identifier: identifier.trim(),
           provider,
           refreshToken: manualToken.trim(),
+          accessToken: manualAccessToken.trim() || undefined,
         });
         setAccounts(response.data);
         toast.success('Token 登录完成', { description: '账号已同步到 CLIProxyAPI。' });
@@ -367,6 +369,7 @@ export default function Page() {
       setOauthSession(null);
       setCallbackUrl('');
       setManualToken('');
+      setManualAccessToken('');
       setOpen(false);
     } catch (error) {
       toast.error(getErrorMessage(error, '添加账号失败'));
@@ -526,6 +529,7 @@ export default function Page() {
                   setOauthSession(null);
                   setCallbackUrl('');
                   setManualToken('');
+                  setManualAccessToken('');
                 }
               }}
             >
@@ -539,7 +543,7 @@ export default function Page() {
                 <DialogHeader>
                   <DialogTitle>添加账号</DialogTitle>
                   <DialogDescription>
-                    选择登录平台，使用浏览器 OAuth 或手动 refresh_token 登录。
+                    选择登录平台，使用浏览器 OAuth 或手动 Token 登录。
                   </DialogDescription>
                 </DialogHeader>
                 <div className="grid gap-4 py-2">
@@ -552,6 +556,7 @@ export default function Page() {
                         setOauthSession(null);
                         setCallbackUrl('');
                         setManualToken('');
+                        setManualAccessToken('');
                       }}
                     >
                       <SelectTrigger>
@@ -584,6 +589,7 @@ export default function Page() {
                         setOauthSession(null);
                         setCallbackUrl('');
                         setManualToken('');
+                        setManualAccessToken('');
                       }}
                     >
                       <SelectTrigger>
@@ -631,7 +637,7 @@ export default function Page() {
                       <div className="space-y-1">
                         <Label htmlFor="manual-refresh-token">Refresh Token</Label>
                         <p className="text-xs leading-relaxed text-muted-foreground">
-                          填写 refresh_token，不是 access_token 或 id_token。Relay 只会转交给 CLIProxyAPI 保存为 auth file，不写入 Relay 数据库。
+                          填写 refresh_token。可额外填写 access_token，仅本次用于查询 OpenAI 订阅并返回 openaiPlanType。
                         </p>
                       </div>
                       {!supportsManualTokenLogin(provider) ? (
@@ -647,6 +653,24 @@ export default function Page() {
                         disabled={!supportsManualTokenLogin(provider)}
                         className={cn(
                           'min-h-28 w-full resize-y rounded-md border border-input bg-background px-3 py-2 font-mono text-sm shadow-sm outline-none transition-colors',
+                          'placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/20',
+                          !supportsManualTokenLogin(provider) && 'cursor-not-allowed opacity-60',
+                        )}
+                      />
+                      <div className="space-y-1">
+                        <Label htmlFor="manual-access-token">Access Token（可选）</Label>
+                        <p className="text-xs leading-relaxed text-muted-foreground">
+                          ChatGPT 账号可填写 access_token；该值不会写入 CLIProxyAPI auth file，也不会保存到 Relay 数据库。
+                        </p>
+                      </div>
+                      <textarea
+                        id="manual-access-token"
+                        value={manualAccessToken}
+                        onChange={(event) => setManualAccessToken(event.target.value)}
+                        placeholder="access_token"
+                        disabled={!supportsManualTokenLogin(provider)}
+                        className={cn(
+                          'min-h-20 w-full resize-y rounded-md border border-input bg-background px-3 py-2 font-mono text-sm shadow-sm outline-none transition-colors',
                           'placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/20',
                           !supportsManualTokenLogin(provider) && 'cursor-not-allowed opacity-60',
                         )}

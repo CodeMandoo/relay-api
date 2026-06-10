@@ -662,6 +662,7 @@ func (a *App) adminSubmitSourceAccountToken(c *gin.Context) {
 		Identifier   string `json:"identifier"`
 		Token        string `json:"token"`
 		RefreshToken string `json:"refreshToken"`
+		AccessToken  string `json:"accessToken"`
 	}
 	if !bindJSON(c, &req) {
 		return
@@ -704,6 +705,7 @@ func (a *App) adminSubmitSourceAccountToken(c *gin.Context) {
 		errorJSON(c, http.StatusBadGateway, err.Error())
 		return
 	}
+	accounts = a.applyOpenAIPlanTypeFromAccessToken(c.Request.Context(), accounts, req.Provider, req.Identifier, req.AccessToken)
 	out := make([]SourceAccountDTO, 0, len(accounts))
 	for _, account := range accounts {
 		out = append(out, sourceAccountDTO(account))

@@ -386,7 +386,7 @@ type SourceAccountDTO struct {
 	Provider              string  `json:"provider"`
 	AuthIndex             string  `json:"authIndex,omitempty"`
 	PlanType              string  `json:"planType,omitempty"`
-	OpenAIPlanType        string  `json:"openaiPlanType,omitempty"`
+	OpenAIPlanType        string  `json:"openaiPlanType"`
 	SubscriptionPlan      string  `json:"subscriptionPlan,omitempty"`
 	HasSubscription       bool    `json:"hasSubscription"`
 	SubscriptionExpiresAt string  `json:"subscriptionExpiresAt,omitempty"`

@@ -2917,6 +2917,120 @@ func TestAdminSubmitSourceAccountTokenUploadsAuthFile(t *testing.T) {
 	}
 }
 
+func TestAdminSubmitChatGPTTokenUsesAccessTokenForSubscription(t *testing.T) {
+	var seenAccountsCheck bool
+	usage := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer manual-access-token" {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		switch r.URL.Path {
+		case "/backend-api/accounts/check/v4-2023-04-27":
+			seenAccountsCheck = true
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"accounts": map[string]any{
+					"default": map[string]any{
+						"account": map[string]any{
+							"plan_type":        "plus",
+							"has_subscription": true,
+							"is_default":       true,
+						},
+						"entitlement": map[string]any{
+							"subscription_plan":       "ChatGPT Plus",
+							"has_active_subscription": true,
+						},
+					},
+				},
+			})
+		case "/backend-api/wham/usage":
+			_ = json.NewEncoder(w).Encode(map[string]any{})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer usage.Close()
+	t.Setenv("RELAY_CODEX_USAGE_BASE_URL", usage.URL+"/backend-api")
+
+	var uploaded map[string]any
+	var uploadName string
+	management := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer mgmt-secret" {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		switch {
+		case r.URL.Path == "/v0/management/auth-files" && r.Method == http.MethodPost:
+			uploadName = r.URL.Query().Get("name")
+			if err := json.NewDecoder(r.Body).Decode(&uploaded); err != nil {
+				t.Fatalf("decode uploaded auth file: %v", err)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok"})
+		case r.URL.Path == "/v0/management/auth-files" && r.Method == http.MethodGet:
+			if uploaded == nil {
+				_ = json.NewEncoder(w).Encode(map[string]any{"files": []any{}})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"files": []any{map[string]any{
+					"name":         uploadName,
+					"provider":     uploaded["type"],
+					"email":        uploaded["email"],
+					"status":       "ok",
+					"last_refresh": uploaded["last_refresh"],
+				}},
+			})
+		case r.URL.Path == "/v0/management/auth-files/download" && r.Method == http.MethodGet:
+			if r.URL.Query().Get("name") != uploadName {
+				http.NotFound(w, r)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(uploaded)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer management.Close()
+
+	app := testApp(t)
+	adminToken := loginToken(t, app, testAdminEmail, testAdminPassword, RoleAdmin)
+	if err := app.db.Model(&UpstreamSource{}).Where("type = ?", SourceTypeCLIProxyAPI).Updates(map[string]any{
+		"base_url":       management.URL + "/v1",
+		"api_key":        "relay-secret",
+		"management_key": "mgmt-secret",
+		"status":         SourceStatusOnline,
+	}).Error; err != nil {
+		t.Fatalf("update source: %v", err)
+	}
+
+	w := performJSON(app, http.MethodPost, "/api/admin/sources/s_001/accounts/token", adminToken, map[string]any{
+		"provider":     "ChatGPT",
+		"identifier":   "chatgpt@example.com",
+		"refreshToken": "manual-refresh-token",
+		"accessToken":  "manual-access-token",
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("manual token login: %d %s", w.Code, w.Body.String())
+	}
+	if uploaded["access_token"] != nil || uploaded["refresh_token"] != "manual-refresh-token" {
+		t.Fatalf("expected access token to stay out of CLIProxy auth file, got %v", uploaded)
+	}
+	body := decodeBody(t, w)
+	rows := body["data"].([]any)
+	if len(rows) != 1 {
+		t.Fatalf("expected one synced account, got %d", len(rows))
+	}
+	row := rows[0].(map[string]any)
+	if row["provider"] != "ChatGPT" || row["openaiPlanType"] != "plus" {
+		t.Fatalf("expected official plan from manual access token, got %v", row)
+	}
+	if row["planType"] != nil || row["subscriptionPlan"] != nil || row["hasSubscription"] != false {
+		t.Fatalf("manual access token should not change normalized subscription fields, got %v", row)
+	}
+	if !seenAccountsCheck {
+		t.Fatalf("expected OpenAI accounts/check to be called")
+	}
+}
+
 func TestPlanExtractionKeepsOfficialChatGPTPlanNames(t *testing.T) {
 	tests := map[string]string{
 		"ChatGPT Free":       "free",

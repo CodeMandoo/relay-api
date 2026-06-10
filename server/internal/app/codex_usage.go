@@ -360,6 +360,29 @@ func applyCodexSubscriptionSnapshot(account *SourceAccount, snapshot codexSubscr
 	account.SubscriptionRenewsAt = snapshot.RenewsAt
 }
 
+func (a *App) applyOpenAIPlanTypeFromAccessToken(ctx context.Context, accounts []SourceAccount, provider string, identifier string, accessToken string) []SourceAccount {
+	accessToken = strings.TrimSpace(accessToken)
+	if accessToken == "" || !isCodexPlatform(provider) {
+		return accounts
+	}
+	snapshot, err := fetchCodexSubscriptionSnapshot(ctx, codexUsageBaseURL(), accessToken, "")
+	if err != nil || snapshot.OpenAIPlanType == "" {
+		return accounts
+	}
+	provider = cliProxyProviderLabel(provider)
+	identifier = strings.TrimSpace(identifier)
+	for i := range accounts {
+		if !strings.EqualFold(accounts[i].Provider, provider) || !strings.EqualFold(accounts[i].Identifier, identifier) {
+			continue
+		}
+		accounts[i].OpenAIPlanType = snapshot.OpenAIPlanType
+		if accounts[i].ID != 0 {
+			_ = a.db.Model(&SourceAccount{}).Where("id = ?", accounts[i].ID).Update("openai_plan_type", snapshot.OpenAIPlanType).Error
+		}
+	}
+	return accounts
+}
+
 func applyCodexUsageSnapshot(account *SourceAccount, snapshot codexUsageSnapshot) {
 	if snapshot.PrimaryUsedPercent != nil {
 		account.Used5h = percentToInt(*snapshot.PrimaryUsedPercent)
