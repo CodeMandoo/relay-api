@@ -36,6 +36,7 @@ export interface UpstreamSource {
   openaiBaseUrl?: string;
   anthropicBaseUrl?: string;
   apiKey?: string;
+  maskedKey?: string;
   managementKey?: string;
   hasManagementKey?: boolean;
   accountCount: number;
@@ -49,6 +50,7 @@ export interface UpstreamSource {
   lastSuccessAt?: string;
   cooldownUntil?: string;
   coolingDown?: boolean;
+  createdAt?: string;
 }
 
 export type AccountProvider = 'ChatGPT' | 'Claude' | 'Gemini' | 'Grok';
@@ -133,6 +135,8 @@ export type ModelProvider = BuiltInModelProvider | (string & {});
 export interface PlatformModel {
   id: string;
   name: string;
+  modelGroupId?: string;
+  modelGroupName?: string;
   sourceId: string;
   sourceName: string;
   sourceKeyId?: string;
@@ -167,6 +171,7 @@ export interface ModelRouteCandidate {
   modelEnabled: boolean;
   coolingDown: boolean;
   cooldownUntil?: string;
+  schedulerState?: 'closed' | 'open' | 'half_open' | 'recovering';
 }
 
 export type InviteStatus = 'valid' | 'expired' | 'exhausted';
@@ -293,6 +298,19 @@ export interface ApiKey {
   status: ApiKeyStatus;
   limit?: number;
   spent: number;
+  modelGroupId?: string;
+  modelGroupName?: string;
+}
+
+export interface ModelAccessGroup {
+  id: string;
+  name: string;
+  description?: string;
+  isDefault: boolean;
+  keyCount?: number;
+  modelCount?: number;
+  bindings?: ModelBindingInput[];
+  createdAt: string;
 }
 
 export interface UserQuota {
@@ -317,6 +335,8 @@ export interface UserModel {
   latencyMs: number;
   sourceId?: string;
   sourceName?: string;
+  modelGroupId?: string;
+  modelGroupName?: string;
   sourceType?: SourceType;
   sourceStatus?: SourceStatus;
   routingCandidates?: number;

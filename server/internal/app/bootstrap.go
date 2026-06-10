@@ -1,6 +1,7 @@
 package app
 
 import (
+	"errors"
 	"time"
 
 	"gorm.io/gorm"
@@ -8,6 +9,9 @@ import (
 
 func (a *App) bootstrap() error {
 	if err := a.ensureSettings(); err != nil {
+		return err
+	}
+	if err := ensureDefaultModelGroup(a.db); err != nil {
 		return err
 	}
 	if err := a.ensureAdmin(); err != nil {
@@ -51,6 +55,37 @@ func (a *App) ensureSettings() error {
 		DefaultTimeout:     120,
 		StreamingEnabled:   true,
 	}).Error
+}
+
+func ensureDefaultModelGroup(db *gorm.DB) error {
+	var group ModelGroup
+	err := db.Where("is_default = ?", true).Order("id asc").First(&group).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		group = ModelGroup{
+			Name:        DefaultModelGroupName,
+			Description: "Legacy models default group",
+			IsDefault:   true,
+		}
+		if err := db.Create(&group).Error; err != nil {
+			return err
+		}
+	} else if err != nil {
+		return err
+	} else if group.Name == "" {
+		if err := db.Model(&group).Update("name", DefaultModelGroupName).Error; err != nil {
+			return err
+		}
+	}
+	if group.ID == 0 {
+		return nil
+	}
+	if err := db.Model(&ModelConfig{}).Where("model_group_id = 0 OR model_group_id IS NULL").Update("model_group_id", group.ID).Error; err != nil {
+		return err
+	}
+	if err := db.Model(&APIKey{}).Where("model_group_id = 0 OR model_group_id IS NULL").Update("model_group_id", group.ID).Error; err != nil {
+		return err
+	}
+	return nil
 }
 
 func (a *App) ensureAdmin() error {
@@ -178,11 +213,15 @@ func (a *App) seedModels() error {
 	if err := a.db.Order("priority asc").First(&source).Error; err != nil {
 		return err
 	}
+	group, err := defaultPlatformModelGroup(a.db)
+	if err != nil {
+		return err
+	}
 	models := []ModelConfig{
-		{SourceID: source.ID, Name: "gpt-4o", DisplayName: "GPT-4o", Provider: "OpenAI", Formats: ModelFormatOpenAI, BillingInput: 1, BillingOutput: 1, Status: ModelStatusActive, LatencyMS: 0},
-		{SourceID: source.ID, Name: "gpt-4o-mini", DisplayName: "GPT-4o Mini", Provider: "OpenAI", Formats: ModelFormatOpenAI, BillingInput: 0.2, BillingOutput: 0.2, Status: ModelStatusActive, LatencyMS: 0},
-		{SourceID: source.ID, Name: "claude-3-5-sonnet", DisplayName: "Claude 3.5 Sonnet", Provider: "Anthropic", Formats: ModelFormatAnthropic, BillingInput: 1.5, BillingOutput: 1.5, Status: ModelStatusActive, LatencyMS: 0},
-		{SourceID: source.ID, Name: "gemini-2.0-flash", DisplayName: "Gemini 2.0 Flash", Provider: "Google", Formats: ModelFormatOpenAI, BillingInput: 0.5, BillingOutput: 0.5, Status: ModelStatusActive, LatencyMS: 0},
+		{ModelGroupID: group.ID, SourceID: source.ID, Name: "gpt-4o", DisplayName: "GPT-4o", Provider: "OpenAI", Formats: ModelFormatOpenAI, BillingInput: 1, BillingOutput: 1, Status: ModelStatusActive, LatencyMS: 0},
+		{ModelGroupID: group.ID, SourceID: source.ID, Name: "gpt-4o-mini", DisplayName: "GPT-4o Mini", Provider: "OpenAI", Formats: ModelFormatOpenAI, BillingInput: 0.2, BillingOutput: 0.2, Status: ModelStatusActive, LatencyMS: 0},
+		{ModelGroupID: group.ID, SourceID: source.ID, Name: "claude-3-5-sonnet", DisplayName: "Claude 3.5 Sonnet", Provider: "Anthropic", Formats: ModelFormatAnthropic, BillingInput: 1.5, BillingOutput: 1.5, Status: ModelStatusActive, LatencyMS: 0},
+		{ModelGroupID: group.ID, SourceID: source.ID, Name: "gemini-2.0-flash", DisplayName: "Gemini 2.0 Flash", Provider: "Google", Formats: ModelFormatOpenAI, BillingInput: 0.5, BillingOutput: 0.5, Status: ModelStatusActive, LatencyMS: 0},
 	}
 	return a.db.Create(&models).Error
 }

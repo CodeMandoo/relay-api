@@ -2,6 +2,7 @@ import type {
   ApiKey,
   AuthUser,
   InviteCode,
+  ModelAccessGroup,
   PlatformModel,
   PlatformSettings,
   PlatformUser,
@@ -183,6 +184,11 @@ export const adminApi = {
       method: 'POST',
       body: jsonBody({ provider, redirectUrl }),
     }),
+  submitSourceAccountToken: (sourceId: string, payload: { provider: string; identifier: string; refreshToken: string }) =>
+    apiRequest<ApiEnvelope<SourceAccount[]> & { ok: boolean }>(`/admin/sources/${sourceId}/accounts/token`, {
+      method: 'POST',
+      body: jsonBody(payload),
+    }),
   updateSourceAccount: (id: string, payload: Partial<SourceAccount>) =>
     apiRequest<ApiEnvelope<SourceAccount>>(`/admin/source-accounts/${id}`, { method: 'PUT', body: jsonBody(payload) }),
   deleteSourceAccount: (id: string) => apiRequest<{ ok: boolean }>(`/admin/source-accounts/${id}`, { method: 'DELETE' }),
@@ -196,6 +202,12 @@ export const adminApi = {
   updateSourceKey: (id: string, payload: Partial<Pick<SourceKey, 'alias' | 'key' | 'status'>>) =>
     apiRequest<ApiEnvelope<SourceKey>>(`/admin/source-keys/${id}`, { method: 'PUT', body: jsonBody(payload) }),
   deleteSourceKey: (id: string) => apiRequest<{ ok: boolean }>(`/admin/source-keys/${id}`, { method: 'DELETE' }),
+  modelGroups: () => apiRequest<ApiEnvelope<ModelAccessGroup[]>>('/admin/model-groups'),
+  createModelGroup: (payload: Partial<ModelAccessGroup>) =>
+    apiRequest<ApiEnvelope<ModelAccessGroup>>('/admin/model-groups', { method: 'POST', body: jsonBody(payload) }),
+  updateModelGroup: (id: string, payload: Partial<ModelAccessGroup>) =>
+    apiRequest<ApiEnvelope<ModelAccessGroup>>(`/admin/model-groups/${id}`, { method: 'PUT', body: jsonBody(payload) }),
+  deleteModelGroup: (id: string) => apiRequest<{ ok: boolean }>(`/admin/model-groups/${id}`, { method: 'DELETE' }),
   models: () => apiRequest<ApiEnvelope<PlatformModel[]>>('/admin/models'),
   createModel: (payload: Partial<PlatformModel>) =>
     apiRequest<ApiEnvelope<PlatformModel>>('/admin/models', { method: 'POST', body: jsonBody(payload) }),
@@ -258,8 +270,9 @@ export const userApi = {
   testModel: (id: string) => apiRequest<ApiEnvelope<{ latencyMs: number }>>(`/user/models/${id}/test`, { method: 'POST' }),
   invokeTestModel: (id: string) =>
     apiRequest<ApiEnvelope<UserModelInvokeTestResult>>(`/user/models/${id}/invoke-test`, { method: 'POST' }),
+  modelGroups: () => apiRequest<ApiEnvelope<ModelAccessGroup[]>>('/user/model-groups'),
   apiKeys: () => apiRequest<ApiEnvelope<ApiKey[]>>('/user/api-keys'),
-  createApiKey: (payload: { name: string; limit?: number }) =>
+  createApiKey: (payload: { name: string; limit?: number; modelGroupId?: string }) =>
     apiRequest<ApiEnvelope<ApiKey>>('/user/api-keys', { method: 'POST', body: jsonBody(payload) }),
   updateApiKey: (id: string, payload: Partial<ApiKey> & { enabled?: boolean }) =>
     apiRequest<ApiEnvelope<ApiKey>>(`/user/api-keys/${id}`, { method: 'PUT', body: jsonBody(payload) }),

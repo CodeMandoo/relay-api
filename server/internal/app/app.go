@@ -64,6 +64,7 @@ func migrate(db *gorm.DB) error {
 		&User{},
 		&InviteCode{},
 		&EmailVerificationCode{},
+		&ModelGroup{},
 		&UpstreamSource{},
 		&SourceAccount{},
 		&SourceAccountUsageLog{},
@@ -76,6 +77,9 @@ func migrate(db *gorm.DB) error {
 		&PlatformSettings{},
 	)
 	if err != nil {
+		return err
+	}
+	if err := ensureDefaultModelGroup(db); err != nil {
 		return err
 	}
 	return migrateModelRouteBindings(db)
@@ -124,6 +128,7 @@ func (a *App) buildRouter() *gin.Engine {
 			admin.POST("/sources/:id/accounts/sync", a.adminSyncSourceAccounts)
 			admin.POST("/sources/:id/accounts/oauth", a.adminCreateOAuthSession)
 			admin.POST("/sources/:id/accounts/oauth/callback", a.adminSubmitOAuthCallback)
+			admin.POST("/sources/:id/accounts/token", a.adminSubmitSourceAccountToken)
 			admin.GET("/sources/:id/keys", a.adminSourceKeys)
 			admin.POST("/sources/:id/keys", a.adminCreateSourceKey)
 			admin.PUT("/source-accounts/:id", a.adminUpdateSourceAccount)
@@ -134,6 +139,10 @@ func (a *App) buildRouter() *gin.Engine {
 			admin.DELETE("/source-keys/:id", a.adminDeleteSourceKey)
 
 			admin.GET("/models", a.adminModels)
+			admin.GET("/model-groups", a.adminModelGroups)
+			admin.POST("/model-groups", a.adminCreateModelGroup)
+			admin.PUT("/model-groups/:id", a.adminUpdateModelGroup)
+			admin.DELETE("/model-groups/:id", a.adminDeleteModelGroup)
 			admin.POST("/models", a.adminCreateModel)
 			admin.PUT("/models/:id", a.adminUpdateModel)
 			admin.DELETE("/models/:id", a.adminDeleteModel)
@@ -164,6 +173,7 @@ func (a *App) buildRouter() *gin.Engine {
 			user.GET("/logs", a.userLogs)
 			user.GET("/logs/:id/attempts", a.userLogAttempts)
 			user.GET("/models", a.userModels)
+			user.GET("/model-groups", a.userModelGroups)
 			user.POST("/models/:id/test", a.userTestModel)
 			user.POST("/models/:id/invoke-test", a.userInvokeTestModel)
 

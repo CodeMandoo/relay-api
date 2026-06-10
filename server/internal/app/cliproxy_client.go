@@ -65,6 +65,110 @@ func (a *App) submitCLIProxyOAuthCallback(ctx context.Context, source UpstreamSo
 	return a.waitCLIProxyOAuthStatus(ctx, source, state, 15*time.Second)
 }
 
+func (a *App) submitCLIProxyManualToken(ctx context.Context, source UpstreamSource, provider string, identifier string, tokenInput string) error {
+	authFileProvider, err := cliProxyManualAuthFileProvider(provider)
+	if err != nil {
+		return err
+	}
+	identifier = strings.TrimSpace(identifier)
+	if identifier == "" {
+		return fmt.Errorf("identifier is required")
+	}
+	token, err := parseManualRefreshToken(tokenInput)
+	if err != nil {
+		return err
+	}
+	now := time.Now().UTC()
+	payload := map[string]any{
+		"type":          authFileProvider,
+		"email":         identifier,
+		"account":       identifier,
+		"label":         identifier,
+		"auth_kind":     "oauth",
+		"refresh_token": token.RefreshToken,
+		"expired":       time.Unix(0, 0).UTC().Format(time.RFC3339),
+		"last_refresh":  now.Format(time.RFC3339),
+	}
+	if token.AccessToken != "" {
+		payload["access_token"] = token.AccessToken
+	}
+	if token.IDToken != "" {
+		payload["id_token"] = token.IDToken
+	}
+	name := manualAuthFileName(authFileProvider, identifier, now)
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+	endpoint := "/v0/management/auth-files?name=" + url.QueryEscape(name)
+	return a.cliProxyJSON(ctx, source, http.MethodPost, endpoint, strings.NewReader(string(raw)), nil)
+}
+
+type manualTokenPayload struct {
+	RefreshToken string
+	AccessToken  string
+	IDToken      string
+}
+
+func parseManualRefreshToken(raw string) (manualTokenPayload, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return manualTokenPayload{}, fmt.Errorf("refresh_token is required")
+	}
+	if strings.HasPrefix(raw, "{") {
+		var payload map[string]any
+		if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+			return manualTokenPayload{}, fmt.Errorf("token JSON is invalid")
+		}
+		token := manualTokenPayload{
+			RefreshToken: firstString(payload, "refresh_token", "refreshToken"),
+			AccessToken:  firstString(payload, "access_token", "accessToken"),
+			IDToken:      firstString(payload, "id_token", "idToken"),
+		}
+		if nested, ok := payload["token"].(map[string]any); ok {
+			if token.RefreshToken == "" {
+				token.RefreshToken = firstString(nested, "refresh_token", "refreshToken")
+			}
+			if token.AccessToken == "" {
+				token.AccessToken = firstString(nested, "access_token", "accessToken")
+			}
+			if token.IDToken == "" {
+				token.IDToken = firstString(nested, "id_token", "idToken")
+			}
+		}
+		if token.RefreshToken == "" {
+			return manualTokenPayload{}, fmt.Errorf("token JSON must contain refresh_token")
+		}
+		return token, nil
+	}
+	return manualTokenPayload{RefreshToken: raw}, nil
+}
+
+func manualAuthFileName(provider string, identifier string, now time.Time) string {
+	clean := strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z':
+			return r
+		case r >= 'A' && r <= 'Z':
+			return r
+		case r >= '0' && r <= '9':
+			return r
+		case r == '-', r == '_', r == '.':
+			return r
+		default:
+			return '-'
+		}
+	}, strings.ToLower(strings.TrimSpace(identifier)))
+	clean = strings.Trim(clean, "-_.")
+	if clean == "" {
+		clean = "account"
+	}
+	if len(clean) > 48 {
+		clean = strings.Trim(clean[:48], "-_.")
+	}
+	return fmt.Sprintf("relay-%s-%s-%d.json", strings.ToLower(provider), clean, now.Unix())
+}
+
 func (a *App) waitCLIProxyOAuthStatus(ctx context.Context, source UpstreamSource, state string, timeout time.Duration) (bool, error) {
 	deadline := time.Now().Add(timeout)
 	for {
@@ -268,6 +372,17 @@ func cliProxyOAuthProviderID(provider string) (string, error) {
 		return "antigravity", nil
 	default:
 		return "", fmt.Errorf("unsupported CLIProxyAPI OAuth provider: %s", provider)
+	}
+}
+
+func cliProxyManualAuthFileProvider(provider string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "chatgpt", "codex", "openai":
+		return "codex", nil
+	case "claude", "anthropic":
+		return "claude", nil
+	default:
+		return "", fmt.Errorf("manual token login currently supports ChatGPT and Claude only")
 	}
 }
 

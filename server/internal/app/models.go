@@ -34,6 +34,8 @@ const (
 
 	RequestStatusSuccess = "success"
 	RequestStatusError   = "error"
+
+	DefaultModelGroupName = "默认分组"
 )
 
 type User struct {
@@ -79,6 +81,17 @@ type EmailVerificationCode struct {
 	CreatedAt time.Time
 	UpdatedAt time.Time
 	DeletedAt gorm.DeletedAt `gorm:"index"`
+}
+
+type ModelGroup struct {
+	ID           uint   `gorm:"primaryKey"`
+	Name         string `gorm:"size:120;index;not null"`
+	Description  string `gorm:"size:255"`
+	BindingsJSON string `gorm:"type:text"`
+	IsDefault    bool   `gorm:"not null;default:false"`
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
+	DeletedAt    gorm.DeletedAt `gorm:"index"`
 }
 
 type UpstreamSource struct {
@@ -174,6 +187,7 @@ type SourceKey struct {
 
 type ModelConfig struct {
 	ID                 uint   `gorm:"primaryKey"`
+	ModelGroupID       uint   `gorm:"index;not null;default:0"`
 	SourceID           uint   `gorm:"index;not null"`
 	SourceKeyID        *uint  `gorm:"index"`
 	Name               string `gorm:"size:255;index;not null"`
@@ -222,19 +236,20 @@ type ModelRouteBinding struct {
 }
 
 type APIKey struct {
-	ID         uint   `gorm:"primaryKey"`
-	UserID     uint   `gorm:"index;not null"`
-	Name       string `gorm:"size:255;not null"`
-	Secret     string `gorm:"size:160;uniqueIndex;not null"`
-	KeyHash    string `gorm:"size:64;uniqueIndex;not null"`
-	Masked     string `gorm:"size:80;not null"`
-	Status     string `gorm:"size:20;index;not null;default:valid"`
-	LimitUSD   *float64
-	SpentUSD   float64
-	LastUsedAt *time.Time
-	CreatedAt  time.Time
-	UpdatedAt  time.Time
-	DeletedAt  gorm.DeletedAt `gorm:"index"`
+	ID           uint   `gorm:"primaryKey"`
+	UserID       uint   `gorm:"index;not null"`
+	ModelGroupID uint   `gorm:"index;not null;default:0"`
+	Name         string `gorm:"size:255;not null"`
+	Secret       string `gorm:"size:160;uniqueIndex;not null"`
+	KeyHash      string `gorm:"size:64;uniqueIndex;not null"`
+	Masked       string `gorm:"size:80;not null"`
+	Status       string `gorm:"size:20;index;not null;default:valid"`
+	LimitUSD     *float64
+	SpentUSD     float64
+	LastUsedAt   *time.Time
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
+	DeletedAt    gorm.DeletedAt `gorm:"index"`
 }
 
 type UsageLog struct {
@@ -346,6 +361,7 @@ type SourceDTO struct {
 	OpenAIBaseURL    string `json:"openaiBaseUrl,omitempty"`
 	AnthropicBaseURL string `json:"anthropicBaseUrl,omitempty"`
 	APIKey           string `json:"apiKey,omitempty"`
+	MaskedKey        string `json:"maskedKey,omitempty"`
 	ManagementKey    string `json:"managementKey,omitempty"`
 	HasManagementKey bool   `json:"hasManagementKey"`
 	AccountCount     int    `json:"accountCount"`
@@ -359,6 +375,7 @@ type SourceDTO struct {
 	LastSuccessAt    string `json:"lastSuccessAt,omitempty"`
 	CooldownUntil    string `json:"cooldownUntil,omitempty"`
 	CoolingDown      bool   `json:"coolingDown"`
+	CreatedAt        string `json:"createdAt,omitempty"`
 }
 
 type SourceAccountDTO struct {
@@ -411,6 +428,8 @@ type SourceKeyDTO struct {
 type ModelDTO struct {
 	ID                 string                   `json:"id"`
 	Name               string                   `json:"name"`
+	ModelGroupID       string                   `json:"modelGroupId,omitempty"`
+	ModelGroupName     string                   `json:"modelGroupName,omitempty"`
 	SourceID           string                   `json:"sourceId"`
 	SourceName         string                   `json:"sourceName"`
 	SourceKeyID        string                   `json:"sourceKeyId,omitempty"`
@@ -453,15 +472,28 @@ type ModelRouteCandidateDTO struct {
 }
 
 type APIKeyDTO struct {
-	ID         string   `json:"id"`
-	Name       string   `json:"name"`
-	Key        string   `json:"key"`
-	Masked     string   `json:"masked"`
-	CreatedAt  string   `json:"createdAt"`
-	LastUsedAt *string  `json:"lastUsedAt,omitempty"`
-	Status     string   `json:"status"`
-	Limit      *float64 `json:"limit,omitempty"`
-	Spent      float64  `json:"spent"`
+	ID             string   `json:"id"`
+	Name           string   `json:"name"`
+	Key            string   `json:"key"`
+	Masked         string   `json:"masked"`
+	CreatedAt      string   `json:"createdAt"`
+	LastUsedAt     *string  `json:"lastUsedAt,omitempty"`
+	Status         string   `json:"status"`
+	Limit          *float64 `json:"limit,omitempty"`
+	Spent          float64  `json:"spent"`
+	ModelGroupID   string   `json:"modelGroupId,omitempty"`
+	ModelGroupName string   `json:"modelGroupName,omitempty"`
+}
+
+type ModelGroupDTO struct {
+	ID          string                `json:"id"`
+	Name        string                `json:"name"`
+	Description string                `json:"description,omitempty"`
+	IsDefault   bool                  `json:"isDefault"`
+	KeyCount    int64                 `json:"keyCount,omitempty"`
+	ModelCount  int64                 `json:"modelCount,omitempty"`
+	Bindings    []modelBindingRequest `json:"bindings,omitempty"`
+	CreatedAt   string                `json:"createdAt"`
 }
 
 func userDTO(user User, used int64) UserDTO {
@@ -516,6 +548,7 @@ func sourceDTO(source UpstreamSource, includeSecret bool) SourceDTO {
 		APIBase:          source.BaseURL,
 		OpenAIBaseURL:    source.OpenAIBaseURL,
 		AnthropicBaseURL: source.AnthropicBaseURL,
+		MaskedKey:        maskSecret(source.APIKey),
 		HasManagementKey: strings.TrimSpace(source.ManagementKey) != "",
 		AccountCount:     source.AccountCount,
 		Priority:         source.Priority,
@@ -525,6 +558,7 @@ func sourceDTO(source UpstreamSource, includeSecret bool) SourceDTO {
 		FailureCount:     source.FailureCount,
 		SuccessCount:     source.SuccessCount,
 		CoolingDown:      source.CooldownUntil != nil && source.CooldownUntil.After(time.Now()),
+		CreatedAt:        source.CreatedAt.UTC().Format(time.RFC3339),
 	}
 	if source.LastFailureAt != nil {
 		out.LastFailureAt = source.LastFailureAt.UTC().Format(time.RFC3339)
@@ -620,6 +654,7 @@ func modelDTO(model ModelConfig, sourceName string, sourceKeyAlias string) Model
 	out := ModelDTO{
 		ID:                 id("m", model.ID),
 		Name:               model.Name,
+		ModelGroupID:       optionalPublicID("mg", model.ModelGroupID),
 		SourceID:           id("s", model.SourceID),
 		SourceName:         sourceName,
 		Provider:           model.Provider,
@@ -685,6 +720,10 @@ func modelRouteCandidateDTOFromBinding(model ModelConfig, binding ModelRouteBind
 }
 
 func apiKeyDTO(key APIKey, reveal bool) APIKeyDTO {
+	return apiKeyDTOWithGroup(key, reveal, "")
+}
+
+func apiKeyDTOWithGroup(key APIKey, reveal bool, groupName string) APIKeyDTO {
 	var last *string
 	if key.LastUsedAt != nil {
 		v := key.LastUsedAt.UTC().Format(time.RFC3339)
@@ -695,15 +734,30 @@ func apiKeyDTO(key APIKey, reveal bool) APIKeyDTO {
 		visible = key.Secret
 	}
 	return APIKeyDTO{
-		ID:         id("k", key.ID),
-		Name:       key.Name,
-		Key:        visible,
-		Masked:     key.Masked,
-		CreatedAt:  key.CreatedAt.UTC().Format(time.RFC3339),
-		LastUsedAt: last,
-		Status:     key.Status,
-		Limit:      key.LimitUSD,
-		Spent:      key.SpentUSD,
+		ID:             id("k", key.ID),
+		Name:           key.Name,
+		Key:            visible,
+		Masked:         key.Masked,
+		CreatedAt:      key.CreatedAt.UTC().Format(time.RFC3339),
+		LastUsedAt:     last,
+		Status:         key.Status,
+		Limit:          key.LimitUSD,
+		Spent:          key.SpentUSD,
+		ModelGroupID:   optionalPublicID("mg", key.ModelGroupID),
+		ModelGroupName: groupName,
+	}
+}
+
+func modelGroupDTO(group ModelGroup, keyCount, modelCount int64) ModelGroupDTO {
+	return ModelGroupDTO{
+		ID:          id("mg", group.ID),
+		Name:        group.Name,
+		Description: group.Description,
+		IsDefault:   group.IsDefault,
+		KeyCount:    keyCount,
+		ModelCount:  modelCount,
+		Bindings:    decodeModelGroupBindings(group.BindingsJSON),
+		CreatedAt:   group.CreatedAt.UTC().Format(time.RFC3339),
 	}
 }
 

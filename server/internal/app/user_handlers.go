@@ -159,19 +159,28 @@ func (a *App) userLogAttempts(c *gin.Context) {
 }
 
 func (a *App) userModels(c *gin.Context) {
+	if _, ok := currentUser(c); !ok {
+		errorJSON(c, http.StatusUnauthorized, "unauthorized")
+		return
+	}
 	var models []ModelConfig
-	if err := a.db.Where("status = ?", ModelStatusActive).Order("name asc").Find(&models).Error; err != nil {
+	settings, _ := a.getSettings()
+	query := a.db.Where("status = ?", ModelStatusActive)
+	if err := query.Order("model_group_id asc, name asc").Find(&models).Error; err != nil {
 		errorJSON(c, http.StatusInternalServerError, "database error")
 		return
 	}
+	defaultGroupID := a.defaultModelGroupID()
 	candidateCounts := map[string]int{}
 	for _, model := range models {
+		model.ModelGroupID = modelGroupBucketID(model, defaultGroupID)
+		key := modelGroupBucketKey(model.Name, model.ModelGroupID)
 		bindings, err := a.modelBindings(model)
 		if err != nil || len(bindings) == 0 {
-			candidateCounts[model.Name]++
+			candidateCounts[key]++
 			continue
 		}
-		candidateCounts[model.Name] += len(bindings)
+		candidateCounts[key] += len(bindings)
 	}
 	sourceMap := map[uint]UpstreamSource{}
 	var sources []UpstreamSource
@@ -193,13 +202,14 @@ func (a *App) userModels(c *gin.Context) {
 			sourceKeyMap[key.ID] = key
 		}
 	}
-	models = currentUserModels(models, sourceMap, sourceKeyMap, time.Now())
-	settings, _ := a.getSettings()
+	models = currentUserModels(models, sourceMap, sourceKeyMap, time.Now(), defaultGroupID)
+	groupNames := a.modelGroupNameMap()
 	out := make([]gin.H, 0, len(models))
 	for _, model := range models {
+		model.ModelGroupID = modelGroupBucketID(model, defaultGroupID)
 		source := sourceMap[model.SourceID]
 		latency := model.LatencyMS
-		if targets, err := a.routeTargets(model.Name, modelTestProtocol(model)); err == nil && len(targets) > 0 {
+		if targets, err := a.routeTargets(model.Name, modelTestProtocol(model), model.ModelGroupID); err == nil && len(targets) > 0 {
 			source = targets[0].Source
 			latency = nonZeroInt(targets[0].Binding.LatencyMS, targets[0].Model.LatencyMS)
 		}
@@ -214,6 +224,8 @@ func (a *App) userModels(c *gin.Context) {
 		out = append(out, gin.H{
 			"id":                id("m", model.ID),
 			"name":              model.Name,
+			"modelGroupId":      optionalPublicID("mg", model.ModelGroupID),
+			"modelGroupName":    groupNames[model.ModelGroupID],
 			"provider":          model.Provider,
 			"formats":           modelFormatList(model),
 			"status":            status,
@@ -223,20 +235,22 @@ func (a *App) userModels(c *gin.Context) {
 			"sourceName":        sourceName,
 			"sourceType":        source.Type,
 			"sourceStatus":      source.Status,
-			"routingCandidates": candidateCounts[model.Name],
+			"routingCandidates": candidateCounts[modelGroupBucketKey(model.Name, model.ModelGroupID)],
 		})
 	}
 	c.JSON(http.StatusOK, gin.H{"data": out})
 }
 
-func currentUserModels(models []ModelConfig, sources map[uint]UpstreamSource, sourceKeys map[uint]SourceKey, now time.Time) []ModelConfig {
+func currentUserModels(models []ModelConfig, sources map[uint]UpstreamSource, sourceKeys map[uint]SourceKey, now time.Time, defaultGroupID uint) []ModelConfig {
 	groups := map[string][]ModelConfig{}
 	names := make([]string, 0)
 	for _, model := range models {
-		if _, ok := groups[model.Name]; !ok {
-			names = append(names, model.Name)
+		model.ModelGroupID = modelGroupBucketID(model, defaultGroupID)
+		key := modelGroupBucketKey(model.Name, model.ModelGroupID)
+		if _, ok := groups[key]; !ok {
+			names = append(names, key)
 		}
-		groups[model.Name] = append(groups[model.Name], model)
+		groups[key] = append(groups[key], model)
 	}
 	sort.Strings(names)
 	out := make([]ModelConfig, 0, len(names))
@@ -396,7 +410,7 @@ func (a *App) userModelTestTarget(c *gin.Context, modelID uint) (routeTarget, bo
 		errorJSON(c, http.StatusNotFound, "model not found")
 		return routeTarget{}, false
 	}
-	targets, err := a.routeTargets(model.Name, modelTestProtocol(model))
+	targets, err := a.routeTargets(model.Name, modelTestProtocol(model), model.ModelGroupID)
 	if err != nil || len(targets) == 0 {
 		errorJSON(c, http.StatusBadGateway, "source is not online")
 		return routeTarget{}, false
@@ -482,9 +496,11 @@ func (a *App) userAPIKeys(c *gin.Context) {
 		errorJSON(c, http.StatusInternalServerError, "database error")
 		return
 	}
+	groupNames := a.modelGroupNameMap()
 	out := make([]APIKeyDTO, 0, len(keys))
 	for _, key := range keys {
-		out = append(out, apiKeyDTO(key, false))
+		key.ModelGroupID = a.normalizeModelGroupID(key.ModelGroupID)
+		out = append(out, apiKeyDTOWithGroup(key, false, groupNames[key.ModelGroupID]))
 	}
 	c.JSON(http.StatusOK, gin.H{"data": out})
 }
@@ -496,8 +512,9 @@ func (a *App) userCreateAPIKey(c *gin.Context) {
 		return
 	}
 	var req struct {
-		Name  string   `json:"name"`
-		Limit *float64 `json:"limit"`
+		Name         string   `json:"name"`
+		Limit        *float64 `json:"limit"`
+		ModelGroupID string   `json:"modelGroupId"`
 	}
 	if !bindJSON(c, &req) {
 		return
@@ -506,25 +523,31 @@ func (a *App) userCreateAPIKey(c *gin.Context) {
 	if name == "" {
 		name = "default"
 	}
+	group, err := a.accessibleModelGroupForUser(user, req.ModelGroupID)
+	if err != nil {
+		errorJSON(c, http.StatusBadRequest, err.Error())
+		return
+	}
 	secret, err := randomToken("sk-relay-", 32)
 	if err != nil {
 		errorJSON(c, http.StatusInternalServerError, "generate api key failed")
 		return
 	}
 	key := APIKey{
-		UserID:   user.ID,
-		Name:     name,
-		Secret:   secret,
-		KeyHash:  hashKey(secret),
-		Masked:   maskKey(secret),
-		Status:   APIKeyStatusValid,
-		LimitUSD: req.Limit,
+		UserID:       user.ID,
+		ModelGroupID: group.ID,
+		Name:         name,
+		Secret:       secret,
+		KeyHash:      hashKey(secret),
+		Masked:       maskKey(secret),
+		Status:       APIKeyStatusValid,
+		LimitUSD:     req.Limit,
 	}
 	if err := a.db.Create(&key).Error; err != nil {
 		errorJSON(c, http.StatusBadRequest, "create api key failed")
 		return
 	}
-	c.JSON(http.StatusCreated, gin.H{"data": apiKeyDTO(key, true)})
+	c.JSON(http.StatusCreated, gin.H{"data": apiKeyDTOWithGroup(key, true, group.Name)})
 }
 
 func (a *App) userUpdateAPIKey(c *gin.Context) {
@@ -559,6 +582,14 @@ func (a *App) userUpdateAPIKey(c *gin.Context) {
 	if value, ok := numberFromMap(req, "limit"); ok {
 		updates["limit_usd"] = value
 	}
+	if value, ok := req["modelGroupId"].(string); ok {
+		group, err := a.accessibleModelGroupForUser(user, value)
+		if err != nil {
+			errorJSON(c, http.StatusBadRequest, err.Error())
+			return
+		}
+		updates["model_group_id"] = group.ID
+	}
 	if len(updates) == 0 {
 		errorJSON(c, http.StatusBadRequest, "no fields to update")
 		return
@@ -572,7 +603,9 @@ func (a *App) userUpdateAPIKey(c *gin.Context) {
 		errorJSON(c, http.StatusNotFound, "api key not found")
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"data": apiKeyDTO(key, false)})
+	groupNames := a.modelGroupNameMap()
+	key.ModelGroupID = a.normalizeModelGroupID(key.ModelGroupID)
+	c.JSON(http.StatusOK, gin.H{"data": apiKeyDTOWithGroup(key, false, groupNames[key.ModelGroupID])})
 }
 
 func (a *App) userDeleteAPIKey(c *gin.Context) {
@@ -609,7 +642,9 @@ func (a *App) userRevealAPIKey(c *gin.Context) {
 		errorJSON(c, http.StatusNotFound, "api key not found")
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"data": apiKeyDTO(key, true)})
+	groupNames := a.modelGroupNameMap()
+	key.ModelGroupID = a.normalizeModelGroupID(key.ModelGroupID)
+	c.JSON(http.StatusOK, gin.H{"data": apiKeyDTOWithGroup(key, true, groupNames[key.ModelGroupID])})
 }
 
 func (a *App) userRequestLogDTOs(user User, logs []UsageLog) []gin.H {

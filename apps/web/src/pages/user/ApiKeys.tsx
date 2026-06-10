@@ -37,6 +37,11 @@ import {
   Input,
   Label,
   Progress,
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
   Switch,
   Table,
   TableBody,
@@ -55,12 +60,60 @@ import {
   formatCurrency,
   formatRelative,
   type ApiKey,
+  type ModelAccessGroup,
 } from '@relay-api/lib';
 import { getErrorMessage, userApi } from '@/lib/api';
 import { PageHeader } from '@/components/common/PageHeader';
 import { StatCard } from '@/components/common/StatCard';
 import { StatusBadge } from '@/components/common/StatusBadge';
 import { EmptyState } from '@/components/common/EmptyState';
+
+type ApiKeyModelGroup = {
+  id: string;
+  name: string;
+  description?: string;
+};
+
+const fallbackModelGroups: ApiKeyModelGroup[] = [
+  { id: 'g_platform', name: '默认分组', description: '使用平台统一提供的模型集合' },
+];
+
+const fallbackDefaultModelGroup = fallbackModelGroups[0];
+
+const normalizeModelGroups = (groups: ModelAccessGroup[]): ApiKeyModelGroup[] =>
+  groups.map((group) => ({
+    id: group.id,
+    name: group.name,
+    description: group.description,
+  }));
+
+const modelGroupById = (groups: ApiKeyModelGroup[], id?: string) => groups.find((group) => group.id === id) ?? groups[0] ?? fallbackDefaultModelGroup;
+
+const nowISO = () => new Date().toISOString();
+
+const demoApiKeys: ApiKey[] = [
+  {
+    id: 'ak_demo_default',
+    name: 'default-app',
+    key: 'sk-relay-demo-default-0123456789',
+    masked: 'sk-relay-demo-********6789',
+    createdAt: nowISO(),
+    lastUsedAt: nowISO(),
+    status: 'valid',
+    limit: 50,
+    spent: 12.4,
+    modelGroupId: 'g_platform',
+    modelGroupName: '默认分组',
+  },
+];
+
+const isLocalDemoKey = (key: ApiKey) => key.id.startsWith('ak_demo') || key.id.startsWith('ak_local');
+
+const ModelGroupOption = ({ group }: { group: ApiKeyModelGroup }) => (
+  <div className="flex w-full min-w-0 items-center">
+    <span className="truncate">{group.name}</span>
+  </div>
+);
 
 export default function Page() {
   const [keys, setKeys] = useState<ApiKey[]>([]);
@@ -70,12 +123,30 @@ export default function Page() {
   const [visible, setVisible] = useState<Set<string>>(new Set());
   const [name, setName] = useState('');
   const [limit, setLimit] = useState('');
+  const [modelGroups, setModelGroups] = useState<ApiKeyModelGroup[]>(fallbackModelGroups);
+  const defaultModelGroup = modelGroups[0] ?? fallbackDefaultModelGroup;
+  const [modelGroupId, setModelGroupId] = useState(fallbackDefaultModelGroup.id);
 
   useEffect(() => {
-    userApi
-      .apiKeys()
-      .then((response) => setKeys(response.data))
-      .catch((error) => toast.error(getErrorMessage(error, '加载 API Key 失败')));
+    Promise.all([userApi.modelGroups(), userApi.apiKeys()])
+      .then(([groupResponse, response]) => {
+        const groups = normalizeModelGroups(groupResponse.data);
+        const nextGroups = groups.length > 0 ? groups : fallbackModelGroups;
+        setModelGroups(nextGroups);
+        setModelGroupId((current) => (nextGroups.some((group) => group.id === current) ? current : nextGroups[0].id));
+        setKeys(
+          response.data.map((key) => ({
+            ...key,
+            modelGroupId: modelGroupById(nextGroups, key.modelGroupId).id,
+            modelGroupName: modelGroupById(nextGroups, key.modelGroupId).name,
+          })),
+        );
+      })
+      .catch((error) => {
+        setModelGroups(fallbackModelGroups);
+        setKeys([]);
+        toast.error(getErrorMessage(error, '加载 API Key 失败'));
+      });
   }, []);
 
   const filtered = useMemo(() => {
@@ -97,17 +168,21 @@ export default function Page() {
       return;
     }
     setCreating(true);
+    const group = modelGroupById(modelGroups, modelGroupId);
+    const groupName = group.name;
     try {
       const response = await userApi.createApiKey({
         name: name.trim(),
         limit: limit ? Number(limit) : undefined,
+        modelGroupId,
       });
-      setKeys((prev) => [response.data, ...prev]);
+      setKeys((prev) => [{ ...response.data, modelGroupId, modelGroupName: groupName }, ...prev]);
       setVisible((prev) => new Set(prev).add(response.data.id));
       setName('');
       setLimit('');
+      setModelGroupId(defaultModelGroup.id);
       setOpen(false);
-      toast.success('API Key 已创建', { description: '凭证已安全保存至您的账户。' });
+      toast.success('API Key 已创建', { description: `已绑定模型分组: ${groupName}` });
     } catch (error) {
       toast.error(getErrorMessage(error, '创建 API Key 失败'));
     } finally {
@@ -117,7 +192,7 @@ export default function Page() {
 
   const copyKey = async (key: ApiKey) => {
     try {
-      const secret = visible.has(key.id) ? key.key : (await userApi.revealApiKey(key.id)).data.key;
+      const secret = visible.has(key.id) || isLocalDemoKey(key) ? key.key : (await userApi.revealApiKey(key.id)).data.key;
       await copyToClipboard(secret);
       setKeys((prev) => prev.map((item) => (item.id === key.id ? { ...item, key: secret } : item)));
       toast.success('API Key 已复制');
@@ -135,6 +210,10 @@ export default function Page() {
       });
       return;
     }
+    if (isLocalDemoKey(key)) {
+      setVisible((prev) => new Set(prev).add(key.id));
+      return;
+    }
     try {
       const response = await userApi.revealApiKey(key.id);
       setKeys((prev) => prev.map((item) => (item.id === key.id ? response.data : item)));
@@ -147,6 +226,13 @@ export default function Page() {
   const toggleStatus = async (id: string) => {
     const target = keys.find((key) => key.id === id);
     if (!target) return;
+    if (isLocalDemoKey(target)) {
+      setKeys((prev) =>
+        prev.map((key) => (key.id === id ? { ...key, status: key.status === 'valid' ? 'disabled' : 'valid' } : key)),
+      );
+      toast.success('Key 状态已更新');
+      return;
+    }
     try {
       const response = await userApi.updateApiKey(id, { enabled: target.status !== 'valid' });
       setKeys((prev) => prev.map((key) => (key.id === id ? response.data : key)));
@@ -156,7 +242,47 @@ export default function Page() {
     }
   };
 
+  const changeKeyGroup = async (key: ApiKey, nextGroupId: string) => {
+    const previousGroup = modelGroupById(modelGroups, key.modelGroupId);
+    const nextGroup = modelGroupById(modelGroups, nextGroupId);
+
+    if (isLocalDemoKey(key)) {
+      setKeys((prev) =>
+        prev.map((item) => (item.id === key.id ? { ...item, modelGroupId: nextGroup.id, modelGroupName: nextGroup.name } : item)),
+      );
+      toast.success('模型分组已更新', { description: nextGroup.name });
+      return;
+    }
+
+    setKeys((prev) =>
+      prev.map((item) => (item.id === key.id ? { ...item, modelGroupId: nextGroup.id, modelGroupName: nextGroup.name } : item)),
+    );
+
+    try {
+      const response = await userApi.updateApiKey(key.id, { modelGroupId: nextGroup.id });
+      setKeys((prev) =>
+        prev.map((item) =>
+          item.id === key.id ? { ...response.data, modelGroupId: nextGroup.id, modelGroupName: nextGroup.name } : item,
+        ),
+      );
+      toast.success('模型分组已更新', { description: nextGroup.name });
+    } catch (error) {
+      setKeys((prev) =>
+        prev.map((item) =>
+          item.id === key.id ? { ...item, modelGroupId: previousGroup.id, modelGroupName: previousGroup.name } : item,
+        ),
+      );
+      toast.error(getErrorMessage(error, '更新模型分组失败'));
+    }
+  };
+
   const removeKey = async (id: string) => {
+    const target = keys.find((key) => key.id === id);
+    if (target && isLocalDemoKey(target)) {
+      setKeys((prev) => prev.filter((key) => key.id !== id));
+      toast.success('API Key 已删除');
+      return;
+    }
     try {
       await userApi.deleteApiKey(id);
       setKeys((prev) => prev.filter((key) => key.id !== id));
@@ -204,6 +330,21 @@ export default function Page() {
                     <Label htmlFor="key-limit">月度预算上限 (USD，可选)</Label>
                     <Input id="key-limit" type="number" min={0} value={limit} onChange={(e) => setLimit(e.target.value)} placeholder="不设上限" />
                   </div>
+                  <div className="grid gap-2">
+                    <Label htmlFor="key-group">模型分组</Label>
+                    <Select value={modelGroupId} onValueChange={setModelGroupId}>
+                      <SelectTrigger id="key-group">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                          {modelGroups.map((group) => (
+                            <SelectItem key={group.id} value={group.id}>
+                              <ModelGroupOption group={group} />
+                            </SelectItem>
+                          ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
                 </div>
                 <DialogFooter>
                   <Button variant="ghost" onClick={() => setOpen(false)}>
@@ -239,12 +380,13 @@ export default function Page() {
             <Table className="w-full table-fixed">
               <TableHeader>
                 <TableRow className="bg-muted/40 hover:bg-muted/40">
-                  <TableHead className="w-[18%] px-6">名称</TableHead>
-                  <TableHead className="w-[33%] px-3">Key 值 (SECRET)</TableHead>
+                  <TableHead className="w-[17%] px-6">名称</TableHead>
+                  <TableHead className="w-[28%] px-3">Key 值 (SECRET)</TableHead>
+                  <TableHead className="w-[13%] px-3">模型分组</TableHead>
                   <TableHead className="w-[10%] px-3">状态</TableHead>
                   <TableHead className="w-[15%] px-3">预算消耗</TableHead>
                   <TableHead className="w-[12%] px-3 text-right">最后使用</TableHead>
-                  <TableHead className="w-[12%] px-3 pr-6 text-right">操作</TableHead>
+                  <TableHead className="w-[10%] px-3 pr-6 text-right">操作</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -253,6 +395,7 @@ export default function Page() {
                   const displayKey = isVisible ? key.key : key.masked;
                   const hasLimit = typeof key.limit === 'number';
                   const pct = hasLimit ? Math.min(100, Math.round((key.spent / Math.max(key.limit ?? 1, 1)) * 100)) : 0;
+                  const currentGroup = modelGroupById(modelGroups, key.modelGroupId);
                   return (
                     <motion.tr
                       key={key.id}
@@ -295,6 +438,28 @@ export default function Page() {
                           <Button variant="ghost" size="icon" className="h-8 w-8 shrink-0 text-muted-foreground hover:text-primary" onClick={() => copyKey(key)}>
                             <Copy className="h-3.5 w-3.5" />
                           </Button>
+                        </div>
+                      </TableCell>
+                      <TableCell className="px-3">
+                        <div className="space-y-1">
+                          <Select
+                            value={key.modelGroupId ?? defaultModelGroup.id}
+                            onValueChange={(value) => changeKeyGroup(key, value)}
+                          >
+                            <SelectTrigger className="h-8 w-full min-w-0 rounded-lg text-xs">
+                              <SelectValue />
+                            </SelectTrigger>
+                            <SelectContent>
+                              {modelGroups.map((group) => (
+                                <SelectItem key={group.id} value={group.id}>
+                                  <ModelGroupOption group={group} />
+                                </SelectItem>
+                              ))}
+                            </SelectContent>
+                          </Select>
+                          <div className="truncate text-[10px] text-muted-foreground/70">
+                            {currentGroup.description}
+                          </div>
                         </div>
                       </TableCell>
                       <TableCell className="px-3">

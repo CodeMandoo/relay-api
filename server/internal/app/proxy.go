@@ -53,8 +53,19 @@ type usageRecordMeta struct {
 }
 
 func (a *App) openAIModels(c *gin.Context) {
+	_, key, ok := currentAPIIdentity(c)
+	if !ok {
+		errorJSON(c, http.StatusUnauthorized, "invalid api key")
+		return
+	}
+	modelGroupID, ok := a.requireAPIKeyModelGroup(c, key)
+	if !ok {
+		return
+	}
 	var models []ModelConfig
-	if err := a.db.Where("status = ?", ModelStatusActive).Order("name asc").Find(&models).Error; err != nil {
+	query := a.db.Where("status = ?", ModelStatusActive)
+	query = a.applyModelGroupFilter(query, modelGroupID)
+	if err := query.Order("name asc").Find(&models).Error; err != nil {
 		errorJSON(c, http.StatusInternalServerError, "database error")
 		return
 	}
@@ -79,9 +90,20 @@ func (a *App) openAIModels(c *gin.Context) {
 }
 
 func (a *App) openAIModel(c *gin.Context) {
+	_, key, ok := currentAPIIdentity(c)
+	if !ok {
+		errorJSON(c, http.StatusUnauthorized, "invalid api key")
+		return
+	}
+	modelGroupID, ok := a.requireAPIKeyModelGroup(c, key)
+	if !ok {
+		return
+	}
 	name := strings.TrimSpace(c.Param("model"))
 	var model ModelConfig
-	if err := a.db.Where("name = ? AND status = ?", name, ModelStatusActive).First(&model).Error; err != nil {
+	query := a.db.Where("name = ? AND status = ?", name, ModelStatusActive)
+	query = a.applyModelGroupFilter(query, modelGroupID)
+	if err := query.First(&model).Error; err != nil {
 		errorJSON(c, http.StatusNotFound, "model not found")
 		return
 	}
@@ -128,8 +150,19 @@ func (a *App) proxyGeminiGenerate(c *gin.Context) {
 }
 
 func (a *App) geminiModels(c *gin.Context) {
+	_, key, ok := currentAPIIdentity(c)
+	if !ok {
+		errorJSON(c, http.StatusUnauthorized, "invalid api key")
+		return
+	}
+	modelGroupID, ok := a.requireAPIKeyModelGroup(c, key)
+	if !ok {
+		return
+	}
 	var models []ModelConfig
-	if err := a.db.Where("status = ? AND provider = ?", ModelStatusActive, "Google").Order("name asc").Find(&models).Error; err != nil {
+	query := a.db.Where("status = ? AND provider = ?", ModelStatusActive, "Google")
+	query = a.applyModelGroupFilter(query, modelGroupID)
+	if err := query.Order("name asc").Find(&models).Error; err != nil {
 		errorJSON(c, http.StatusInternalServerError, "database error")
 		return
 	}
@@ -176,7 +209,11 @@ func (a *App) proxyUpstream(c *gin.Context, protocol relayProtocol, upstreamPath
 		errorJSON(c, http.StatusTooManyRequests, err.Error())
 		return
 	}
-	targets, err := a.routeTargets(modelName, protocol)
+	modelGroupID, ok := a.requireAPIKeyModelGroup(c, key)
+	if !ok {
+		return
+	}
+	targets, err := a.routeTargets(modelName, protocol, modelGroupID)
 	if err != nil {
 		a.recordUsage(c, user, key, routeTarget{Model: ModelConfig{Name: modelName}}, usageTokens{}, http.StatusBadGateway, RequestStatusError, err.Error(), body, nil, 0, usageRecordMeta{RequestID: requestID, Protocol: protocol, Path: upstreamPath, Stream: stream})
 		errorJSON(c, http.StatusBadGateway, err.Error())
@@ -437,9 +474,15 @@ func (a *App) proxyStreamResponse(c *gin.Context, resp *http.Response, user User
 	a.recordUsage(c, user, key, target, extractUsage(capture.Bytes()), resp.StatusCode, status, errMsg, requestBody, capture.Bytes(), latency, meta)
 }
 
-func (a *App) routeTargets(modelName string, protocol relayProtocol) ([]routeTarget, error) {
+func (a *App) routeTargets(modelName string, protocol relayProtocol, modelGroupIDs ...uint) ([]routeTarget, error) {
+	modelGroupID := uint(0)
+	if len(modelGroupIDs) > 0 {
+		modelGroupID = modelGroupIDs[0]
+	}
 	var models []ModelConfig
-	if err := a.db.Where("name = ? AND status = ?", modelName, ModelStatusActive).Find(&models).Error; err != nil {
+	query := a.db.Where("name = ? AND status = ?", modelName, ModelStatusActive)
+	query = a.applyModelGroupFilter(query, modelGroupID)
+	if err := query.Find(&models).Error; err != nil {
 		return nil, err
 	}
 	if len(models) == 0 {
@@ -507,6 +550,19 @@ func (a *App) routeTargets(modelName string, protocol relayProtocol) ([]routeTar
 		return nil, errors.New("no online source for model")
 	}
 	return a.scheduleTargets(targets, now), nil
+}
+
+func (a *App) requireAPIKeyModelGroup(c *gin.Context, key APIKey) (uint, bool) {
+	groupID, err := a.modelGroupIDForAPIKey(key)
+	if err == nil {
+		return groupID, true
+	}
+	if errors.Is(err, errModelGroupDeleted) {
+		errorJSON(c, http.StatusBadRequest, err.Error())
+		return 0, false
+	}
+	errorJSON(c, http.StatusInternalServerError, "database error")
+	return 0, false
 }
 
 func (a *App) checkQuota(user User) error {

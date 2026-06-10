@@ -77,8 +77,10 @@ import { ProviderIcon } from '@/components/common/ProviderIcon';
 import { EmptyState } from '@/components/common/EmptyState';
 
 const providers: AccountProvider[] = ['ChatGPT', 'Claude', 'Gemini', 'Grok'];
+const manualTokenProviders = new Set<AccountProvider>(['ChatGPT', 'Claude']);
 
 const supportsAccountPool = (source?: UpstreamSource | null): boolean => source?.type === 'CLIProxyAPI';
+const supportsManualTokenLogin = (provider: AccountProvider): boolean => manualTokenProviders.has(provider);
 
 const sourceTypeLabel = (source?: UpstreamSource | null): string =>
   source?.type === 'CLIProxyAPI' ? 'CLIProxyAPI' : '第三方提供商';
@@ -204,6 +206,7 @@ export default function Page() {
   const [startingOAuth, setStartingOAuth] = useState(false);
   const [submittingCallback, setSubmittingCallback] = useState(false);
   const [callbackUrl, setCallbackUrl] = useState('');
+  const [manualToken, setManualToken] = useState('');
   const [oauthSession, setOauthSession] = useState<{ authUrl?: string; sessionId?: string; statusUrl?: string } | null>(null);
   const autoRefreshedSourcesRef = useRef<Set<string>>(new Set());
   const source = useMemo(() => sources.find((item) => item.id === sourceId) ?? sources[0], [sourceId, sources]);
@@ -317,8 +320,18 @@ export default function Page() {
       toast.error('该上游源不支持账号池');
       return;
     }
-    if (loginMode !== 'oauth' && !identifier.trim()) {
+    if (loginMode === 'token' && !identifier.trim()) {
       toast.error('请填写账号标识');
+      return;
+    }
+    if (loginMode === 'token' && !manualToken.trim()) {
+      toast.error('请填写 refresh_token');
+      return;
+    }
+    if (loginMode === 'token' && !supportsManualTokenLogin(provider)) {
+      toast.error('当前仅支持 ChatGPT / Claude 手动 Token 登录', {
+        description: 'Gemini 和 Grok 请继续使用浏览器 OAuth。',
+      });
       return;
     }
     try {
@@ -339,25 +352,21 @@ export default function Page() {
         toast.success('OAuth 授权已创建', { description: session.authUrl ? '请在新窗口完成授权。' : '请按上游返回信息继续。' });
         return;
       } else {
-        const response = await adminApi.createSourceAccount(source.id, {
+        setStartingOAuth(true);
+        const response = await adminApi.submitSourceAccountToken(source.id, {
           identifier: identifier.trim(),
           provider,
-          status: 'valid',
-          balance: 0,
-          balanceLimit: provider === 'Grok' ? 80 : 200,
-          used5h: 0,
-          limit5h: 40,
-          used7d: 0,
-          limit7d: 400,
+          refreshToken: manualToken.trim(),
         });
-        setAccounts((prev) => [response.data, ...prev]);
-        toast.success('账号已添加');
+        setAccounts(response.data);
+        toast.success('Token 登录完成', { description: '账号已同步到 CLIProxyAPI。' });
       }
       setIdentifier('');
       setProvider('ChatGPT');
       setLoginMode('oauth');
       setOauthSession(null);
       setCallbackUrl('');
+      setManualToken('');
       setOpen(false);
     } catch (error) {
       toast.error(getErrorMessage(error, '添加账号失败'));
@@ -516,20 +525,21 @@ export default function Page() {
                 if (!nextOpen) {
                   setOauthSession(null);
                   setCallbackUrl('');
+                  setManualToken('');
                 }
               }}
             >
               <DialogTrigger asChild>
                 <Button className="shadow-sm">
                   <Plus className="mr-2 h-4 w-4" />
-                  添加 OAuth 账号
+                  添加账号
                 </Button>
               </DialogTrigger>
               <DialogContent>
                 <DialogHeader>
-                  <DialogTitle>添加 OAuth 账号</DialogTitle>
+                  <DialogTitle>添加账号</DialogTitle>
                   <DialogDescription>
-                    选择登录平台，订阅类型会在授权后自动同步。
+                    选择登录平台，使用浏览器 OAuth 或手动 refresh_token 登录。
                   </DialogDescription>
                 </DialogHeader>
                 <div className="grid gap-4 py-2">
@@ -541,6 +551,7 @@ export default function Page() {
                         setProvider(value as AccountProvider);
                         setOauthSession(null);
                         setCallbackUrl('');
+                        setManualToken('');
                       }}
                     >
                       <SelectTrigger>
@@ -572,6 +583,7 @@ export default function Page() {
                         setLoginMode(value);
                         setOauthSession(null);
                         setCallbackUrl('');
+                        setManualToken('');
                       }}
                     >
                       <SelectTrigger>
@@ -614,6 +626,33 @@ export default function Page() {
                       ) : null}
                     </div>
                   ) : null}
+                  {loginMode === 'token' ? (
+                    <div className="grid gap-3 rounded-md border bg-muted/30 p-3">
+                      <div className="space-y-1">
+                        <Label htmlFor="manual-refresh-token">Refresh Token</Label>
+                        <p className="text-xs leading-relaxed text-muted-foreground">
+                          填写 refresh_token，不是 access_token 或 id_token。Relay 只会转交给 CLIProxyAPI 保存为 auth file，不写入 Relay 数据库。
+                        </p>
+                      </div>
+                      {!supportsManualTokenLogin(provider) ? (
+                        <div className="rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
+                          当前仅支持 ChatGPT / Claude 手动 Token 登录；{provider} 请使用浏览器 OAuth。
+                        </div>
+                      ) : null}
+                      <textarea
+                        id="manual-refresh-token"
+                        value={manualToken}
+                        onChange={(event) => setManualToken(event.target.value)}
+                        placeholder="refresh_token"
+                        disabled={!supportsManualTokenLogin(provider)}
+                        className={cn(
+                          'min-h-28 w-full resize-y rounded-md border border-input bg-background px-3 py-2 font-mono text-sm shadow-sm outline-none transition-colors',
+                          'placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/20',
+                          !supportsManualTokenLogin(provider) && 'cursor-not-allowed opacity-60',
+                        )}
+                      />
+                    </div>
+                  ) : null}
                 </div>
                 <DialogFooter>
                   <Button variant="ghost" onClick={() => setOpen(false)}>
@@ -625,9 +664,9 @@ export default function Page() {
                       提交回调链接
                     </Button>
                   ) : (
-                    <Button onClick={addAccount} disabled={startingOAuth}>
+                    <Button onClick={addAccount} disabled={startingOAuth || (loginMode === 'token' && (!manualToken.trim() || !supportsManualTokenLogin(provider)))}>
                       {startingOAuth ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
-                      {loginMode === 'oauth' ? '继续授权' : '添加账号'}
+                      {loginMode === 'oauth' ? '继续授权' : 'Token 登录'}
                     </Button>
                   )}
                 </DialogFooter>

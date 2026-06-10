@@ -18,8 +18,12 @@ type modelBindingRequest struct {
 }
 
 func migrateModelRouteBindings(db *gorm.DB) error {
+	defaultGroup, err := defaultPlatformModelGroup(db)
+	if err != nil {
+		return err
+	}
 	var models []ModelConfig
-	if err := db.Order("name asc, id asc").Find(&models).Error; err != nil {
+	if err := db.Order("model_group_id asc, name asc, id asc").Find(&models).Error; err != nil {
 		return err
 	}
 	if len(models) == 0 {
@@ -35,7 +39,8 @@ func migrateModelRouteBindings(db *gorm.DB) error {
 	}
 	groups := map[string][]ModelConfig{}
 	for _, model := range models {
-		groups[model.Name] = append(groups[model.Name], model)
+		groupID := modelGroupBucketID(model, defaultGroup.ID)
+		groups[modelGroupBucketKey(model.Name, groupID)] = append(groups[modelGroupBucketKey(model.Name, groupID)], model)
 	}
 	for _, group := range groups {
 		canonical := preferredModelConfig(group, sourceMap)
@@ -212,9 +217,16 @@ func (a *App) modelBindingRequestsForGroup(canonicalID uint, models []ModelConfi
 	return requests, nil
 }
 
-func (a *App) deleteModelSiblings(name string, keepID uint) error {
+func (a *App) deleteModelSiblings(name string, groupID uint, keepID uint) error {
 	var siblings []ModelConfig
-	if err := a.db.Where("name = ? AND id <> ?", name, keepID).Find(&siblings).Error; err != nil {
+	defaultGroupID := a.defaultModelGroupID()
+	query := a.db.Where("name = ? AND id <> ?", name, keepID)
+	if groupID == 0 || groupID == defaultGroupID {
+		query = query.Where("model_group_id = ? OR model_group_id = 0", defaultGroupID)
+	} else {
+		query = query.Where("model_group_id = ?", groupID)
+	}
+	if err := query.Find(&siblings).Error; err != nil {
 		return err
 	}
 	if len(siblings) == 0 {

@@ -651,6 +651,66 @@ func (a *App) adminSubmitOAuthCallback(c *gin.Context) {
 	c.JSON(status, gin.H{"ok": true, "pending": !complete, "data": out})
 }
 
+func (a *App) adminSubmitSourceAccountToken(c *gin.Context) {
+	sourceID, err := parseNumericID(c.Param("id"))
+	if err != nil {
+		errorJSON(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	var req struct {
+		Provider     string `json:"provider"`
+		Identifier   string `json:"identifier"`
+		Token        string `json:"token"`
+		RefreshToken string `json:"refreshToken"`
+	}
+	if !bindJSON(c, &req) {
+		return
+	}
+	req.Provider = cliProxyProviderLabel(req.Provider)
+	if strings.TrimSpace(req.Provider) == "" || req.Provider == "unknown" {
+		req.Provider = "ChatGPT"
+	}
+	token := strings.TrimSpace(req.RefreshToken)
+	if token == "" {
+		token = strings.TrimSpace(req.Token)
+	}
+	if strings.TrimSpace(req.Identifier) == "" {
+		errorJSON(c, http.StatusBadRequest, "identifier is required")
+		return
+	}
+	if token == "" {
+		errorJSON(c, http.StatusBadRequest, "refreshToken is required")
+		return
+	}
+	var source UpstreamSource
+	if err := a.db.First(&source, sourceID).Error; err != nil {
+		errorJSON(c, http.StatusNotFound, "source not found")
+		return
+	}
+	if !strings.EqualFold(source.Type, "CLIProxyAPI") {
+		errorJSON(c, http.StatusBadRequest, "manual token login is only supported for CLIProxyAPI sources")
+		return
+	}
+	if strings.TrimSpace(source.ManagementKey) == "" {
+		errorJSON(c, http.StatusBadRequest, cliProxyManagementKeyMissingMessage)
+		return
+	}
+	if err := a.submitCLIProxyManualToken(c.Request.Context(), source, req.Provider, req.Identifier, token); err != nil {
+		errorJSON(c, http.StatusBadGateway, err.Error())
+		return
+	}
+	accounts, err := a.syncCLIProxyAccounts(c, source)
+	if err != nil {
+		errorJSON(c, http.StatusBadGateway, err.Error())
+		return
+	}
+	out := make([]SourceAccountDTO, 0, len(accounts))
+	for _, account := range accounts {
+		out = append(out, sourceAccountDTO(account))
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true, "data": out})
+}
+
 func (a *App) adminSyncSourceAccounts(c *gin.Context) {
 	sourceID, err := parseNumericID(c.Param("id"))
 	if err != nil {
@@ -968,11 +1028,15 @@ func (a *App) adminModels(c *gin.Context) {
 	}
 	sources := a.sourceMap()
 	sourceKeys := a.sourceKeyAliasMap()
-	candidates := a.modelRouteCandidatesByName(models, sources, sourceKeys)
+	groupNames := a.modelGroupNameMap()
+	defaultGroupID := a.defaultModelGroupID()
+	candidates := a.modelRouteCandidatesByGroup(models, sources, sourceKeys, defaultGroupID)
 	out := make([]ModelDTO, 0, len(models))
 	for _, model := range models {
+		model.ModelGroupID = modelGroupBucketID(model, defaultGroupID)
 		dto := modelDTO(model, sources[model.SourceID].Name, sourceKeys[sourceKeyIDValue(model.SourceKeyID)])
-		dto.RoutingCandidates = candidates[model.Name]
+		dto.ModelGroupName = groupNames[model.ModelGroupID]
+		dto.RoutingCandidates = candidates[modelGroupBucketKey(model.Name, model.ModelGroupID)]
 		dto.CandidateCount = len(dto.RoutingCandidates)
 		out = append(out, dto)
 	}
@@ -984,6 +1048,7 @@ func (a *App) adminCreateModel(c *gin.Context) {
 		Name               string                `json:"name"`
 		SourceID           string                `json:"sourceId"`
 		SourceKeyID        string                `json:"sourceKeyId"`
+		ModelGroupID       string                `json:"modelGroupId"`
 		Provider           string                `json:"provider"`
 		Formats            []string              `json:"formats"`
 		InputPrice         float64               `json:"inputPrice"`
@@ -1006,6 +1071,11 @@ func (a *App) adminCreateModel(c *gin.Context) {
 	}
 	if strings.TrimSpace(req.Name) == "" {
 		errorJSON(c, http.StatusBadRequest, "model name is required")
+		return
+	}
+	group, err := a.platformModelGroupFromRequest(req.ModelGroupID)
+	if err != nil {
+		errorJSON(c, http.StatusBadRequest, err.Error())
 		return
 	}
 	bindings := normalizeBindingRequests(req.Bindings, modelBindingRequest{
@@ -1037,6 +1107,7 @@ func (a *App) adminCreateModel(c *gin.Context) {
 	cacheWriteMultiple := nonZeroFloat(req.CacheWriteMultiple, 1)
 	cacheReadMultiple := nonZeroFloat(req.CacheReadMultiple, 1)
 	model := ModelConfig{
+		ModelGroupID:       group.ID,
 		SourceID:           firstSourceID,
 		SourceKeyID:        firstSourceKeyID,
 		Name:               strings.TrimSpace(req.Name),
@@ -1064,7 +1135,13 @@ func (a *App) adminCreateModel(c *gin.Context) {
 		model.Formats = normalizeModelFormats(req.Formats, model.Provider)
 	}
 	var existing ModelConfig
-	if err := a.db.Where("name = ?", model.Name).Order("id asc").First(&existing).Error; err == nil {
+	existingQuery := a.db.Where("name = ?", model.Name)
+	if model.ModelGroupID == a.defaultModelGroupID() {
+		existingQuery = existingQuery.Where("model_group_id = ? OR model_group_id = 0", model.ModelGroupID)
+	} else {
+		existingQuery = existingQuery.Where("model_group_id = ?", model.ModelGroupID)
+	}
+	if err := existingQuery.Order("id asc").First(&existing).Error; err == nil {
 		merged, err := a.appendModelBindingsToExisting(existing, model, parsedBindings)
 		if err != nil {
 			errorJSON(c, http.StatusBadRequest, "merge model bindings failed")
@@ -1125,6 +1202,14 @@ func (a *App) adminUpdateModel(c *gin.Context) {
 		if value, ok := req[key].(string); ok && strings.TrimSpace(value) != "" {
 			updates[key] = strings.TrimSpace(value)
 		}
+	}
+	if value, ok := req["modelGroupId"].(string); ok && strings.TrimSpace(value) != "" {
+		group, err := a.platformModelGroupFromRequest(value)
+		if err != nil {
+			errorJSON(c, http.StatusBadRequest, err.Error())
+			return
+		}
+		updates["model_group_id"] = group.ID
 	}
 	providerForFormats := existing.Provider
 	if provider, ok := updates["provider"].(string); ok {
@@ -1207,8 +1292,9 @@ func (a *App) adminUpdateModel(c *gin.Context) {
 		errorJSON(c, http.StatusNotFound, "model not found")
 		return
 	}
+	model.ModelGroupID = a.normalizeModelGroupID(model.ModelGroupID)
 	if hasBindingRequests {
-		if err := a.deleteModelSiblings(model.Name, model.ID); err != nil {
+		if err := a.deleteModelSiblings(model.Name, model.ModelGroupID, model.ID); err != nil {
 			errorJSON(c, http.StatusBadRequest, "delete duplicate model rows failed")
 			return
 		}
@@ -1236,7 +1322,7 @@ func (a *App) adminUpdateModel(c *gin.Context) {
 			errorJSON(c, http.StatusBadRequest, err.Error())
 			return
 		}
-		if err := a.deleteModelSiblings(model.Name, model.ID); err != nil {
+		if err := a.deleteModelSiblings(model.Name, model.ModelGroupID, model.ID); err != nil {
 			errorJSON(c, http.StatusBadRequest, "delete duplicate model rows failed")
 			return
 		}
@@ -1258,7 +1344,14 @@ func (a *App) adminUpdateModel(c *gin.Context) {
 
 func (a *App) appendModelBindingsToExisting(existing ModelConfig, incoming ModelConfig, bindings []modelBindingRequest) (ModelConfig, error) {
 	var group []ModelConfig
-	if err := a.db.Where("name = ?", existing.Name).Order("id asc").Find(&group).Error; err != nil {
+	groupID := a.normalizeModelGroupID(existing.ModelGroupID)
+	query := a.db.Where("name = ?", existing.Name)
+	if groupID == a.defaultModelGroupID() {
+		query = query.Where("model_group_id = ? OR model_group_id = 0", groupID)
+	} else {
+		query = query.Where("model_group_id = ?", groupID)
+	}
+	if err := query.Order("id asc").Find(&group).Error; err != nil {
 		return ModelConfig{}, err
 	}
 	currentBindings, err := a.modelBindingRequestsForGroup(existing.ID, group)
@@ -1272,7 +1365,7 @@ func (a *App) appendModelBindingsToExisting(existing ModelConfig, incoming Model
 			return ModelConfig{}, err
 		}
 	}
-	if err := a.deleteModelSiblings(existing.Name, existing.ID); err != nil {
+	if err := a.deleteModelSiblings(existing.Name, groupID, existing.ID); err != nil {
 		return ModelConfig{}, err
 	}
 	if err := a.replaceModelBindings(existing.ID, nextBindings); err != nil {
@@ -1929,37 +2022,53 @@ func (a *App) sourceKeyAliasMap() map[uint]string {
 func (a *App) modelDTOWithRouting(model ModelConfig) ModelDTO {
 	sources := a.sourceMap()
 	sourceKeys := a.sourceKeyAliasMap()
+	groupNames := a.modelGroupNameMap()
+	model.ModelGroupID = a.normalizeModelGroupID(model.ModelGroupID)
 	dto := modelDTO(model, sources[model.SourceID].Name, sourceKeys[sourceKeyIDValue(model.SourceKeyID)])
-	candidates := a.modelRouteCandidates(model.Name, sources, sourceKeys)
+	dto.ModelGroupName = groupNames[model.ModelGroupID]
+	candidates := a.modelRouteCandidates(model.Name, model.ModelGroupID, sources, sourceKeys)
 	dto.RoutingCandidates = candidates
 	dto.CandidateCount = len(candidates)
 	return dto
 }
 
-func (a *App) modelRouteCandidates(name string, sources map[uint]UpstreamSource, sourceKeys map[uint]string) []ModelRouteCandidateDTO {
+func (a *App) modelRouteCandidates(name string, groupID uint, sources map[uint]UpstreamSource, sourceKeys map[uint]string) []ModelRouteCandidateDTO {
 	var models []ModelConfig
-	if err := a.db.Where("name = ?", name).Order("id asc").Find(&models).Error; err != nil {
+	defaultGroupID := a.defaultModelGroupID()
+	query := a.db.Where("name = ?", name)
+	if groupID == 0 || groupID == defaultGroupID {
+		query = query.Where("model_group_id = ? OR model_group_id = 0", defaultGroupID)
+	} else {
+		query = query.Where("model_group_id = ?", groupID)
+	}
+	if err := query.Order("id asc").Find(&models).Error; err != nil {
 		return []ModelRouteCandidateDTO{}
 	}
-	return a.modelRouteCandidatesByName(models, sources, sourceKeys)[name]
+	normalizedGroupID := groupID
+	if normalizedGroupID == 0 {
+		normalizedGroupID = defaultGroupID
+	}
+	return a.modelRouteCandidatesByGroup(models, sources, sourceKeys, defaultGroupID)[modelGroupBucketKey(name, normalizedGroupID)]
 }
 
-func (a *App) modelRouteCandidatesByName(models []ModelConfig, sources map[uint]UpstreamSource, sourceKeys map[uint]string) map[string][]ModelRouteCandidateDTO {
+func (a *App) modelRouteCandidatesByGroup(models []ModelConfig, sources map[uint]UpstreamSource, sourceKeys map[uint]string, defaultGroupID uint) map[string][]ModelRouteCandidateDTO {
 	out := map[string][]ModelRouteCandidateDTO{}
 	for _, model := range models {
+		model.ModelGroupID = modelGroupBucketID(model, defaultGroupID)
 		bindings, err := a.modelBindings(model)
 		if err != nil {
 			continue
 		}
 		for _, binding := range bindings {
 			source := sources[binding.SourceID]
-			out[model.Name] = append(out[model.Name], modelRouteCandidateDTOFromBinding(model, binding, source, sourceKeys[sourceKeyIDValueFromBinding(binding)]))
+			key := modelGroupBucketKey(model.Name, model.ModelGroupID)
+			out[key] = append(out[key], modelRouteCandidateDTOFromBinding(model, binding, source, sourceKeys[sourceKeyIDValueFromBinding(binding)]))
 		}
 	}
-	for name := range out {
-		sort.SliceStable(out[name], func(i, j int) bool {
-			left := out[name][i]
-			right := out[name][j]
+	for key := range out {
+		sort.SliceStable(out[key], func(i, j int) bool {
+			left := out[key][i]
+			right := out[key][j]
 			if left.RoutingWeight != right.RoutingWeight {
 				return left.RoutingWeight > right.RoutingWeight
 			}

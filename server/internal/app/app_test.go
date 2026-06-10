@@ -733,6 +733,184 @@ func TestModelBindingMigrationMergesLegacyDuplicateModels(t *testing.T) {
 	}
 }
 
+func TestAdminSameModelNameCanExistInDifferentGroups(t *testing.T) {
+	app := testApp(t)
+	adminToken := loginToken(t, app, testAdminEmail, testAdminPassword, RoleAdmin)
+	source := UpstreamSource{Name: "Grouped_Model_Source", Type: SourceTypeThirdParty, BaseURL: "https://grouped.example.com/v1", APIKey: "key", Priority: 1, Status: SourceStatusOnline}
+	if err := app.db.Create(&source).Error; err != nil {
+		t.Fatalf("create source: %v", err)
+	}
+
+	groupResp := performJSON(app, http.MethodPost, "/api/admin/model-groups", adminToken, map[string]any{
+		"name": "premium",
+	})
+	if groupResp.Code != http.StatusCreated {
+		t.Fatalf("create model group: %d %s", groupResp.Code, groupResp.Body.String())
+	}
+	groupID := decodeBody(t, groupResp)["data"].(map[string]any)["id"].(string)
+
+	first := performJSON(app, http.MethodPost, "/api/admin/models", adminToken, map[string]any{
+		"name":     "same-name-grouped-model",
+		"sourceId": id("s", source.ID),
+		"provider": "OpenAI",
+		"formats":  []string{ModelFormatOpenAI},
+		"enabled":  true,
+	})
+	if first.Code != http.StatusCreated {
+		t.Fatalf("create default group model: %d %s", first.Code, first.Body.String())
+	}
+	second := performJSON(app, http.MethodPost, "/api/admin/models", adminToken, map[string]any{
+		"name":         "same-name-grouped-model",
+		"modelGroupId": groupID,
+		"sourceId":     id("s", source.ID),
+		"provider":     "OpenAI",
+		"formats":      []string{ModelFormatOpenAI},
+		"enabled":      true,
+	})
+	if second.Code != http.StatusCreated {
+		t.Fatalf("create custom group model: %d %s", second.Code, second.Body.String())
+	}
+
+	list := performJSON(app, http.MethodGet, "/api/admin/models?q=same-name-grouped-model", adminToken, nil)
+	if list.Code != http.StatusOK {
+		t.Fatalf("list grouped models: %d %s", list.Code, list.Body.String())
+	}
+	rows := decodeBody(t, list)["data"].([]any)
+	seenGroups := map[string]bool{}
+	for _, row := range rows {
+		item := row.(map[string]any)
+		if item["name"] == "same-name-grouped-model" {
+			seenGroups[item["modelGroupId"].(string)] = true
+		}
+	}
+	if len(seenGroups) != 2 || !seenGroups[groupID] {
+		t.Fatalf("expected same model name in two groups, got %v from rows %v", seenGroups, rows)
+	}
+}
+
+func TestAPIKeyModelGroupControlsRouteResolution(t *testing.T) {
+	defaultCalls := 0
+	customCalls := 0
+	defaultUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		defaultCalls++
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id":      "chatcmpl_default_group",
+			"object":  "chat.completion",
+			"choices": []any{map[string]any{"message": map[string]any{"role": "assistant", "content": "default"}}},
+			"usage":   map[string]any{"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2},
+			"model":   "group-routed-model",
+		})
+	}))
+	defer defaultUpstream.Close()
+	customUpstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		customCalls++
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id":      "chatcmpl_custom_group",
+			"object":  "chat.completion",
+			"choices": []any{map[string]any{"message": map[string]any{"role": "assistant", "content": "custom"}}},
+			"usage":   map[string]any{"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3},
+			"model":   "group-routed-model",
+		})
+	}))
+	defer customUpstream.Close()
+
+	app := testApp(t)
+	user := loadTestUser(t, app)
+	defaultGroup, err := defaultPlatformModelGroup(app.db)
+	if err != nil {
+		t.Fatalf("default group: %v", err)
+	}
+	customGroup := ModelGroup{Name: "custom-route"}
+	if err := app.db.Create(&customGroup).Error; err != nil {
+		t.Fatalf("create custom group: %v", err)
+	}
+	defaultSource := UpstreamSource{Name: "Default_Group_Route_Source", Type: SourceTypeThirdParty, BaseURL: defaultUpstream.URL + "/v1", APIKey: "default-key", Priority: 1, Status: SourceStatusOnline}
+	customSource := UpstreamSource{Name: "Custom_Group_Route_Source", Type: SourceTypeThirdParty, BaseURL: customUpstream.URL + "/v1", APIKey: "custom-key", Priority: 1, Status: SourceStatusOnline}
+	if err := app.db.Create(&defaultSource).Error; err != nil {
+		t.Fatalf("create default source: %v", err)
+	}
+	if err := app.db.Create(&customSource).Error; err != nil {
+		t.Fatalf("create custom source: %v", err)
+	}
+	models := []ModelConfig{
+		{ModelGroupID: defaultGroup.ID, SourceID: defaultSource.ID, Name: "group-routed-model", Provider: "OpenAI", Formats: ModelFormatOpenAI, Status: ModelStatusActive},
+		{ModelGroupID: customGroup.ID, SourceID: customSource.ID, Name: "group-routed-model", Provider: "OpenAI", Formats: ModelFormatOpenAI, Status: ModelStatusActive},
+	}
+	if err := app.db.Create(&models).Error; err != nil {
+		t.Fatalf("create grouped route models: %v", err)
+	}
+	defaultSecret := "sk-relay-route-default"
+	customSecret := "sk-relay-route-custom"
+	keys := []APIKey{
+		{UserID: user.ID, ModelGroupID: defaultGroup.ID, Name: "default-route", Secret: defaultSecret, KeyHash: hashKey(defaultSecret), Masked: maskKey(defaultSecret), Status: APIKeyStatusValid},
+		{UserID: user.ID, ModelGroupID: customGroup.ID, Name: "custom-route", Secret: customSecret, KeyHash: hashKey(customSecret), Masked: maskKey(customSecret), Status: APIKeyStatusValid},
+	}
+	if err := app.db.Create(&keys).Error; err != nil {
+		t.Fatalf("create grouped api keys: %v", err)
+	}
+
+	payload := map[string]any{
+		"model":    "group-routed-model",
+		"messages": []any{map[string]any{"role": "user", "content": "hello"}},
+	}
+	w := performJSON(app, http.MethodPost, "/v1/chat/completions", defaultSecret, payload)
+	if w.Code != http.StatusOK {
+		t.Fatalf("default group proxy: %d %s", w.Code, w.Body.String())
+	}
+	w = performJSON(app, http.MethodPost, "/v1/chat/completions", customSecret, payload)
+	if w.Code != http.StatusOK {
+		t.Fatalf("custom group proxy: %d %s", w.Code, w.Body.String())
+	}
+	if defaultCalls != 1 || customCalls != 1 {
+		t.Fatalf("expected one call per group, default=%d custom=%d", defaultCalls, customCalls)
+	}
+}
+
+func TestAPIKeyDeletedModelGroupReturnsClearError(t *testing.T) {
+	app := testApp(t)
+	user := loadTestUser(t, app)
+	group := ModelGroup{Name: "deleted-route"}
+	if err := app.db.Create(&group).Error; err != nil {
+		t.Fatalf("create group: %v", err)
+	}
+	secret := "sk-relay-deleted-group"
+	key := APIKey{
+		UserID:       user.ID,
+		ModelGroupID: group.ID,
+		Name:         "deleted-group-key",
+		Secret:       secret,
+		KeyHash:      hashKey(secret),
+		Masked:       maskKey(secret),
+		Status:       APIKeyStatusValid,
+	}
+	if err := app.db.Create(&key).Error; err != nil {
+		t.Fatalf("create api key: %v", err)
+	}
+	if err := app.db.Delete(&group).Error; err != nil {
+		t.Fatalf("delete group: %v", err)
+	}
+
+	payload := map[string]any{
+		"model":    "deleted-group-model",
+		"messages": []any{map[string]any{"role": "user", "content": "hello"}},
+	}
+	w := performJSON(app, http.MethodPost, "/v1/chat/completions", secret, payload)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("deleted group proxy: %d %s", w.Code, w.Body.String())
+	}
+	if got := decodeBody(t, w)["error"]; got != "当前分组已删除" {
+		t.Fatalf("expected deleted group error, got %v", got)
+	}
+
+	w = performJSON(app, http.MethodGet, "/v1/models", secret, nil)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("deleted group model list: %d %s", w.Code, w.Body.String())
+	}
+	if got := decodeBody(t, w)["error"]; got != "当前分组已删除" {
+		t.Fatalf("expected deleted group model list error, got %v", got)
+	}
+}
+
 func TestAdminRecoverSourceClearsCooldown(t *testing.T) {
 	app := testApp(t)
 	adminToken := loginToken(t, app, testAdminEmail, testAdminPassword, RoleAdmin)
@@ -2656,6 +2834,86 @@ func TestPlanExtractionIgnoresOAuthAccountType(t *testing.T) {
 	}
 	if normalized := normalizePlanType("oauth"); normalized != "" {
 		t.Fatalf("expected unknown plan value to normalize empty, got %q", normalized)
+	}
+}
+
+func TestAdminSubmitSourceAccountTokenUploadsAuthFile(t *testing.T) {
+	var uploadName string
+	var uploaded map[string]any
+	management := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer mgmt-secret" {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		if r.URL.Path != "/v0/management/auth-files" {
+			http.NotFound(w, r)
+			return
+		}
+		switch r.Method {
+		case http.MethodPost:
+			uploadName = r.URL.Query().Get("name")
+			if !strings.HasSuffix(uploadName, ".json") {
+				t.Fatalf("expected json upload name, got %q", uploadName)
+			}
+			if err := json.NewDecoder(r.Body).Decode(&uploaded); err != nil {
+				t.Fatalf("decode uploaded auth file: %v", err)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok"})
+		case http.MethodGet:
+			if uploaded == nil {
+				_ = json.NewEncoder(w).Encode(map[string]any{"files": []any{}})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"files": []any{
+					map[string]any{
+						"name":         uploadName,
+						"provider":     uploaded["type"],
+						"email":        uploaded["email"],
+						"status":       "ok",
+						"last_refresh": uploaded["last_refresh"],
+					},
+				},
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer management.Close()
+
+	app := testApp(t)
+	adminToken := loginToken(t, app, testAdminEmail, testAdminPassword, RoleAdmin)
+	if err := app.db.Model(&UpstreamSource{}).Where("type = ?", SourceTypeCLIProxyAPI).Updates(map[string]any{
+		"base_url":       management.URL + "/v1",
+		"api_key":        "relay-secret",
+		"management_key": "mgmt-secret",
+		"status":         SourceStatusOnline,
+	}).Error; err != nil {
+		t.Fatalf("update source: %v", err)
+	}
+
+	w := performJSON(app, http.MethodPost, "/api/admin/sources/s_001/accounts/token", adminToken, map[string]any{
+		"provider":     "Claude",
+		"identifier":   "claude@example.com",
+		"refreshToken": "claude-refresh-token",
+	})
+	if w.Code != http.StatusOK {
+		t.Fatalf("manual token login: %d %s", w.Code, w.Body.String())
+	}
+	if uploaded["type"] != "claude" || uploaded["email"] != "claude@example.com" || uploaded["refresh_token"] != "claude-refresh-token" {
+		t.Fatalf("unexpected uploaded auth file: %v", uploaded)
+	}
+	if uploaded["access_token"] != nil || uploaded["id_token"] != nil {
+		t.Fatalf("access/id token should not be required for manual refresh token login: %v", uploaded)
+	}
+	body := decodeBody(t, w)
+	rows := body["data"].([]any)
+	if len(rows) != 1 {
+		t.Fatalf("expected one synced account, got %d", len(rows))
+	}
+	row := rows[0].(map[string]any)
+	if row["provider"] != "Claude" || row["identifier"] != "claude@example.com" {
+		t.Fatalf("unexpected synced account: %v", row)
 	}
 }
 
