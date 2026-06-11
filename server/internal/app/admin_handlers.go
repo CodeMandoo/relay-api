@@ -806,6 +806,17 @@ func (a *App) adminDeleteSourceAccount(c *gin.Context) {
 		errorJSON(c, http.StatusNotFound, "account not found")
 		return
 	}
+	var source UpstreamSource
+	if err := a.db.First(&source, account.SourceID).Error; err != nil {
+		errorJSON(c, http.StatusNotFound, "source not found")
+		return
+	}
+	if sourceSupportsAccountPool(source) && strings.TrimSpace(account.AuthFileName) != "" {
+		if err := a.deleteCLIProxyAuthFile(c.Request.Context(), source, account.AuthFileName); err != nil {
+			errorJSON(c, http.StatusBadGateway, err.Error())
+			return
+		}
+	}
 	if err := a.db.Delete(&account).Error; err != nil {
 		errorJSON(c, http.StatusBadRequest, "delete account failed")
 		return

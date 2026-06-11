@@ -104,6 +104,15 @@ func (a *App) submitCLIProxyManualToken(ctx context.Context, source UpstreamSour
 	return a.cliProxyJSON(ctx, source, http.MethodPost, endpoint, strings.NewReader(string(raw)), nil)
 }
 
+func (a *App) deleteCLIProxyAuthFile(ctx context.Context, source UpstreamSource, name string) error {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return fmt.Errorf("auth file name is required")
+	}
+	endpoint := "/v0/management/auth-files?name=" + url.QueryEscape(name)
+	return a.cliProxyJSON(ctx, source, http.MethodDelete, endpoint, nil, nil)
+}
+
 type manualTokenPayload struct {
 	RefreshToken string
 	AccessToken  string

@@ -2819,6 +2819,87 @@ func TestCLIProxyAccountSyncAndOAuth(t *testing.T) {
 	}
 }
 
+func TestAdminDeleteSourceAccountDeletesCLIProxyAuthFile(t *testing.T) {
+	authFileName := "claude-delete@example.com.json"
+	authFileDeleted := false
+	var deletedName string
+	management := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer mgmt-secret" {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		if r.URL.Path != "/v0/management/auth-files" {
+			http.NotFound(w, r)
+			return
+		}
+		switch r.Method {
+		case http.MethodGet:
+			files := []any{}
+			if !authFileDeleted {
+				files = append(files, map[string]any{
+					"name":         authFileName,
+					"provider":     "claude",
+					"email":        "claude-delete@example.com",
+					"status":       "ok",
+					"last_refresh": "2026-05-24T00:00:00Z",
+				})
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{"files": files})
+		case http.MethodDelete:
+			deletedName = r.URL.Query().Get("name")
+			if deletedName != authFileName {
+				http.NotFound(w, r)
+				return
+			}
+			authFileDeleted = true
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "ok"})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer management.Close()
+
+	app := testApp(t)
+	adminToken := loginToken(t, app, testAdminEmail, testAdminPassword, RoleAdmin)
+	if err := app.db.Model(&UpstreamSource{}).Where("type = ?", SourceTypeCLIProxyAPI).Updates(map[string]any{
+		"base_url":       management.URL + "/v1",
+		"api_key":        "relay-secret",
+		"management_key": "mgmt-secret",
+		"status":         SourceStatusOnline,
+	}).Error; err != nil {
+		t.Fatalf("update source: %v", err)
+	}
+
+	w := performJSON(app, http.MethodPost, "/api/admin/sources/s_001/accounts/sync", adminToken, nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("sync accounts: %d %s", w.Code, w.Body.String())
+	}
+	body := decodeBody(t, w)
+	rows := body["data"].([]any)
+	if len(rows) != 1 {
+		t.Fatalf("expected one synced account, got %d", len(rows))
+	}
+	account := rows[0].(map[string]any)
+
+	w = performJSON(app, http.MethodDelete, "/api/admin/source-accounts/"+account["id"].(string), adminToken, nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("delete account: %d %s", w.Code, w.Body.String())
+	}
+	if deletedName != authFileName {
+		t.Fatalf("expected CLIProxy auth file %q to be deleted, got %q", authFileName, deletedName)
+	}
+
+	w = performJSON(app, http.MethodPost, "/api/admin/sources/s_001/accounts/sync", adminToken, nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("sync after delete: %d %s", w.Code, w.Body.String())
+	}
+	body = decodeBody(t, w)
+	rows = body["data"].([]any)
+	if len(rows) != 0 {
+		t.Fatalf("expected deleted account not to be recreated from CLIProxy sync, got %d rows", len(rows))
+	}
+}
+
 func TestPlanExtractionIgnoresOAuthAccountType(t *testing.T) {
 	planType, subscriptionPlan := cliProxyAccountPlans(map[string]any{
 		"account_type": "oauth",
