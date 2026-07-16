@@ -1,9 +1,14 @@
 package app
 
 import (
+	"bytes"
+	"context"
 	"fmt"
+	"net/http"
 	"sort"
 	"time"
+
+	"gorm.io/gorm"
 )
 
 const (
@@ -11,17 +16,21 @@ const (
 	schedulerStateOpen       = "open"
 	schedulerStateHalfOpen   = "half_open"
 	schedulerStateRecovering = "recovering"
+	schedulerStateObserving  = "observing"
 
-	schedulerShortCooldown            = 30 * time.Second
-	schedulerMediumCooldown           = 2 * time.Minute
-	schedulerLongCooldown             = 10 * time.Minute
-	schedulerRecoveringWeightPercent  = 30
+	schedulerFailureThreshold         = 3
+	schedulerProbeInterval            = 5 * time.Minute
+	schedulerRecoveryProbeInterval    = 10 * time.Second
+	schedulerProbeTimeout             = 10 * time.Second
+	schedulerProbeLeaseDuration       = 30 * time.Second
+	schedulerObservationDuration      = 30 * time.Second
+	schedulerObservingWeightPercent   = 10
 	schedulerRecoverySuccessThreshold = 3
 )
 
 func schedulerBindingState(binding ModelRouteBinding) string {
 	switch binding.SchedulerState {
-	case schedulerStateOpen, schedulerStateHalfOpen, schedulerStateRecovering:
+	case schedulerStateOpen, schedulerStateHalfOpen, schedulerStateRecovering, schedulerStateObserving:
 		return binding.SchedulerState
 	default:
 		return schedulerStateClosed
@@ -30,11 +39,13 @@ func schedulerBindingState(binding ModelRouteBinding) string {
 
 func schedulerResetUpdates() map[string]any {
 	return map[string]any{
-		"scheduler_state": schedulerStateClosed,
-		"failure_count":   0,
-		"success_streak":  0,
-		"cooldown_until":  nil,
-		"last_failure_at": nil,
+		"scheduler_state":   schedulerStateClosed,
+		"failure_count":     0,
+		"success_streak":    0,
+		"cooldown_until":    nil,
+		"observation_until": nil,
+		"probe_lease_until": nil,
+		"last_failure_at":   nil,
 	}
 }
 
@@ -71,19 +82,17 @@ func (a *App) recoverSourceBindings(sourceID uint) error {
 func (a *App) refreshSchedulerState(binding ModelRouteBinding, now time.Time) ModelRouteBinding {
 	state := schedulerBindingState(binding)
 	binding.SchedulerState = state
-	if binding.ID == 0 || state != schedulerStateOpen {
+	if binding.ID == 0 || state != schedulerStateObserving || binding.ObservationUntil == nil || binding.ObservationUntil.After(now) {
 		return binding
 	}
-	if binding.CooldownUntil != nil && binding.CooldownUntil.After(now) {
-		return binding
-	}
-	updates := map[string]any{
-		"scheduler_state": schedulerStateHalfOpen,
-		"cooldown_until":  nil,
-	}
-	if err := a.db.Model(&ModelRouteBinding{}).Where("id = ?", binding.ID).Updates(updates).Error; err == nil {
-		binding.SchedulerState = schedulerStateHalfOpen
+	updates := schedulerResetUpdates()
+	updates["last_success_at"] = now
+	if err := a.db.Model(&ModelRouteBinding{}).Where("id = ? AND scheduler_state = ?", binding.ID, schedulerStateObserving).Updates(updates).Error; err == nil {
+		binding.SchedulerState = schedulerStateClosed
+		binding.FailureCount = 0
+		binding.SuccessStreak = 0
 		binding.CooldownUntil = nil
+		binding.ObservationUntil = nil
 	}
 	return binding
 }
@@ -93,18 +102,13 @@ func effectiveRoutingWeight(target routeTarget, now time.Time) int {
 		return 0
 	}
 	state := schedulerBindingState(target.Binding)
-	if state == schedulerStateOpen {
-		if target.Binding.CooldownUntil == nil || !target.Binding.CooldownUntil.After(now) {
-			return 1
-		}
+	if state == schedulerStateOpen || state == schedulerStateHalfOpen || state == schedulerStateRecovering {
 		return 0
 	}
 	base := nonZeroInt(target.Binding.RoutingWeight, 1)
 	switch state {
-	case schedulerStateHalfOpen:
-		return 1
-	case schedulerStateRecovering:
-		weight := base * schedulerRecoveringWeightPercent / 100
+	case schedulerStateObserving:
+		weight := base * schedulerObservingWeightPercent / 100
 		return nonZeroInt(weight, 1)
 	default:
 		return base
@@ -119,40 +123,77 @@ func (a *App) scheduleTargets(targets []routeTarget, now time.Time) []routeTarge
 		}
 		eligible = append(eligible, target)
 	}
-	if len(eligible) <= 1 {
-		return eligible
+	sort.SliceStable(eligible, func(i, j int) bool { return routeTargetLess(eligible[i], eligible[j], now) })
+	groups := make([][]routeTarget, 0)
+	for start := 0; start < len(eligible); {
+		end := start + 1
+		for end < len(eligible) && eligible[end].Source.Priority == eligible[start].Source.Priority {
+			end++
+		}
+		groups = append(groups, a.schedulePriorityGroup(eligible[start:end], now))
+		start = end
 	}
+	if len(groups) > 1 && priorityGroupOnlyObserving(groups[0]) && !a.shouldRouteObservation(groups[0]) {
+		groups[0], groups[1] = groups[1], groups[0]
+	}
+	ordered := make([]routeTarget, 0, len(eligible))
+	for _, group := range groups {
+		ordered = append(ordered, group...)
+	}
+	return ordered
+}
 
+func priorityGroupOnlyObserving(group []routeTarget) bool {
+	if len(group) == 0 {
+		return false
+	}
+	for _, target := range group {
+		if schedulerBindingState(target.Binding) != schedulerStateObserving {
+			return false
+		}
+	}
+	return true
+}
+
+func (a *App) shouldRouteObservation(group []routeTarget) bool {
+	key := fmt.Sprintf("observe:p:%d", group[0].Source.Priority)
+	a.schedulerMu.Lock()
+	defer a.schedulerMu.Unlock()
+	count := a.schedulerCurrent[key] + 1
+	a.schedulerCurrent[key] = count % 10
+	return count%10 == 0
+}
+
+func (a *App) schedulePriorityGroup(group []routeTarget, now time.Time) []routeTarget {
+	if len(group) <= 1 {
+		return append([]routeTarget(nil), group...)
+	}
 	totalWeight := 0
-	for _, target := range eligible {
+	for _, target := range group {
 		totalWeight += effectiveRoutingWeight(target, now)
 	}
-	if totalWeight <= 0 {
-		return nil
-	}
-
 	a.schedulerMu.Lock()
 	if a.schedulerCurrent == nil {
 		a.schedulerCurrent = map[string]int{}
 	}
 	selected := 0
 	bestCurrent := 0
-	for i, target := range eligible {
+	for i, target := range group {
 		key := schedulerKey(target)
 		next := a.schedulerCurrent[key] + effectiveRoutingWeight(target, now)
 		a.schedulerCurrent[key] = next
-		if i == 0 || next > bestCurrent || (next == bestCurrent && routeTargetLess(target, eligible[selected], now)) {
+		if i == 0 || next > bestCurrent || (next == bestCurrent && routeTargetLess(target, group[selected], now)) {
 			selected = i
 			bestCurrent = next
 		}
 	}
-	a.schedulerCurrent[schedulerKey(eligible[selected])] -= totalWeight
+	a.schedulerCurrent[schedulerKey(group[selected])] -= totalWeight
 	a.schedulerMu.Unlock()
 
-	ordered := make([]routeTarget, 0, len(eligible))
-	ordered = append(ordered, eligible[selected])
-	remaining := make([]routeTarget, 0, len(eligible)-1)
-	for i, target := range eligible {
+	ordered := make([]routeTarget, 0, len(group))
+	ordered = append(ordered, group[selected])
+	remaining := make([]routeTarget, 0, len(group)-1)
+	for i, target := range group {
 		if i == selected {
 			continue
 		}
@@ -192,19 +233,6 @@ func routeTargetLess(left routeTarget, right routeTarget, now time.Time) bool {
 	return sourceKeyIDValueFromBinding(left.Binding) < sourceKeyIDValueFromBinding(right.Binding)
 }
 
-func schedulerCooldownForFailures(failures int) time.Duration {
-	switch {
-	case failures >= 4:
-		return schedulerLongCooldown
-	case failures == 3:
-		return schedulerMediumCooldown
-	case failures == 2:
-		return schedulerShortCooldown
-	default:
-		return 0
-	}
-}
-
 func (a *App) markBindingSuccess(target routeTarget, now time.Time) {
 	if target.Binding.ID == 0 {
 		return
@@ -219,19 +247,8 @@ func (a *App) markBindingSuccess(target routeTarget, now time.Time) {
 		"last_success_at": now,
 	}
 	switch state {
-	case schedulerStateHalfOpen:
-		updates["scheduler_state"] = schedulerStateRecovering
-		updates["success_streak"] = 1
-	case schedulerStateRecovering:
-		streak := binding.SuccessStreak + 1
-		if streak >= schedulerRecoverySuccessThreshold {
-			updates["scheduler_state"] = schedulerStateClosed
-			updates["failure_count"] = 0
-			updates["success_streak"] = 0
-		} else {
-			updates["scheduler_state"] = schedulerStateRecovering
-			updates["success_streak"] = streak
-		}
+	case schedulerStateObserving:
+		updates["scheduler_state"] = schedulerStateObserving
 	default:
 		updates["scheduler_state"] = schedulerStateClosed
 		updates["failure_count"] = 0
@@ -243,47 +260,147 @@ func (a *App) markBindingSuccess(target routeTarget, now time.Time) {
 	}
 }
 
-func (a *App) markBindingFailure(target routeTarget, now time.Time) {
+func (a *App) markBindingFailure(target routeTarget, statusCode int, now time.Time) {
 	if target.Binding.ID == 0 {
 		return
 	}
-	var binding ModelRouteBinding
-	if err := a.db.First(&binding, target.Binding.ID).Error; err != nil {
-		return
-	}
-	failures := binding.FailureCount + 1
-	updates := map[string]any{
-		"failure_count":   failures,
+	result := a.db.Model(&ModelRouteBinding{}).Where("id = ?", target.Binding.ID).Updates(map[string]any{
+		"failure_count":   gorm.Expr("failure_count + ?", 1),
 		"success_streak":  0,
 		"last_failure_at": now,
+	})
+	if result.Error != nil || result.RowsAffected != 1 {
+		return
 	}
-	if target.SingleSource {
-		updates["scheduler_state"] = schedulerStateClosed
+	query := a.db.Model(&ModelRouteBinding{}).Where("id = ?", target.Binding.ID)
+	if statusCode != http.StatusUnauthorized && statusCode != http.StatusForbidden {
+		query = query.Where("failure_count >= ? OR scheduler_state IN ?", schedulerFailureThreshold, []string{schedulerStateHalfOpen, schedulerStateRecovering, schedulerStateObserving})
+	}
+	opened := query.Updates(map[string]any{
+		"scheduler_state":   schedulerStateOpen,
+		"cooldown_until":    now.Add(schedulerProbeInterval),
+		"observation_until": nil,
+	})
+	if opened.Error == nil && opened.RowsAffected == 1 {
+		a.resetSchedulerBindingMemory(target.Binding.ID)
+	}
+}
+
+func (a *App) runSchedulerProbeLoop(done <-chan struct{}) {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case now := <-ticker.C:
+			a.runDueSchedulerProbes(now)
+		case <-done:
+			return
+		}
+	}
+}
+
+func (a *App) runDueSchedulerProbes(now time.Time) {
+	var bindings []ModelRouteBinding
+	if err := a.db.Where("scheduler_state IN ? AND cooldown_until IS NOT NULL AND cooldown_until <= ?", []string{schedulerStateOpen, schedulerStateRecovering, schedulerStateHalfOpen}, now).Find(&bindings).Error; err != nil {
+		return
+	}
+	for _, binding := range bindings {
+		if !a.claimSchedulerProbe(binding, now) {
+			continue
+		}
+		go a.probeSchedulerBinding(binding.ID, now)
+	}
+}
+
+func (a *App) claimSchedulerProbe(binding ModelRouteBinding, now time.Time) bool {
+	leaseUntil := now.Add(schedulerProbeLeaseDuration)
+	result := a.db.Model(&ModelRouteBinding{}).
+		Where("id = ? AND scheduler_state = ? AND cooldown_until <= ? AND (probe_lease_until IS NULL OR probe_lease_until <= ?)", binding.ID, schedulerBindingState(binding), now, now).
+		Updates(map[string]any{"scheduler_state": schedulerStateHalfOpen, "probe_lease_until": leaseUntil})
+	return result.Error == nil && result.RowsAffected == 1
+}
+
+func (a *App) probeSchedulerBinding(bindingID uint, now time.Time) {
+	target, protocol, err := a.schedulerProbeTarget(bindingID)
+	if err != nil {
+		a.markSchedulerProbeFailure(bindingID, now)
+		return
+	}
+	path, body, err := modelInvokeTestPayload(protocol, target.Model.Name)
+	if err != nil {
+		a.markSchedulerProbeFailure(bindingID, now)
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), schedulerProbeTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, upstreamURL(target, protocol, path), bytes.NewReader(body))
+	if err != nil {
+		a.markSchedulerProbeFailure(bindingID, now)
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	applyUpstreamAuth(req.Header, target.Source, effectiveUpstreamAPIKey(target), protocol)
+	if protocol == relayProtocolAnthropic {
+		req.Header.Set("anthropic-version", "2023-06-01")
+	}
+	resp, err := (&http.Client{Timeout: schedulerProbeTimeout}).Do(req)
+	if err != nil {
+		a.markSchedulerProbeFailure(bindingID, time.Now())
+		return
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= http.StatusBadRequest {
+		a.markSchedulerProbeFailure(bindingID, time.Now())
+		return
+	}
+	a.markSchedulerProbeSuccess(bindingID, time.Now())
+}
+
+func (a *App) schedulerProbeTarget(bindingID uint) (routeTarget, relayProtocol, error) {
+	var binding ModelRouteBinding
+	if err := a.db.First(&binding, bindingID).Error; err != nil {
+		return routeTarget{}, "", err
+	}
+	var model ModelConfig
+	if err := a.db.First(&model, binding.ModelID).Error; err != nil {
+		return routeTarget{}, "", err
+	}
+	var source UpstreamSource
+	if err := a.db.First(&source, binding.SourceID).Error; err != nil {
+		return routeTarget{}, "", err
+	}
+	target := routeTarget{Model: model, Binding: binding, Source: source}
+	if binding.SourceKeyID != nil {
+		var key SourceKey
+		if err := a.db.Where("id = ? AND source_id = ? AND status = ?", *binding.SourceKeyID, source.ID, APIKeyStatusValid).First(&key).Error; err != nil {
+			return routeTarget{}, "", err
+		}
+		target.SourceKey = &key
+	}
+	return target, modelTestProtocol(model), nil
+}
+
+func (a *App) markSchedulerProbeSuccess(bindingID uint, now time.Time) {
+	var binding ModelRouteBinding
+	if err := a.db.First(&binding, bindingID).Error; err != nil {
+		return
+	}
+	streak := binding.SuccessStreak + 1
+	updates := map[string]any{"success_streak": streak, "last_success_at": now, "probe_lease_until": nil}
+	if streak >= schedulerRecoverySuccessThreshold {
+		updates["scheduler_state"] = schedulerStateObserving
+		updates["observation_until"] = now.Add(schedulerObservationDuration)
 		updates["cooldown_until"] = nil
-		_ = a.db.Model(&ModelRouteBinding{}).Where("id = ?", binding.ID).Updates(updates).Error
-		a.resetSchedulerBindingMemory(binding.ID)
-		return
-	}
-
-	state := schedulerBindingState(binding)
-	if state == schedulerStateHalfOpen || state == schedulerStateRecovering {
-		updates["scheduler_state"] = schedulerStateOpen
-		updates["cooldown_until"] = now.Add(schedulerLongCooldown)
-		_ = a.db.Model(&ModelRouteBinding{}).Where("id = ?", binding.ID).Updates(updates).Error
-		a.resetSchedulerBindingMemory(binding.ID)
-		return
-	}
-
-	cooldown := schedulerCooldownForFailures(failures)
-	if cooldown > 0 {
-		updates["scheduler_state"] = schedulerStateOpen
-		updates["cooldown_until"] = now.Add(cooldown)
 	} else {
-		updates["scheduler_state"] = schedulerStateClosed
-		updates["cooldown_until"] = nil
+		updates["scheduler_state"] = schedulerStateRecovering
+		updates["cooldown_until"] = now.Add(schedulerRecoveryProbeInterval)
 	}
-	_ = a.db.Model(&ModelRouteBinding{}).Where("id = ?", binding.ID).Updates(updates).Error
-	if cooldown > 0 {
-		a.resetSchedulerBindingMemory(binding.ID)
-	}
+	_ = a.db.Model(&ModelRouteBinding{}).Where("id = ? AND scheduler_state = ?", bindingID, schedulerStateHalfOpen).Updates(updates).Error
+}
+
+func (a *App) markSchedulerProbeFailure(bindingID uint, now time.Time) {
+	_ = a.db.Model(&ModelRouteBinding{}).Where("id = ?", bindingID).Updates(map[string]any{
+		"scheduler_state": schedulerStateOpen, "success_streak": 0, "cooldown_until": now.Add(schedulerProbeInterval), "observation_until": nil, "probe_lease_until": nil, "last_failure_at": now,
+	}).Error
+	a.resetSchedulerBindingMemory(bindingID)
 }

@@ -41,7 +41,11 @@ func New(cfg Config) (*App, error) {
 }
 
 func (a *App) Run() error {
-	return a.router.Run(a.cfg.Addr)
+	done := make(chan struct{})
+	go a.runSchedulerProbeLoop(done)
+	err := a.router.Run(a.cfg.Addr)
+	close(done)
+	return err
 }
 
 func (a *App) Handler() http.Handler {

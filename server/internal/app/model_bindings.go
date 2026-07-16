@@ -179,7 +179,12 @@ func (a *App) modelBindings(model ModelConfig) ([]ModelRouteBinding, error) {
 		return nil, err
 	}
 	if len(bindings) == 0 && model.SourceID != 0 {
-		bindings = append(bindings, legacyBindingFromModel(model))
+		binding := legacyBindingFromModel(model)
+		binding.SchedulerState = schedulerStateClosed
+		if err := a.db.Create(&binding).Error; err != nil {
+			return nil, err
+		}
+		bindings = append(bindings, binding)
 	}
 	return bindings, nil
 }
@@ -261,13 +266,13 @@ func (a *App) primaryModelBindingRequest(bindings []modelBindingRequest) modelBi
 		if leftSchedulable != rightSchedulable {
 			return leftSchedulable
 		}
+		if leftSource.Priority != rightSource.Priority {
+			return leftSource.Priority < rightSource.Priority
+		}
 		leftWeight := nonZeroInt(out[i].RoutingWeight, 1)
 		rightWeight := nonZeroInt(out[j].RoutingWeight, 1)
 		if leftWeight != rightWeight {
 			return leftWeight > rightWeight
-		}
-		if leftSource.Priority != rightSource.Priority {
-			return leftSource.Priority < rightSource.Priority
 		}
 		return leftSourceID < rightSourceID
 	})

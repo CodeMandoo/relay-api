@@ -970,7 +970,7 @@ func TestSchedulerSmoothWeightedRoundRobinUsesRoutingWeight(t *testing.T) {
 
 	hits := map[uint]int{}
 	for i := 0; i < 4; i++ {
-		targets, err := app.routeTargets("weighted-scheduler-model", relayProtocolOpenAI)
+		targets, err := app.scheduledRouteTargets("weighted-scheduler-model", relayProtocolOpenAI)
 		if err != nil {
 			t.Fatalf("route targets: %v", err)
 		}
@@ -984,7 +984,7 @@ func TestSchedulerSmoothWeightedRoundRobinUsesRoutingWeight(t *testing.T) {
 	}
 }
 
-func TestSchedulerFailureLadderAndHalfOpenProbe(t *testing.T) {
+func TestSchedulerOpensAfterThreeConsecutiveFailures(t *testing.T) {
 	app := testApp(t)
 	primary, _, _ := createSchedulerModel(t, app, "failure-ladder-model", 5, 1)
 	target := firstSchedulerTarget(t, app, "failure-ladder-model")
@@ -1000,18 +1000,16 @@ func TestSchedulerFailureLadderAndHalfOpenProbe(t *testing.T) {
 
 	app.markTargetFailure(target, http.StatusBadGateway)
 	binding = loadRouteBinding(t, app, target.Binding.ID)
-	if schedulerBindingState(binding) != schedulerStateOpen || binding.FailureCount != 2 {
-		t.Fatalf("second failure should open breaker, got %+v", binding)
+	if schedulerBindingState(binding) != schedulerStateClosed || binding.FailureCount != 2 || binding.CooldownUntil != nil {
+		t.Fatalf("second failure should stay closed without cooldown, got %+v", binding)
 	}
-	assertCooldownNear(t, binding.CooldownUntil, schedulerShortCooldown)
 
 	app.markTargetFailure(target, http.StatusBadGateway)
 	binding = loadRouteBinding(t, app, target.Binding.ID)
-	assertCooldownNear(t, binding.CooldownUntil, schedulerMediumCooldown)
-
-	app.markTargetFailure(target, http.StatusBadGateway)
-	binding = loadRouteBinding(t, app, target.Binding.ID)
-	assertCooldownNear(t, binding.CooldownUntil, schedulerLongCooldown)
+	if schedulerBindingState(binding) != schedulerStateOpen || binding.FailureCount != schedulerFailureThreshold {
+		t.Fatalf("third failure should open breaker, got %+v", binding)
+	}
+	assertCooldownNear(t, binding.CooldownUntil, schedulerProbeInterval)
 
 	past := time.Now().Add(-time.Second)
 	if err := app.db.Model(&ModelRouteBinding{}).Where("id = ?", target.Binding.ID).Updates(map[string]any{
@@ -1020,28 +1018,16 @@ func TestSchedulerFailureLadderAndHalfOpenProbe(t *testing.T) {
 	}).Error; err != nil {
 		t.Fatalf("expire cooldown: %v", err)
 	}
-	app.resetSchedulerMemory()
-	targets, err := app.routeTargets("failure-ladder-model", relayProtocolOpenAI)
-	if err != nil {
-		t.Fatalf("route half-open target: %v", err)
-	}
-	if len(targets) == 0 || targets[0].Binding.ID != target.Binding.ID {
-		t.Fatalf("expected expired binding to be probed first, got %+v", targets)
+	if !app.claimSchedulerProbe(binding, time.Now()) {
+		t.Fatal("expected due open binding probe lease to be claimed")
 	}
 	binding = loadRouteBinding(t, app, target.Binding.ID)
 	if schedulerBindingState(binding) != schedulerStateHalfOpen {
-		t.Fatalf("expected expired open binding to become half-open, got %+v", binding)
+		t.Fatalf("expected due open binding to be claimed for background probing, got %+v", binding)
 	}
-
-	app.markTargetFailure(targets[0], http.StatusBadGateway)
-	binding = loadRouteBinding(t, app, target.Binding.ID)
-	if schedulerBindingState(binding) != schedulerStateOpen {
-		t.Fatalf("half-open failure should reopen breaker, got %+v", binding)
-	}
-	assertCooldownNear(t, binding.CooldownUntil, schedulerLongCooldown)
 }
 
-func TestSchedulerRecoveringSuccessAndFailure(t *testing.T) {
+func TestSchedulerProbeRecoveryAndObservation(t *testing.T) {
 	app := testApp(t)
 	_, _, _ = createSchedulerModel(t, app, "recovering-scheduler-model", 5, 1)
 	target := firstSchedulerTarget(t, app, "recovering-scheduler-model")
@@ -1054,32 +1040,130 @@ func TestSchedulerRecoveringSuccessAndFailure(t *testing.T) {
 		t.Fatalf("set half-open binding: %v", err)
 	}
 
-	app.markTargetSuccess(target)
+	app.markSchedulerProbeSuccess(target.Binding.ID, time.Now())
 	binding := loadRouteBinding(t, app, target.Binding.ID)
-	if schedulerBindingState(binding) != schedulerStateRecovering || binding.SuccessStreak != 1 || binding.CooldownUntil != nil {
+	if schedulerBindingState(binding) != schedulerStateRecovering || binding.SuccessStreak != 1 || binding.CooldownUntil == nil {
 		t.Fatalf("half-open success should enter recovering, got %+v", binding)
 	}
-	app.markTargetSuccess(target)
-	app.markTargetSuccess(target)
+	for i := 0; i < 2; i++ {
+		if err := app.db.Model(&ModelRouteBinding{}).Where("id = ?", target.Binding.ID).Update("scheduler_state", schedulerStateHalfOpen).Error; err != nil {
+			t.Fatalf("claim next recovery probe: %v", err)
+		}
+		app.markSchedulerProbeSuccess(target.Binding.ID, time.Now())
+	}
 	binding = loadRouteBinding(t, app, target.Binding.ID)
-	if schedulerBindingState(binding) != schedulerStateClosed || binding.FailureCount != 0 || binding.SuccessStreak != 0 || binding.CooldownUntil != nil {
-		t.Fatalf("three recovering successes should close breaker, got %+v", binding)
+	if schedulerBindingState(binding) != schedulerStateObserving || binding.SuccessStreak != schedulerRecoverySuccessThreshold || binding.ObservationUntil == nil {
+		t.Fatalf("three probe successes should enter observation, got %+v", binding)
 	}
 
+	past := time.Now().Add(-time.Second)
 	if err := app.db.Model(&ModelRouteBinding{}).Where("id = ?", target.Binding.ID).Updates(map[string]any{
-		"scheduler_state": schedulerStateRecovering,
-		"failure_count":   2,
-		"success_streak":  1,
-		"cooldown_until":  nil,
+		"observation_until": past,
 	}).Error; err != nil {
-		t.Fatalf("set recovering binding: %v", err)
+		t.Fatalf("expire observation: %v", err)
 	}
-	app.markTargetFailure(target, http.StatusBadGateway)
+	target.Binding = loadRouteBinding(t, app, target.Binding.ID)
+	_ = app.refreshSchedulerState(target.Binding, time.Now())
 	binding = loadRouteBinding(t, app, target.Binding.ID)
-	if schedulerBindingState(binding) != schedulerStateOpen || binding.SuccessStreak != 0 {
-		t.Fatalf("recovering failure should reopen breaker, got %+v", binding)
+	if schedulerBindingState(binding) != schedulerStateClosed || binding.FailureCount != 0 || binding.SuccessStreak != 0 || binding.ObservationUntil != nil {
+		t.Fatalf("successful observation should close breaker, got %+v", binding)
 	}
-	assertCooldownNear(t, binding.CooldownUntil, schedulerLongCooldown)
+}
+
+func TestSchedulerCredentialFailureOpensImmediately(t *testing.T) {
+	app := testApp(t)
+	_, _, _ = createSchedulerModel(t, app, "credential-failure-model", 1, 1)
+	target := firstSchedulerTarget(t, app, "credential-failure-model")
+	app.markTargetFailure(target, http.StatusUnauthorized)
+	binding := loadRouteBinding(t, app, target.Binding.ID)
+	if schedulerBindingState(binding) != schedulerStateOpen || binding.FailureCount != 1 {
+		t.Fatalf("credential failure should open immediately, got %+v", binding)
+	}
+}
+
+func TestSchedulerProbeCallsModelAndEntersRecovering(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/chat/completions" {
+			t.Fatalf("unexpected probe request: %s %s", r.Method, r.URL.Path)
+		}
+		if r.Header.Get("Authorization") != "Bearer probe-key" {
+			t.Fatalf("unexpected probe authorization: %q", r.Header.Get("Authorization"))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"probe-ok"}`))
+	}))
+	defer upstream.Close()
+
+	app := testApp(t)
+	source := UpstreamSource{Name: "Probe_Source", Type: SourceTypeThirdParty, BaseURL: upstream.URL + "/v1", APIKey: "probe-key", Priority: 1, Status: SourceStatusOnline}
+	if err := app.db.Create(&source).Error; err != nil {
+		t.Fatalf("create probe source: %v", err)
+	}
+	model := ModelConfig{SourceID: source.ID, Name: "probe-model", Provider: "OpenAI", Formats: ModelFormatOpenAI, Status: ModelStatusActive, RoutingEnabled: true, RoutingWeight: 1}
+	if err := app.db.Create(&model).Error; err != nil {
+		t.Fatalf("create probe model: %v", err)
+	}
+	if err := app.replaceModelBindings(model.ID, []modelBindingRequest{{SourceID: id("s", source.ID), SourceKeyID: "default", RoutingWeight: 1}}); err != nil {
+		t.Fatalf("create probe binding: %v", err)
+	}
+	var binding ModelRouteBinding
+	if err := app.db.Where("model_id = ?", model.ID).First(&binding).Error; err != nil {
+		t.Fatalf("load probe binding: %v", err)
+	}
+	if err := app.db.Model(&ModelRouteBinding{}).Where("id = ?", binding.ID).Updates(map[string]any{
+		"scheduler_state": schedulerStateHalfOpen,
+		"failure_count":   schedulerFailureThreshold,
+	}).Error; err != nil {
+		t.Fatalf("prepare probe binding: %v", err)
+	}
+
+	app.probeSchedulerBinding(binding.ID, time.Now())
+	binding = loadRouteBinding(t, app, binding.ID)
+	if schedulerBindingState(binding) != schedulerStateRecovering || binding.SuccessStreak != 1 {
+		t.Fatalf("successful real probe should enter recovering, got %+v", binding)
+	}
+}
+
+func TestSchedulerUsesWeightOnlyWithinSamePriority(t *testing.T) {
+	app := testApp(t)
+	primary, backup, _ := createSchedulerModel(t, app, "strict-priority-model", 1, 100)
+	if err := app.db.Model(&UpstreamSource{}).Where("id = ?", backup.ID).Update("priority", 2).Error; err != nil {
+		t.Fatalf("lower backup priority: %v", err)
+	}
+	for i := 0; i < 20; i++ {
+		target := firstSchedulerTarget(t, app, "strict-priority-model")
+		if target.Source.ID != primary.ID {
+			t.Fatalf("lower-priority source selected despite primary health: %+v", target.Source)
+		}
+	}
+}
+
+func TestSchedulerObservesRecoveredHigherPriorityAtTenPercent(t *testing.T) {
+	app := testApp(t)
+	primary, backup, _ := createSchedulerModel(t, app, "observation-traffic-model", 1, 1)
+	if err := app.db.Model(&UpstreamSource{}).Where("id = ?", backup.ID).Update("priority", 2).Error; err != nil {
+		t.Fatalf("lower backup priority: %v", err)
+	}
+	var binding ModelRouteBinding
+	if err := app.db.Where("source_id = ?", primary.ID).First(&binding).Error; err != nil {
+		t.Fatalf("load primary binding: %v", err)
+	}
+	observationUntil := time.Now().Add(time.Minute)
+	if err := app.db.Model(&ModelRouteBinding{}).Where("id = ?", binding.ID).Updates(map[string]any{
+		"scheduler_state":   schedulerStateObserving,
+		"observation_until": observationUntil,
+	}).Error; err != nil {
+		t.Fatalf("observe primary binding: %v", err)
+	}
+	app.resetSchedulerMemory()
+	hits := map[uint]int{}
+	for i := 0; i < 20; i++ {
+		target := firstSchedulerTarget(t, app, "observation-traffic-model")
+		hits[target.Source.ID]++
+	}
+	if hits[primary.ID] != 2 || hits[backup.ID] != 18 {
+		t.Fatalf("expected 10%% observation traffic, got primary=%d backup=%d", hits[primary.ID], hits[backup.ID])
+	}
 }
 
 func TestModelBindingUpdateResetsSchedulerCooldownAndAppliesWeight(t *testing.T) {
@@ -1143,7 +1227,7 @@ func createSchedulerModel(t *testing.T, app *App, name string, primaryWeight int
 
 func firstSchedulerTarget(t *testing.T, app *App, modelName string) routeTarget {
 	t.Helper()
-	targets, err := app.routeTargets(modelName, relayProtocolOpenAI)
+	targets, err := app.scheduledRouteTargets(modelName, relayProtocolOpenAI)
 	if err != nil {
 		t.Fatalf("route targets: %v", err)
 	}
@@ -1244,14 +1328,33 @@ func TestUserModelsExposeCurrentScheduledModelAndCandidateCount(t *testing.T) {
 	if len(found) != 1 {
 		t.Fatalf("expected one deduplicated shared-openai-model row, got %v", found)
 	}
-	if found[0]["sourceName"] != "OpenRouter_A" {
-		t.Fatalf("expected current scheduled source OpenRouter_A by routing weight, got %v", found[0])
+	if found[0]["sourceName"] != "OpenRouter_B" {
+		t.Fatalf("expected current scheduled source OpenRouter_B by priority, got %v", found[0])
 	}
 	if found[0]["sourceType"] != SourceTypeThirdParty || found[0]["sourceStatus"] != SourceStatusOnline {
 		t.Fatalf("unexpected source metadata: %v", found[0])
 	}
 	if got := int64(found[0]["routingCandidates"].(float64)); got != 2 {
 		t.Fatalf("routingCandidates = %d, want 2", got)
+	}
+}
+
+func TestUserModelsDoesNotAdvanceWeightedScheduler(t *testing.T) {
+	app := testApp(t)
+	primary, _, _ := createSchedulerModel(t, app, "user-list-scheduler-model", 3, 1)
+	createTestUser(t, app)
+	userToken := loginToken(t, app, testUserEmail, testUserPassword, RoleUser)
+
+	for i := 0; i < 2; i++ {
+		w := performJSON(app, http.MethodGet, "/api/user/models", userToken, nil)
+		if w.Code != http.StatusOK {
+			t.Fatalf("user models request %d: %d %s", i+1, w.Code, w.Body.String())
+		}
+	}
+
+	target := firstSchedulerTarget(t, app, "user-list-scheduler-model")
+	if target.Source.ID != primary.ID {
+		t.Fatalf("user model listing should not consume scheduler slots, got first scheduled source %+v", target.Source)
 	}
 }
 
@@ -2339,7 +2442,7 @@ func TestProxySkipsCoolingSource(t *testing.T) {
 	}
 }
 
-func TestProxySingleSourceRoutesDirectlyWithStaleCooldown(t *testing.T) {
+func TestProxySingleOpenBindingDoesNotReceiveTraffic(t *testing.T) {
 	var calls int
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
@@ -2354,8 +2457,7 @@ func TestProxySingleSourceRoutesDirectlyWithStaleCooldown(t *testing.T) {
 	defer upstream.Close()
 
 	app := testApp(t)
-	cooldownUntil := time.Now().Add(10 * time.Minute)
-	source := UpstreamSource{Name: "Single_Cooling_Source", Type: SourceTypeThirdParty, BaseURL: upstream.URL + "/v1", APIKey: "single-key", Priority: 1, Status: SourceStatusOnline, FailureCount: 2, CooldownUntil: &cooldownUntil}
+	source := UpstreamSource{Name: "Single_Cooling_Source", Type: SourceTypeThirdParty, BaseURL: upstream.URL + "/v1", APIKey: "single-key", Priority: 1, Status: SourceStatusOnline}
 	if err := app.db.Create(&source).Error; err != nil {
 		t.Fatalf("create source: %v", err)
 	}
@@ -2363,27 +2465,32 @@ func TestProxySingleSourceRoutesDirectlyWithStaleCooldown(t *testing.T) {
 	if err := app.db.Create(&model).Error; err != nil {
 		t.Fatalf("create model: %v", err)
 	}
+	bindings, err := app.modelBindings(model)
+	if err != nil || len(bindings) != 1 {
+		t.Fatalf("load binding: count=%d err=%v", len(bindings), err)
+	}
+	cooldownUntil := time.Now().Add(10 * time.Minute)
+	if err := app.db.Model(&ModelRouteBinding{}).Where("id = ?", bindings[0].ID).Updates(map[string]any{
+		"scheduler_state": schedulerStateOpen,
+		"failure_count":   schedulerFailureThreshold,
+		"cooldown_until":  cooldownUntil,
+	}).Error; err != nil {
+		t.Fatalf("open binding: %v", err)
+	}
 
 	w := performJSON(app, http.MethodPost, "/v1/chat/completions", createRelayAPIKey(t, app), map[string]any{
 		"model":    "single-cooldown-model",
 		"messages": []any{map[string]any{"role": "user", "content": "hello"}},
 	})
-	if w.Code != http.StatusOK {
-		t.Fatalf("proxy single cooldown request: %d %s", w.Code, w.Body.String())
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("expected no available source, got %d %s", w.Code, w.Body.String())
 	}
-	if calls != 1 {
-		t.Fatalf("expected single direct source to be called once, got %d", calls)
-	}
-	var refreshed UpstreamSource
-	if err := app.db.First(&refreshed, source.ID).Error; err != nil {
-		t.Fatalf("load source: %v", err)
-	}
-	if refreshed.CooldownUntil != nil || refreshed.FailureCount != 0 || refreshed.Status != SourceStatusOnline {
-		t.Fatalf("expected single direct source success to clear stale cooldown, got status=%s failure=%d cooldown=%v", refreshed.Status, refreshed.FailureCount, refreshed.CooldownUntil)
+	if calls != 0 {
+		t.Fatalf("open single binding must not receive traffic, got %d calls", calls)
 	}
 }
 
-func TestProxySingleSourceFailureDoesNotCooldown(t *testing.T) {
+func TestProxySingleSourceOpensAfterThreeFailures(t *testing.T) {
 	var calls int
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
@@ -2401,22 +2508,26 @@ func TestProxySingleSourceFailureDoesNotCooldown(t *testing.T) {
 		t.Fatalf("create model: %v", err)
 	}
 
-	w := performJSON(app, http.MethodPost, "/v1/chat/completions", createRelayAPIKey(t, app), map[string]any{
-		"model":    "single-failure-model",
-		"messages": []any{map[string]any{"role": "user", "content": "hello"}},
-	})
-	if w.Code != http.StatusInternalServerError {
-		t.Fatalf("expected upstream 500 to pass through, got %d %s", w.Code, w.Body.String())
+	apiKey := createRelayAPIKey(t, app)
+	for i := 0; i < schedulerFailureThreshold; i++ {
+		w := performJSON(app, http.MethodPost, "/v1/chat/completions", apiKey, map[string]any{
+			"model":    "single-failure-model",
+			"messages": []any{map[string]any{"role": "user", "content": "hello"}},
+		})
+		if w.Code != http.StatusInternalServerError {
+			t.Fatalf("request %d: expected upstream 500, got %d %s", i+1, w.Code, w.Body.String())
+		}
 	}
-	if calls != 1 {
-		t.Fatalf("expected single source to be called once, got %d", calls)
+	if calls != schedulerFailureThreshold {
+		t.Fatalf("expected %d source calls, got %d", schedulerFailureThreshold, calls)
 	}
-	var refreshed UpstreamSource
-	if err := app.db.First(&refreshed, source.ID).Error; err != nil {
-		t.Fatalf("load source: %v", err)
+	bindings, err := app.modelBindings(model)
+	if err != nil || len(bindings) != 1 {
+		t.Fatalf("load binding: count=%d err=%v", len(bindings), err)
 	}
-	if refreshed.FailureCount == 0 || refreshed.CooldownUntil != nil {
-		t.Fatalf("expected failure count without cooldown, got failure=%d cooldown=%v", refreshed.FailureCount, refreshed.CooldownUntil)
+	binding := loadRouteBinding(t, app, bindings[0].ID)
+	if schedulerBindingState(binding) != schedulerStateOpen || binding.FailureCount != schedulerFailureThreshold || binding.CooldownUntil == nil {
+		t.Fatalf("third single-source failure should open binding, got %+v", binding)
 	}
 }
 
@@ -2764,8 +2875,11 @@ func TestCLIProxyAccountSyncAndOAuth(t *testing.T) {
 	if row["used5h"] != float64(25) || row["limit5h"] != float64(100) || row["used7d"] != float64(60) || row["limit7d"] != float64(100) {
 		t.Fatalf("expected codex usage quota, got %v", row)
 	}
-	if row["provider"] != "ChatGPT" || row["planType"] != "pro_5x" || row["openaiPlanType"] != "pro" || row["subscriptionPlan"] != "pro_5x" || row["hasSubscription"] != true {
+	if row["provider"] != "ChatGPT" || row["planType"] != "pro_5x" || row["subscriptionPlan"] != "pro_5x" || row["hasSubscription"] != true {
 		t.Fatalf("expected platform and subscription fields, got %v", row)
+	}
+	if _, ok := row["openaiPlanType"]; ok {
+		t.Fatalf("openaiPlanType should not be returned, got %v", row)
 	}
 	if seenUsageAccountID != "org-usage" {
 		t.Fatalf("expected ChatGPT-Account-ID org-usage, got %q", seenUsageAccountID)
@@ -2919,6 +3033,27 @@ func TestPlanExtractionIgnoresOAuthAccountType(t *testing.T) {
 }
 
 func TestAdminSubmitSourceAccountTokenUploadsAuthFile(t *testing.T) {
+	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.NotFound(w, r)
+			return
+		}
+		var body map[string]string
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode claude token request: %v", err)
+		}
+		if body["grant_type"] != "refresh_token" || body["refresh_token"] != "claude-refresh-token" {
+			t.Fatalf("unexpected claude token request: %v", body)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"access_token":  "validated-claude-access-token",
+			"refresh_token": "validated-claude-refresh-token",
+			"expires_in":    3600,
+		})
+	}))
+	defer tokenServer.Close()
+	t.Setenv("RELAY_CLAUDE_OAUTH_TOKEN_URL", tokenServer.URL)
+
 	var uploadName string
 	var uploaded map[string]any
 	management := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -2976,16 +3111,16 @@ func TestAdminSubmitSourceAccountTokenUploadsAuthFile(t *testing.T) {
 	w := performJSON(app, http.MethodPost, "/api/admin/sources/s_001/accounts/token", adminToken, map[string]any{
 		"provider":     "Claude",
 		"identifier":   "claude@example.com",
-		"refreshToken": "claude-refresh-token",
+		"refreshToken": `{"refresh_token":"claude-refresh-token","access_token":"claude-access-token"}`,
 	})
 	if w.Code != http.StatusOK {
 		t.Fatalf("manual token login: %d %s", w.Code, w.Body.String())
 	}
-	if uploaded["type"] != "claude" || uploaded["email"] != "claude@example.com" || uploaded["refresh_token"] != "claude-refresh-token" {
+	if uploaded["type"] != "claude" || uploaded["email"] != "claude@example.com" || uploaded["refresh_token"] != "validated-claude-refresh-token" {
 		t.Fatalf("unexpected uploaded auth file: %v", uploaded)
 	}
 	if uploaded["access_token"] != nil || uploaded["id_token"] != nil {
-		t.Fatalf("access/id token should not be required for manual refresh token login: %v", uploaded)
+		t.Fatalf("manual token auth file should not store access/id token for Claude: %v", uploaded)
 	}
 	body := decodeBody(t, w)
 	rows := body["data"].([]any)
@@ -2998,31 +3133,34 @@ func TestAdminSubmitSourceAccountTokenUploadsAuthFile(t *testing.T) {
 	}
 }
 
-func TestAdminSubmitChatGPTTokenUsesAccessTokenForSubscription(t *testing.T) {
-	var seenAccountsCheck bool
-	usage := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("Authorization") != "Bearer manual-access-token" {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
+func TestAdminSubmitChatGPTTokenIgnoresAccessToken(t *testing.T) {
+	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.NotFound(w, r)
 			return
 		}
+		if err := r.ParseForm(); err != nil {
+			t.Fatalf("parse codex token request: %v", err)
+		}
+		if r.Form.Get("grant_type") != "refresh_token" || r.Form.Get("refresh_token") != "manual-refresh-token" {
+			t.Fatalf("unexpected codex token request: %v", r.Form)
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"access_token":  "validated-codex-access-token",
+			"refresh_token": "validated-codex-refresh-token",
+			"id_token":      "validated-id-token",
+			"expires_in":    3600,
+		})
+	}))
+	defer tokenServer.Close()
+	t.Setenv("RELAY_CODEX_OAUTH_TOKEN_URL", tokenServer.URL)
+
+	var seenAccountsCheck bool
+	usage := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/backend-api/accounts/check/v4-2023-04-27":
 			seenAccountsCheck = true
-			_ = json.NewEncoder(w).Encode(map[string]any{
-				"accounts": map[string]any{
-					"default": map[string]any{
-						"account": map[string]any{
-							"plan_type":        "plus",
-							"has_subscription": true,
-							"is_default":       true,
-						},
-						"entitlement": map[string]any{
-							"subscription_plan":       "ChatGPT Plus",
-							"has_active_subscription": true,
-						},
-					},
-				},
-			})
+			http.Error(w, "manual token login must not query subscription", http.StatusInternalServerError)
 		case "/backend-api/wham/usage":
 			_ = json.NewEncoder(w).Encode(map[string]any{})
 		default:
@@ -3092,8 +3230,8 @@ func TestAdminSubmitChatGPTTokenUsesAccessTokenForSubscription(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("manual token login: %d %s", w.Code, w.Body.String())
 	}
-	if uploaded["access_token"] != nil || uploaded["refresh_token"] != "manual-refresh-token" {
-		t.Fatalf("expected access token to stay out of CLIProxy auth file, got %v", uploaded)
+	if uploaded["access_token"] != nil || uploaded["refresh_token"] != "validated-codex-refresh-token" || uploaded["id_token"] != "validated-id-token" {
+		t.Fatalf("expected validated token data without access token, got %v", uploaded)
 	}
 	body := decodeBody(t, w)
 	rows := body["data"].([]any)
@@ -3101,14 +3239,65 @@ func TestAdminSubmitChatGPTTokenUsesAccessTokenForSubscription(t *testing.T) {
 		t.Fatalf("expected one synced account, got %d", len(rows))
 	}
 	row := rows[0].(map[string]any)
-	if row["provider"] != "ChatGPT" || row["openaiPlanType"] != "plus" {
-		t.Fatalf("expected official plan from manual access token, got %v", row)
+	if row["provider"] != "ChatGPT" {
+		t.Fatalf("unexpected synced account: %v", row)
+	}
+	if _, ok := row["openaiPlanType"]; ok {
+		t.Fatalf("openaiPlanType should not be returned, got %v", row)
 	}
 	if row["planType"] != nil || row["subscriptionPlan"] != nil || row["hasSubscription"] != false {
-		t.Fatalf("manual access token should not change normalized subscription fields, got %v", row)
+		t.Fatalf("manual access token should not change subscription fields, got %v", row)
 	}
-	if !seenAccountsCheck {
-		t.Fatalf("expected OpenAI accounts/check to be called")
+	if seenAccountsCheck {
+		t.Fatalf("manual token login should not call OpenAI accounts/check")
+	}
+}
+
+func TestAdminSubmitSourceAccountTokenRejectsInvalidRefreshToken(t *testing.T) {
+	tokenServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"error":             "invalid_grant",
+			"error_description": "refresh token is invalid or expired",
+		})
+	}))
+	defer tokenServer.Close()
+	t.Setenv("RELAY_CODEX_OAUTH_TOKEN_URL", tokenServer.URL)
+
+	uploadCalled := false
+	management := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v0/management/auth-files" && r.Method == http.MethodPost {
+			uploadCalled = true
+		}
+		http.NotFound(w, r)
+	}))
+	defer management.Close()
+
+	app := testApp(t)
+	adminToken := loginToken(t, app, testAdminEmail, testAdminPassword, RoleAdmin)
+	if err := app.db.Model(&UpstreamSource{}).Where("type = ?", SourceTypeCLIProxyAPI).Updates(map[string]any{
+		"base_url":       management.URL + "/v1",
+		"api_key":        "relay-secret",
+		"management_key": "mgmt-secret",
+		"status":         SourceStatusOnline,
+	}).Error; err != nil {
+		t.Fatalf("update source: %v", err)
+	}
+
+	w := performJSON(app, http.MethodPost, "/api/admin/sources/s_001/accounts/token", adminToken, map[string]any{
+		"provider":     "ChatGPT",
+		"identifier":   "chatgpt@example.com",
+		"refreshToken": "bad-refresh-token",
+	})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected invalid refresh token to return 400, got %d %s", w.Code, w.Body.String())
+	}
+	body := decodeBody(t, w)
+	if !strings.Contains(body["error"].(string), "invalid_grant") || !strings.Contains(body["error"].(string), "refresh token is invalid or expired") {
+		t.Fatalf("expected upstream refresh error, got %v", body["error"])
+	}
+	if uploadCalled {
+		t.Fatalf("invalid refresh token should not upload auth file")
 	}
 }
 
@@ -3144,7 +3333,7 @@ func TestPlanExtractionKeepsOfficialChatGPTPlanNames(t *testing.T) {
 			"has_active_subscription": true,
 		},
 	})
-	if snapshot.AccountPlanType != "pro_20x" || snapshot.OpenAIPlanType != "pro" || snapshot.SubscriptionPlan != "pro_20x" {
+	if snapshot.AccountPlanType != "pro_20x" || snapshot.SubscriptionPlan != "pro_20x" {
 		t.Fatalf("expected nested official plan name to win, got %+v", snapshot)
 	}
 }

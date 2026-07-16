@@ -128,7 +128,6 @@ type SourceAccount struct {
 	ChatGPTAccountID      string `gorm:"size:255"`
 	WorkspaceID           string `gorm:"size:255"`
 	PlanType              string `gorm:"size:50"`
-	OpenAIPlanType        string `gorm:"column:openai_plan_type;size:100"`
 	SubscriptionPlan      string `gorm:"size:50"`
 	HasSubscription       bool
 	SubscriptionExpiresAt *time.Time
@@ -217,23 +216,25 @@ type ModelConfig struct {
 }
 
 type ModelRouteBinding struct {
-	ID             uint `gorm:"primaryKey"`
-	ModelID        uint `gorm:"index;not null"`
-	SourceID       uint `gorm:"index;not null"`
-	SourceKeyID    *uint
-	RoutingWeight  int  `gorm:"not null;default:1"`
-	RoutingEnabled bool `gorm:"not null;default:true"`
-	Enabled        bool `gorm:"not null;default:true"`
-	LatencyMS      int
-	SchedulerState string `gorm:"size:20;index;not null;default:closed"`
-	FailureCount   int
-	SuccessStreak  int
-	CooldownUntil  *time.Time `gorm:"index"`
-	LastFailureAt  *time.Time
-	LastSuccessAt  *time.Time
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
-	DeletedAt      gorm.DeletedAt `gorm:"index"`
+	ID               uint `gorm:"primaryKey"`
+	ModelID          uint `gorm:"index;not null"`
+	SourceID         uint `gorm:"index;not null"`
+	SourceKeyID      *uint
+	RoutingWeight    int  `gorm:"not null;default:1"`
+	RoutingEnabled   bool `gorm:"not null;default:true"`
+	Enabled          bool `gorm:"not null;default:true"`
+	LatencyMS        int
+	SchedulerState   string `gorm:"size:20;index;not null;default:closed"`
+	FailureCount     int
+	SuccessStreak    int
+	CooldownUntil    *time.Time `gorm:"index"`
+	ObservationUntil *time.Time `gorm:"index"`
+	ProbeLeaseUntil  *time.Time `gorm:"index"`
+	LastFailureAt    *time.Time
+	LastSuccessAt    *time.Time
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
+	DeletedAt        gorm.DeletedAt `gorm:"index"`
 }
 
 type APIKey struct {
@@ -386,7 +387,6 @@ type SourceAccountDTO struct {
 	Provider              string  `json:"provider"`
 	AuthIndex             string  `json:"authIndex,omitempty"`
 	PlanType              string  `json:"planType,omitempty"`
-	OpenAIPlanType        string  `json:"openaiPlanType"`
 	SubscriptionPlan      string  `json:"subscriptionPlan,omitempty"`
 	HasSubscription       bool    `json:"hasSubscription"`
 	SubscriptionExpiresAt string  `json:"subscriptionExpiresAt,omitempty"`
@@ -586,7 +586,6 @@ func sourceAccountDTO(account SourceAccount) SourceAccountDTO {
 		Provider:         cliProxyProviderLabel(account.Provider),
 		AuthIndex:        account.AuthIndex,
 		PlanType:         account.PlanType,
-		OpenAIPlanType:   account.OpenAIPlanType,
 		SubscriptionPlan: account.SubscriptionPlan,
 		HasSubscription:  account.HasSubscription,
 		Status:           account.Status,

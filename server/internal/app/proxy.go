@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -213,7 +214,7 @@ func (a *App) proxyUpstream(c *gin.Context, protocol relayProtocol, upstreamPath
 	if !ok {
 		return
 	}
-	targets, err := a.routeTargets(modelName, protocol, modelGroupID)
+	targets, err := a.scheduledRouteTargets(modelName, protocol, modelGroupID)
 	if err != nil {
 		a.recordUsage(c, user, key, routeTarget{Model: ModelConfig{Name: modelName}}, usageTokens{}, http.StatusBadGateway, RequestStatusError, err.Error(), body, nil, 0, usageRecordMeta{RequestID: requestID, Protocol: protocol, Path: upstreamPath, Stream: stream})
 		errorJSON(c, http.StatusBadGateway, err.Error())
@@ -474,7 +475,15 @@ func (a *App) proxyStreamResponse(c *gin.Context, resp *http.Response, user User
 	a.recordUsage(c, user, key, target, extractUsage(capture.Bytes()), resp.StatusCode, status, errMsg, requestBody, capture.Bytes(), latency, meta)
 }
 
+func (a *App) scheduledRouteTargets(modelName string, protocol relayProtocol, modelGroupIDs ...uint) ([]routeTarget, error) {
+	return a.routeTargetsWithScheduler(modelName, protocol, true, modelGroupIDs...)
+}
+
 func (a *App) routeTargets(modelName string, protocol relayProtocol, modelGroupIDs ...uint) ([]routeTarget, error) {
+	return a.routeTargetsWithScheduler(modelName, protocol, false, modelGroupIDs...)
+}
+
+func (a *App) routeTargetsWithScheduler(modelName string, protocol relayProtocol, advanceScheduler bool, modelGroupIDs ...uint) ([]routeTarget, error) {
 	modelGroupID := uint(0)
 	if len(modelGroupIDs) > 0 {
 		modelGroupID = modelGroupIDs[0]
@@ -524,14 +533,14 @@ func (a *App) routeTargets(modelName string, protocol relayProtocol, modelGroupI
 				}
 				target.SourceKey = &sourceKey
 			}
-			target.Binding = a.refreshSchedulerState(target.Binding, now)
+			if advanceScheduler {
+				target.Binding = a.refreshSchedulerState(target.Binding, now)
+			}
 			candidates = append(candidates, target)
 		}
 	}
 	if len(candidates) == 1 {
-		// A single upstream is a direct route, not a schedulable pool.
 		candidates[0].SingleSource = true
-		return candidates, nil
 	}
 	targets := make([]routeTarget, 0, len(candidates))
 	for _, target := range candidates {
@@ -549,7 +558,21 @@ func (a *App) routeTargets(modelName string, protocol relayProtocol, modelGroupI
 	if len(targets) == 0 {
 		return nil, errors.New("no online source for model")
 	}
-	return a.scheduleTargets(targets, now), nil
+	if advanceScheduler {
+		return a.scheduleTargets(targets, now), nil
+	}
+	return previewRouteTargets(targets, now), nil
+}
+
+func previewRouteTargets(targets []routeTarget, now time.Time) []routeTarget {
+	if len(targets) <= 1 {
+		return targets
+	}
+	out := append([]routeTarget(nil), targets...)
+	sort.SliceStable(out, func(i, j int) bool {
+		return routeTargetLess(out[i], out[j], now)
+	})
+	return out
 }
 
 func (a *App) requireAPIKeyModelGroup(c *gin.Context, key APIKey) (uint, bool) {
@@ -685,7 +708,7 @@ func newRelayRequestID() string {
 }
 
 func isRetryableUpstreamStatus(statusCode int) bool {
-	return statusCode == http.StatusTooManyRequests || statusCode >= http.StatusInternalServerError
+	return statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden || statusCode == http.StatusTooManyRequests || statusCode >= http.StatusInternalServerError
 }
 
 func requestAttemptRow(requestID string, index int, target routeTarget, protocol relayProtocol, path string, statusCode int, status string, errMsg string, latency int64, started time.Time, ended time.Time) RequestAttempt {
@@ -764,7 +787,9 @@ func (a *App) markTargetResult(target routeTarget, statusCode int) {
 		a.markTargetFailure(target, statusCode)
 		return
 	}
-	a.markTargetSuccess(target)
+	if statusCode < http.StatusBadRequest {
+		a.markTargetSuccess(target)
+	}
 }
 
 func (a *App) markTargetSuccess(target routeTarget) {
@@ -787,7 +812,7 @@ func (a *App) markTargetFailure(target routeTarget, statusCode int) {
 		return
 	}
 	now := time.Now()
-	a.markBindingFailure(target, now)
+	a.markBindingFailure(target, statusCode, now)
 	updates := map[string]any{
 		"failure_count":   gorm.Expr("failure_count + ?", 1),
 		"last_failure_at": now,
