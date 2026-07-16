@@ -662,7 +662,6 @@ func (a *App) adminSubmitSourceAccountToken(c *gin.Context) {
 		Identifier   string `json:"identifier"`
 		Token        string `json:"token"`
 		RefreshToken string `json:"refreshToken"`
-		AccessToken  string `json:"accessToken"`
 	}
 	if !bindJSON(c, &req) {
 		return
@@ -697,6 +696,11 @@ func (a *App) adminSubmitSourceAccountToken(c *gin.Context) {
 		return
 	}
 	if err := a.submitCLIProxyManualToken(c.Request.Context(), source, req.Provider, req.Identifier, token); err != nil {
+		var validationErr *manualTokenValidationError
+		if errors.As(err, &validationErr) {
+			errorJSON(c, http.StatusBadRequest, err.Error())
+			return
+		}
 		errorJSON(c, http.StatusBadGateway, err.Error())
 		return
 	}
@@ -705,7 +709,6 @@ func (a *App) adminSubmitSourceAccountToken(c *gin.Context) {
 		errorJSON(c, http.StatusBadGateway, err.Error())
 		return
 	}
-	accounts = a.applyOpenAIPlanTypeFromAccessToken(c.Request.Context(), accounts, req.Provider, req.Identifier, req.AccessToken)
 	out := make([]SourceAccountDTO, 0, len(accounts))
 	for _, account := range accounts {
 		out = append(out, sourceAccountDTO(account))

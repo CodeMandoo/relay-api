@@ -63,7 +63,6 @@ export interface SourceAccount {
   provider: AccountProvider;
   authIndex?: string;
   planType?: string;
-  openaiPlanType: string;
   subscriptionPlan?: string;
   hasSubscription?: boolean;
   subscriptionExpiresAt?: string;

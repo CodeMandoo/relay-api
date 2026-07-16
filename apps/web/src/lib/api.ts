@@ -184,7 +184,7 @@ export const adminApi = {
       method: 'POST',
       body: jsonBody({ provider, redirectUrl }),
     }),
-  submitSourceAccountToken: (sourceId: string, payload: { provider: string; identifier: string; refreshToken: string; accessToken?: string }) =>
+  submitSourceAccountToken: (sourceId: string, payload: { provider: string; identifier: string; refreshToken: string }) =>
     apiRequest<ApiEnvelope<SourceAccount[]> & { ok: boolean }>(`/admin/sources/${sourceId}/accounts/token`, {
       method: 'POST',
       body: jsonBody(payload),
