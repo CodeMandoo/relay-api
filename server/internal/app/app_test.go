@@ -3879,3 +3879,48 @@ func TestHealthProbeRecordsFailureWithoutTrippingBreaker(t *testing.T) {
 		t.Fatalf("expected one failed probe log, got %+v", logs)
 	}
 }
+
+func TestAdminDeleteModelGroupCascadesModelsAndDisappears(t *testing.T) {
+	app := testApp(t)
+	source := UpstreamSource{Name: "GroupDelete_Source", Type: SourceTypeThirdParty, BaseURL: "https://group-delete.example/v1", APIKey: "key", Priority: 1, Status: SourceStatusOnline}
+	if err := app.db.Create(&source).Error; err != nil {
+		t.Fatalf("create source: %v", err)
+	}
+	group := ModelGroup{Name: "ToDelete_Group", Description: "will be deleted", DynamicRouting: true}
+	if err := app.db.Create(&group).Error; err != nil {
+		t.Fatalf("create group: %v", err)
+	}
+	if err := app.db.Create(&ModelConfig{ModelGroupID: group.ID, SourceID: source.ID, Name: "group-delete-model", DisplayName: "Group Delete Model", Provider: "OpenAI", Formats: ModelFormatOpenAI, Status: ModelStatusActive}).Error; err != nil {
+		t.Fatalf("create model: %v", err)
+	}
+
+	adminToken := loginToken(t, app, testAdminEmail, testAdminPassword, RoleAdmin)
+	w := performJSON(app, http.MethodDelete, "/api/admin/model-groups/"+id("mg", group.ID), adminToken, nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("delete group: %d %s", w.Code, w.Body.String())
+	}
+	body := decodeBody(t, w)
+	if deleted, _ := body["deletedModels"].(float64); deleted != 1 {
+		t.Fatalf("expected deletedModels=1, got %v", body)
+	}
+
+	// 分组不再出现在列表
+	w = performJSON(app, http.MethodGet, "/api/admin/model-groups", adminToken, nil)
+	rows := decodeBody(t, w)["data"].([]any)
+	for _, row := range rows {
+		item := row.(map[string]any)
+		if item["id"] == id("mg", group.ID) {
+			t.Fatalf("deleted group still listed: %v", item)
+		}
+	}
+
+	// 模型配置也被级联删除
+	w = performJSON(app, http.MethodGet, "/api/admin/models", adminToken, nil)
+	modelRows := decodeBody(t, w)["data"].([]any)
+	for _, row := range modelRows {
+		item := row.(map[string]any)
+		if item["name"] == "group-delete-model" {
+			t.Fatalf("deleted group model still listed: %v", item)
+		}
+	}
+}

@@ -308,7 +308,7 @@ export default function Page() {
         });
         setModels((current) => attachModelGroupIds(modelResponse.data, current));
         setSources(sourceResponse.data);
-        setModelGroupOptions(nextGroups.length ? nextGroups : INITIAL_MODEL_GROUPS);
+        setModelGroupOptions(nextGroups);
       })
       .catch((error) => toast.error(getErrorMessage(error, '加载模型配置失败')))
       .finally(() => setSyncing(false));
@@ -583,6 +583,8 @@ export default function Page() {
       setModelGroupOptions((current) => current.filter((item) => item.id !== group.id));
       setModels((current) => current.filter((model) => (model.modelGroupId ?? DEFAULT_MODEL_GROUP_ID) !== group.id));
       if (modelGroupFilter === group.id) setModelGroupFilter('all');
+      // 后端权威刷新，确保分组下拉、列表与统计与后端完全一致。
+      await reloadModels();
       toast.success('模型分组已删除', { description: group.name });
     } catch (error) {
       toast.error(getErrorMessage(error, '删除模型分组失败'));
