@@ -1,6 +1,6 @@
-import { Fragment, useEffect, useMemo, useState } from 'react';
+import { Fragment, useCallback, useEffect, useMemo, useState } from 'react';
 import { motion } from 'framer-motion';
-import { Bot, CheckCircle2, Copy, Loader2, RotateCcw, Search, Shuffle, Zap } from 'lucide-react';
+import { Bot, CheckCircle2, Copy, Loader2, RefreshCw, RotateCcw, Search, Shuffle, Zap } from 'lucide-react';
 import { toast } from 'sonner';
 import {
   Badge,
@@ -226,9 +226,10 @@ export default function Page() {
   const [latencyMap, setLatencyMap] = useState<Record<string, LatencyState>>({});
   const [invokeMap, setInvokeMap] = useState<Record<string, InvokeState>>({});
   const [refreshing, setRefreshing] = useState(false);
+  const [autoRefreshing, setAutoRefreshing] = useState(false);
 
-  useEffect(() => {
-    Promise.all([userApi.modelGroups(), userApi.models()])
+  const loadModels = useCallback(() => {
+    return Promise.all([userApi.modelGroups(), userApi.models()])
       .then(([groupResponse, modelResponse]) => {
         const groups = groupResponse.data.map(modelGroupFromDTO);
         const groupMap = new Map(groups.map((group) => [group.id, group]));
@@ -237,11 +238,45 @@ export default function Page() {
         setModelGroups(ensureGroupsForModels(groups, nextModels));
       })
       .catch((error) => {
-        setModels([]);
-        setModelGroups([]);
+        // 仅首次加载失败时提示；自动刷新失败静默，避免频繁打扰。
         toast.error(getErrorMessage(error, '加载可用模型失败'));
       });
   }, []);
+
+  useEffect(() => {
+    let initialLoadFailed = false;
+    const initialLoad = () => {
+      Promise.all([userApi.modelGroups(), userApi.models()])
+        .then(([groupResponse, modelResponse]) => {
+          const groups = groupResponse.data.map(modelGroupFromDTO);
+          const groupMap = new Map(groups.map((group) => [group.id, group]));
+          const nextModels = dedupeById(modelResponse.data.map((model) => normalizeBackendModel(model, groupMap)));
+          setModels(nextModels);
+          setModelGroups(ensureGroupsForModels(groups, nextModels));
+        })
+        .catch((error) => {
+          if (!initialLoadFailed) {
+            initialLoadFailed = true;
+            setModels([]);
+            setModelGroups([]);
+            toast.error(getErrorMessage(error, '加载可用模型失败'));
+          }
+        });
+    };
+    initialLoad();
+    // 自动刷新实时状态（检测结果/转发延迟由后端更新）
+    const timer = setInterval(loadModels, 30_000);
+    return () => clearInterval(timer);
+  }, [loadModels]);
+
+  const refreshModels = async () => {
+    setAutoRefreshing(true);
+    try {
+      await loadModels();
+    } finally {
+      setAutoRefreshing(false);
+    }
+  };
 
   const filtered = useMemo(() => {
     const keyword = query.trim().toLowerCase();
@@ -355,6 +390,10 @@ export default function Page() {
                 className="h-10 w-72 rounded-xl pl-9"
               />
             </div>
+            <Button size="lg" variant="outline" className="rounded-xl font-bold" onClick={refreshModels} disabled={autoRefreshing}>
+              {autoRefreshing ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <RefreshCw className="mr-2 h-4 w-4" />}
+              刷新
+            </Button>
             <Button size="lg" className="rounded-xl font-bold" onClick={refreshAll} disabled={refreshing}>
               {refreshing ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <RotateCcw className="mr-2 h-4 w-4" />}
               一键测速

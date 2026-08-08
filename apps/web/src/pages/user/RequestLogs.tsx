@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { motion } from 'framer-motion';
 import { toast } from 'sonner';
 import {
@@ -12,6 +12,7 @@ import {
   Hash,
   KeyRound,
   Loader2,
+  RefreshCw,
   Search,
   ScrollText,
   TerminalSquare,
@@ -119,6 +120,19 @@ export default function Page() {
   const [attemptsByLog, setAttemptsByLog] = useState<Record<string, RequestAttemptLog[]>>({});
   const [attemptsLoading, setAttemptsLoading] = useState<Record<string, boolean>>({});
   const [loading, setLoading] = useState(true);
+  const [manualRefreshing, setManualRefreshing] = useState(false);
+
+  const refreshLogs = async () => {
+    setManualRefreshing(true);
+    try {
+      await loadLogs();
+      toast.success('请求日志已刷新');
+    } catch (error) {
+      toast.error(getErrorMessage(error, '刷新请求日志失败'));
+    } finally {
+      setManualRefreshing(false);
+    }
+  };
 
   useEffect(() => {
     userApi
@@ -127,9 +141,8 @@ export default function Page() {
       .catch((error) => toast.error(getErrorMessage(error, '加载 API Key 失败')));
   }, []);
 
-  useEffect(() => {
-    setLoading(true);
-    userApi
+  const loadLogs = useCallback(() => {
+    return userApi
       .logs({
         status,
         model,
@@ -142,10 +155,23 @@ export default function Page() {
       .then((response) => {
         setLogs(response.data);
         setPagination(response.pagination);
-      })
+      });
+  }, [apiKey, model, page, pageSize, query, range, status]);
+
+  useEffect(() => {
+    setLoading(true);
+    loadLogs()
       .catch((error) => toast.error(getErrorMessage(error, '加载请求日志失败')))
       .finally(() => setLoading(false));
-  }, [apiKey, model, page, pageSize, query, range, status]);
+  }, [loadLogs]);
+
+  // 自动刷新请求日志（静默失败，不打扰用户）
+  useEffect(() => {
+    const timer = setInterval(() => {
+      loadLogs().catch(() => undefined);
+    }, 30_000);
+    return () => clearInterval(timer);
+  }, [loadLogs]);
 
   const models = useMemo(() => Array.from(new Set(logs.map((log) => log.model).filter(Boolean))).sort(), [logs]);
 
@@ -200,10 +226,16 @@ export default function Page() {
         title="请求日志"
         description="按请求查看模型调用、Token 明细、成本、延迟和结果状态。"
         actions={
-          <Button variant="outline" onClick={reset}>
-            <FilterX className="mr-2 h-4 w-4" />
-            重置筛选
-          </Button>
+          <div className="flex items-center gap-2">
+            <Button variant="outline" onClick={refreshLogs} disabled={manualRefreshing}>
+              {manualRefreshing ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <RefreshCw className="mr-2 h-4 w-4" />}
+              刷新
+            </Button>
+            <Button variant="outline" onClick={reset}>
+              <FilterX className="mr-2 h-4 w-4" />
+              重置筛选
+            </Button>
+          </div>
         }
       />
 
