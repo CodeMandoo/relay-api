@@ -272,6 +272,7 @@ export default function Page() {
   const [modelGroupOptions, setModelGroupOptions] = useState<ModelGroupDefinition[]>(INITIAL_MODEL_GROUPS);
   const [groupEditorOpen, setGroupEditorOpen] = useState(false);
   const [editingModelGroup, setEditingModelGroup] = useState<ModelGroupDefinition | null>(null);
+  const [pendingDeleteGroup, setPendingDeleteGroup] = useState<ModelGroupDefinition | null>(null);
   const [groupNameDraft, setGroupNameDraft] = useState('');
   const [groupDescriptionDraft, setGroupDescriptionDraft] = useState('');
   const [groupDynamicRouting, setGroupDynamicRouting] = useState(true);
@@ -981,7 +982,7 @@ export default function Page() {
           <DialogFooter>
             {editingModelGroup && !editingModelGroup.locked && (
               <Button variant="ghost" className="mr-auto text-destructive hover:text-destructive" onClick={() => {
-                deleteModelGroupDefinition(editingModelGroup);
+                setPendingDeleteGroup(editingModelGroup);
                 setGroupEditorOpen(false);
               }}>
                 删除分组
@@ -992,6 +993,39 @@ export default function Page() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      <AlertDialog open={Boolean(pendingDeleteGroup)} onOpenChange={(open) => !open && setPendingDeleteGroup(null)}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>确认删除当前分组？</AlertDialogTitle>
+            <AlertDialogDescription>
+              <span>删除分组</span>
+              <span className="font-semibold text-foreground">{pendingDeleteGroup?.name}</span>
+              <span>后不可恢复。</span>
+              {pendingDeleteGroup &&
+                modelGroups.filter((model) => (model.modelGroupId ?? DEFAULT_MODEL_GROUP_ID) === pendingDeleteGroup.id).length > 0 && (
+                  <span className="mt-2 block text-xs font-semibold text-amber-600">
+                    当前分组下存在{' '}
+                    {modelGroups.filter((model) => (model.modelGroupId ?? DEFAULT_MODEL_GROUP_ID) === pendingDeleteGroup.id).length}{' '}
+                    个模型配置，会一起删除。
+                  </span>
+                )}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>取消</AlertDialogCancel>
+            <AlertDialogAction
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+              onClick={() => {
+                if (pendingDeleteGroup) deleteModelGroupDefinition(pendingDeleteGroup);
+                setPendingDeleteGroup(null);
+              }}
+            >
+              确认删除
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
 
       <AlertDialog open={Boolean(pendingGroupUpdate)} onOpenChange={(open) => !open && setPendingGroupUpdate(null)}>
         <AlertDialogContent>

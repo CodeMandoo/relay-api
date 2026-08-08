@@ -380,20 +380,21 @@ func (a *App) adminDeleteModelGroup(c *gin.Context) {
 		errorJSON(c, http.StatusBadRequest, "default model group cannot be deleted")
 		return
 	}
-	var modelCount int64
-	if err := a.db.Model(&ModelConfig{}).Where("model_group_id = ?", group.ID).Count(&modelCount).Error; err != nil {
+	// 同步删除该分组下的模型配置及路由绑定。
+	var modelIDs []uint
+	if err := a.db.Model(&ModelConfig{}).Where("model_group_id = ?", group.ID).Pluck("id", &modelIDs).Error; err != nil {
 		errorJSON(c, http.StatusInternalServerError, "database error")
 		return
 	}
-	if modelCount > 0 {
-		errorJSON(c, http.StatusBadRequest, "model group is not empty")
-		return
+	if len(modelIDs) > 0 {
+		_ = a.db.Where("model_id IN ?", modelIDs).Delete(&ModelRouteBinding{}).Error
+		_ = a.db.Where("model_group_id = ?", group.ID).Delete(&ModelConfig{}).Error
 	}
 	if err := a.db.Delete(&group).Error; err != nil {
 		errorJSON(c, http.StatusBadRequest, "delete model group failed")
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"ok": true})
+	c.JSON(http.StatusOK, gin.H{"ok": true, "deletedModels": len(modelIDs)})
 }
 
 func (a *App) userModelGroups(c *gin.Context) {

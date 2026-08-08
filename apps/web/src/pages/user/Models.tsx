@@ -139,7 +139,7 @@ function ProbeBars({ history, lastProbeAt }: { history?: { success: boolean; at:
           <span
             key={i}
             className={cn(
-              'h-4 w-1 shrink-0 rounded-[1px]',
+              'h-4 w-1 shrink-0 rounded-full',
               item === undefined ? 'bg-muted/60' : item.success ? 'bg-emerald-500' : 'bg-destructive',
             )}
             title={item ? `${item.success ? '成功' : '失败'} · ${new Date(item.at).toLocaleString()}` : '暂无记录'}
@@ -410,7 +410,6 @@ export default function Page() {
               <TableHead className="w-[30%] py-4">模型节点</TableHead>
               <TableHead>协议格式</TableHead>
               <TableHead>实时状态</TableHead>
-              <TableHead>检测状态</TableHead>
               <TableHead>转发延迟</TableHead>
               <TableHead className="w-[180px] pr-6 text-right">操作</TableHead>
             </TableRow>
@@ -419,7 +418,7 @@ export default function Page() {
             {displaySections.map((section, sectionIndex) => (
               <Fragment key={section.group.id}>
                 <TableRow className="border-b bg-muted/25 hover:bg-muted/25">
-                  <TableCell colSpan={6} className="px-4 py-2">
+                  <TableCell colSpan={5} className="px-4 py-2">
                     <div className="flex flex-wrap items-center justify-between gap-3">
                       <div className="flex min-w-0 items-center gap-2 text-xs text-muted-foreground">
                         <span className="font-semibold text-foreground">{section.group.name}</span>
@@ -515,18 +514,6 @@ export default function Page() {
                         </div>
                       </TableCell>
                       <TableCell>
-                        <span
-                          className={cn(
-                            'rounded-full border px-2 py-0.5 text-xs font-bold uppercase tracking-widest',
-                            isOffline
-                              ? 'border-destructive/20 bg-destructive/5 text-destructive'
-                              : 'border-emerald-500/20 bg-emerald-500/5 text-emerald-500',
-                          )}
-                        >
-                          {isOffline ? 'Offline' : 'Online'}
-                        </span>
-                      </TableCell>
-                      <TableCell>
                         <ProbeBars history={model.probeHistory} lastProbeAt={model.lastProbeAt} />
                       </TableCell>
                       <TableCell>
@@ -577,7 +564,7 @@ export default function Page() {
             ))}
             {displaySections.length === 0 && (
               <TableRow>
-                <TableCell colSpan={6} className="h-32 text-center text-muted-foreground">
+                <TableCell colSpan={5} className="h-32 text-center text-muted-foreground">
                   未匹配到相关模型节点
                 </TableCell>
               </TableRow>

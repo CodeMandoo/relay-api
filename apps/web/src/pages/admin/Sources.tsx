@@ -626,10 +626,10 @@ export default function Page() {
             </div>
 
             <div className="overflow-hidden rounded-lg border">
-              <div className="grid grid-cols-[1fr_1.4fr_130px_88px_112px] gap-3 border-b bg-muted/35 px-3 py-2 text-xs font-semibold text-muted-foreground">
+              <div className="grid grid-cols-[1fr_1.4fr_130px_56px_112px] gap-3 border-b bg-muted/35 px-3 py-2 text-xs font-semibold text-muted-foreground">
                 <span>别名</span>
                 <span>Key</span>
-                <span>请求状态</span>
+                <span>实时状态</span>
                 <span>状态</span>
                 <span className="text-right">操作</span>
               </div>
@@ -641,12 +641,12 @@ export default function Page() {
                 sourceKeys.map((item) => {
                   const isDefault = item.id === 'sk_default';
                   return (
-                    <div key={item.id} className="grid grid-cols-[1fr_1.4fr_130px_88px_112px] items-center gap-3 border-b px-3 py-2 last:border-b-0">
+                    <div key={item.id} className="grid grid-cols-[1fr_1.4fr_130px_56px_112px] items-center gap-3 border-b px-3 py-2 last:border-b-0">
                       <div className="min-w-0">
                         <div className="flex items-center gap-1.5">
-                          <span className="truncate text-sm font-semibold">{item.alias}</span>
+                          <span className="min-w-0 truncate text-sm font-semibold">{item.alias}</span>
                           {isDefault && (
-                            <span className="rounded border-amber-500/30 bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-bold text-amber-600">默认</span>
+                            <span className="shrink-0 whitespace-nowrap rounded border-amber-500/30 bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-bold text-amber-600">默认</span>
                           )}
                         </div>
                         <div className="text-[11px] text-muted-foreground">
@@ -662,7 +662,7 @@ export default function Page() {
                               <span
                                 key={i}
                                 className={cn(
-                                  'h-3.5 w-1 shrink-0 rounded-[1px]',
+                                  'h-3.5 w-1 shrink-0 rounded-full',
                                   state === undefined ? 'bg-muted/60' : state ? 'bg-emerald-500' : 'bg-destructive',
                                 )}
                                 title={state === undefined ? '暂无请求' : `${state ? '成功' : '失败'} · 最近 ${i + 1} 次`}
