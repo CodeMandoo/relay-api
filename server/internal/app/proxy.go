@@ -823,15 +823,10 @@ func (a *App) recordUsage(c *gin.Context, user User, key APIKey, target routeTar
 	if cost > 0 {
 		_ = a.db.Model(&User{}).Where("id = ?", user.ID).Update("balance", gorm.Expr("balance - ?", cost)).Error
 	}
-	if target.Source.ID != 0 && latency > 0 {
-		updates := map[string]any{"latency_ms": int(latency)}
+	if target.Source.ID != 0 {
+		// 转发延迟（latency_ms）只由测速接口更新，真实请求耗时含模型执行时间，不覆盖。
 		if status == RequestStatusSuccess && target.Source.Status != SourceStatusDisabled {
-			updates["status"] = SourceStatusOnline
-		}
-		_ = a.db.Model(&UpstreamSource{}).Where("id = ?", target.Source.ID).Updates(updates).Error
-		_ = a.db.Model(&ModelConfig{}).Where("id = ?", target.Model.ID).Update("latency_ms", int(latency)).Error
-		if target.Binding.ID != 0 {
-			_ = a.db.Model(&ModelRouteBinding{}).Where("id = ?", target.Binding.ID).Update("latency_ms", int(latency)).Error
+			_ = a.db.Model(&UpstreamSource{}).Where("id = ?", target.Source.ID).Update("status", SourceStatusOnline).Error
 		}
 	}
 	if target.SourceKey != nil && target.SourceKey.ID != 0 {

@@ -290,12 +290,11 @@ export default function Page() {
     setInvokeMap((prev) => ({ ...prev, [model.id]: 'loading' }));
     try {
       const response = await userApi.invokeTestModel(model.id);
-      const { latencyMs, totalTokens } = response.data;
+      const { totalTokens } = response.data;
       setInvokeMap((prev) => ({ ...prev, [model.id]: 'success' }));
-      setLatencyMap((prev) => ({ ...prev, [model.id]: latencyMs }));
-      setModels((prev) => prev.map((item) => (item.id === model.id ? { ...item, latencyMs, status: 'online' } : item)));
+      // 转发延迟只由测速更新，调用耗时含模型执行时间，不覆盖显示。
       toast.success(`${model.name} 调用测试通过`, {
-        description: `真实模型响应: ${latencyMs}ms · 消耗 ${compactTokens(totalTokens)} tokens`,
+        description: `真实模型响应: ${response.data.latencyMs}ms · 消耗 ${compactTokens(totalTokens)} tokens`,
       });
     } catch (error) {
       setInvokeMap((prev) => ({ ...prev, [model.id]: 'error' }));

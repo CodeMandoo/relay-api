@@ -393,8 +393,8 @@ func (a *App) userInvokeTestModel(c *gin.Context) {
 		return
 	}
 	usage := extractUsage(responseBody)
-	_ = a.db.Model(&target.Model).Update("latency_ms", latency).Error
-	_ = a.db.Model(&target.Source).Updates(map[string]any{"latency_ms": latency, "status": SourceStatusOnline}).Error
+	// 转发延迟只由测速接口更新，调用耗时含模型执行时间，不覆盖。
+	_ = a.db.Model(&target.Source).Updates(map[string]any{"status": SourceStatusOnline}).Error
 	if target.SourceKey != nil {
 		_ = a.db.Model(&SourceKey{}).Where("id = ?", target.SourceKey.ID).Update("last_used_at", time.Now()).Error
 	}
@@ -448,7 +448,7 @@ func modelInvokeTestPayload(protocol relayProtocol, modelName string) (string, [
 			"model":      modelName,
 			"max_tokens": 1,
 			"messages": []any{
-				map[string]any{"role": "user", "content": "Reply with ok."},
+				map[string]any{"role": "user", "content": "hi"},
 			},
 		}
 	case relayProtocolGemini:
@@ -456,7 +456,7 @@ func modelInvokeTestPayload(protocol relayProtocol, modelName string) (string, [
 		path = "/v1beta/models/" + url.PathEscape(geminiName) + ":generateContent"
 		payload = map[string]any{
 			"contents": []any{
-				map[string]any{"role": "user", "parts": []any{map[string]any{"text": "Reply with ok."}}},
+				map[string]any{"role": "user", "parts": []any{map[string]any{"text": "hi"}}},
 			},
 			"generationConfig": map[string]any{
 				"maxOutputTokens": 1,
@@ -470,7 +470,7 @@ func modelInvokeTestPayload(protocol relayProtocol, modelName string) (string, [
 			"max_tokens":  1,
 			"temperature": 0,
 			"messages": []any{
-				map[string]any{"role": "user", "content": "Reply with ok."},
+				map[string]any{"role": "user", "content": "hi"},
 			},
 		}
 	}
