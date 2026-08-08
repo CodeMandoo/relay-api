@@ -85,6 +85,9 @@ type ModelGroupDefinition = {
   name: string;
   description: string;
   bindings: GroupBindingConfig[];
+  dynamicRouting?: boolean;
+  fixedSourceId?: string;
+  fixedSourceKeyId?: string;
   locked?: boolean;
 };
 
@@ -185,6 +188,9 @@ const modelGroupStyle = (groupId: string) => MODEL_GROUP_STYLES[groupId] ?? fall
 const modelGroupDefinitionFromDTO = (group: ModelAccessGroup): ModelGroupDefinition => ({
   id: group.id,
   name: group.name,
+  dynamicRouting: group.dynamicRouting !== false,
+  fixedSourceId: group.fixedSourceId,
+  fixedSourceKeyId: group.fixedSourceKeyId,
   description: group.description ?? '模型分组',
   locked: group.isDefault,
   bindings: (group.bindings ?? []).map((binding) => ({
@@ -266,8 +272,12 @@ export default function Page() {
   const [modelGroupOptions, setModelGroupOptions] = useState<ModelGroupDefinition[]>(INITIAL_MODEL_GROUPS);
   const [groupEditorOpen, setGroupEditorOpen] = useState(false);
   const [editingModelGroup, setEditingModelGroup] = useState<ModelGroupDefinition | null>(null);
+  const [pendingDeleteGroup, setPendingDeleteGroup] = useState<ModelGroupDefinition | null>(null);
   const [groupNameDraft, setGroupNameDraft] = useState('');
   const [groupDescriptionDraft, setGroupDescriptionDraft] = useState('');
+  const [groupDynamicRouting, setGroupDynamicRouting] = useState(true);
+  const [groupFixedSourceId, setGroupFixedSourceId] = useState('');
+  const [groupFixedSourceKeyId, setGroupFixedSourceKeyId] = useState('default');
   const [groupBindings, setGroupBindings] = useState<ModelBindingDraft[]>([]);
   const [pendingGroupUpdate, setPendingGroupUpdate] = useState<{ groupId: string; groupName: string; bindings: GroupBindingConfig[] } | null>(null);
   const [selected, setSelected] = useState<Set<string>>(new Set());
@@ -386,6 +396,25 @@ export default function Page() {
     return [makeBindingDraft(sources[0]?.id ?? '')];
   };
 
+  const defaultFixedBinding = (bindings: ModelBindingDraft[]) =>
+    [...bindings]
+      .filter((binding) => binding.sourceId)
+      .sort((left, right) => {
+        const leftSource = sources.find((source) => source.id === left.sourceId);
+        const rightSource = sources.find((source) => source.id === right.sourceId);
+        const priorityDiff = (leftSource?.priority ?? Number.MAX_SAFE_INTEGER) - (rightSource?.priority ?? Number.MAX_SAFE_INTEGER);
+        if (priorityDiff !== 0) return priorityDiff;
+        return left.sourceId.localeCompare(right.sourceId);
+      })[0];
+
+  useEffect(() => {
+    if (!groupEditorOpen || groupDynamicRouting || groupFixedSourceId) return;
+    const binding = defaultFixedBinding(groupBindings);
+    if (!binding) return;
+    setGroupFixedSourceId(binding.sourceId);
+    setGroupFixedSourceKeyId(binding.sourceKeyId || 'default');
+  }, [groupEditorOpen, groupDynamicRouting, groupFixedSourceId, groupBindings, sources]);
+
   const serializeBindingDrafts = (bindings: ModelBindingDraft[]): GroupBindingConfig[] =>
     bindings
       .filter((binding) => binding.sourceId)
@@ -449,6 +478,9 @@ export default function Page() {
     setEditingModelGroup(null);
     setGroupNameDraft('');
     setGroupDescriptionDraft('');
+    setGroupDynamicRouting(true);
+    setGroupFixedSourceId('');
+    setGroupFixedSourceKeyId('default');
     setGroupBindings(groupBindingDrafts(null));
     setGroupEditorOpen(true);
   };
@@ -457,6 +489,9 @@ export default function Page() {
     setEditingModelGroup(group);
     setGroupNameDraft(group.name);
     setGroupDescriptionDraft(group.description);
+    setGroupDynamicRouting(group.dynamicRouting !== false);
+    setGroupFixedSourceId(group.fixedSourceId ?? '');
+    setGroupFixedSourceKeyId(group.fixedSourceKeyId ?? 'default');
     setGroupBindings(groupBindingDrafts(group));
     setGroupEditorOpen(true);
   };
@@ -472,6 +507,10 @@ export default function Page() {
       toast.error('请至少选择一个上游源');
       return;
     }
+    if (!groupDynamicRouting && !groupFixedSourceId) {
+      toast.error('请选择固定使用的模型');
+      return;
+    }
     if (editingModelGroup) {
       const upstreamChanged = bindingsChanged(editingModelGroup.bindings, bindings);
       try {
@@ -479,6 +518,9 @@ export default function Page() {
           name,
           description: groupDescriptionDraft.trim() || editingModelGroup.description,
           bindings,
+          dynamicRouting: groupDynamicRouting,
+          fixedSourceId: groupDynamicRouting ? undefined : groupFixedSourceId,
+          fixedSourceKeyId: groupDynamicRouting ? undefined : groupFixedSourceKeyId,
         });
         setModelGroupOptions((current) =>
           current.map((group) =>
@@ -488,6 +530,9 @@ export default function Page() {
                   name: response.data.name,
                   description: response.data.description ?? group.description,
                   bindings,
+                  dynamicRouting: response.data.dynamicRouting,
+                  fixedSourceId: response.data.fixedSourceId,
+                  fixedSourceKeyId: response.data.fixedSourceKeyId,
                 }
               : group,
           ),
@@ -506,6 +551,9 @@ export default function Page() {
           name,
           description: groupDescriptionDraft.trim() || '自定义模型分组',
           bindings,
+          dynamicRouting: groupDynamicRouting,
+          fixedSourceId: groupDynamicRouting ? undefined : groupFixedSourceId,
+          fixedSourceKeyId: groupDynamicRouting ? undefined : groupFixedSourceKeyId,
         });
         const nextGroup = { ...modelGroupDefinitionFromDTO(response.data), bindings };
         setModelGroupOptions((current) => [...current, nextGroup]);
@@ -898,11 +946,43 @@ export default function Page() {
               <Label>默认上游源配置</Label>
               {renderBindingFields(groupBindings, updateGroupBinding, addGroupBinding, removeGroupBinding)}
             </div>
+            <div className="flex items-center justify-between rounded-lg border p-3">
+              <div>
+                <Label>动态调用</Label>
+                <div className="text-xs text-muted-foreground">关闭后固定使用指定上游，目标不可用时直接报错。</div>
+              </div>
+              <Switch checked={groupDynamicRouting} onCheckedChange={setGroupDynamicRouting} />
+            </div>
+            {!groupDynamicRouting && (
+              <div className="grid gap-2 rounded-lg border p-3">
+                <Label>固定使用的模型</Label>
+                <Select
+                  value={groupFixedSourceId ? `${groupFixedSourceId}|${groupFixedSourceKeyId}` : ''}
+                  onValueChange={(value) => {
+                    const binding = groupBindings.find((item) => `${item.sourceId}|${item.sourceKeyId || 'default'}` === value);
+                    if (!binding) return;
+                    setGroupFixedSourceId(binding.sourceId);
+                    setGroupFixedSourceKeyId(binding.sourceKeyId || 'default');
+                  }}
+                >
+                  <SelectTrigger><SelectValue placeholder="选择固定上游" /></SelectTrigger>
+                  <SelectContent>
+                    {groupBindings.filter((binding) => binding.sourceId).map((binding) => {
+                      const source = sources.find((item) => item.id === binding.sourceId);
+                      const sourceKey = sourceKeysBySource[binding.sourceId]?.find((item) => item.id === binding.sourceKeyId);
+                      const label = binding.sourceKeyId && binding.sourceKeyId !== 'default' ? `${source?.name ?? binding.sourceId} · ${sourceKey?.alias ?? binding.sourceKeyId}` : (source?.name ?? binding.sourceId);
+                      return <SelectItem key={`${binding.sourceId}|${binding.sourceKeyId || 'default'}`} value={`${binding.sourceId}|${binding.sourceKeyId || 'default'}`}>{label}</SelectItem>;
+                    })}
+                  </SelectContent>
+                </Select>
+                <div className="text-xs text-muted-foreground">默认应选择优先级最高的上游；可手动切换。</div>
+              </div>
+            )}
           </div>
           <DialogFooter>
             {editingModelGroup && !editingModelGroup.locked && (
               <Button variant="ghost" className="mr-auto text-destructive hover:text-destructive" onClick={() => {
-                deleteModelGroupDefinition(editingModelGroup);
+                setPendingDeleteGroup(editingModelGroup);
                 setGroupEditorOpen(false);
               }}>
                 删除分组
@@ -913,6 +993,39 @@ export default function Page() {
           </DialogFooter>
         </DialogContent>
       </Dialog>
+
+      <AlertDialog open={Boolean(pendingDeleteGroup)} onOpenChange={(open) => !open && setPendingDeleteGroup(null)}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>确认删除当前分组？</AlertDialogTitle>
+            <AlertDialogDescription>
+              <span>删除分组</span>
+              <span className="font-semibold text-foreground">{pendingDeleteGroup?.name}</span>
+              <span>后不可恢复。</span>
+              {pendingDeleteGroup &&
+                modelGroups.filter((model) => (model.modelGroupId ?? DEFAULT_MODEL_GROUP_ID) === pendingDeleteGroup.id).length > 0 && (
+                  <span className="mt-2 block text-xs font-semibold text-amber-600">
+                    当前分组下存在{' '}
+                    {modelGroups.filter((model) => (model.modelGroupId ?? DEFAULT_MODEL_GROUP_ID) === pendingDeleteGroup.id).length}{' '}
+                    个模型配置，会一起删除。
+                  </span>
+                )}
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>取消</AlertDialogCancel>
+            <AlertDialogAction
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+              onClick={() => {
+                if (pendingDeleteGroup) deleteModelGroupDefinition(pendingDeleteGroup);
+                setPendingDeleteGroup(null);
+              }}
+            >
+              确认删除
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
 
       <AlertDialog open={Boolean(pendingGroupUpdate)} onOpenChange={(open) => !open && setPendingGroupUpdate(null)}>
         <AlertDialogContent>

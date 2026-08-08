@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -72,7 +73,7 @@ func (a *App) openAIModels(c *gin.Context) {
 	data := make([]gin.H, 0, len(models))
 	seen := map[string]bool{}
 	for _, model := range models {
-		if !modelSupportsRelayProtocol(model, relayProtocolOpenAI) {
+		if !a.modelProtocolAllowed(model, relayProtocolOpenAI) {
 			continue
 		}
 		if seen[model.Name] {
@@ -107,7 +108,7 @@ func (a *App) openAIModel(c *gin.Context) {
 		errorJSON(c, http.StatusNotFound, "model not found")
 		return
 	}
-	if !modelSupportsRelayProtocol(model, relayProtocolOpenAI) {
+	if !a.modelProtocolAllowed(model, relayProtocolOpenAI) {
 		errorJSON(c, http.StatusNotFound, "model not found")
 		return
 	}
@@ -115,23 +116,23 @@ func (a *App) openAIModel(c *gin.Context) {
 }
 
 func (a *App) proxyChatCompletions(c *gin.Context) {
-	a.proxyJSONBody(c, relayProtocolOpenAI, "/v1/chat/completions")
+	a.proxyJSONBody(c, relayProtocolOpenAI, "/v1/chat/completions", true)
 }
 
 func (a *App) proxyCompletions(c *gin.Context) {
-	a.proxyJSONBody(c, relayProtocolOpenAI, "/v1/completions")
+	a.proxyJSONBody(c, relayProtocolOpenAI, "/v1/completions", false)
 }
 
 func (a *App) proxyResponses(c *gin.Context) {
-	a.proxyJSONBody(c, relayProtocolOpenAI, "/v1/responses")
+	a.proxyJSONBody(c, relayProtocolOpenAI, "/v1/responses", true)
 }
 
 func (a *App) proxyAnthropicMessages(c *gin.Context) {
-	a.proxyJSONBody(c, relayProtocolAnthropic, requestPathWithQuery(c, "/v1/messages"))
+	a.proxyJSONBody(c, relayProtocolAnthropic, requestPathWithQuery(c, "/v1/messages"), true)
 }
 
 func (a *App) proxyAnthropicCountTokens(c *gin.Context) {
-	a.proxyJSONBody(c, relayProtocolAnthropic, requestPathWithQuery(c, "/v1/messages/count_tokens"))
+	a.proxyJSONBody(c, relayProtocolAnthropic, requestPathWithQuery(c, "/v1/messages/count_tokens"), false)
 }
 
 func (a *App) proxyGeminiGenerate(c *gin.Context) {
@@ -146,7 +147,7 @@ func (a *App) proxyGeminiGenerate(c *gin.Context) {
 		return
 	}
 	stream := strings.Contains(strings.ToLower(c.Request.URL.Path), ":stream")
-	a.proxyUpstream(c, relayProtocolGemini, requestPathWithQuery(c, c.Request.URL.Path), body, modelName, stream)
+	a.proxyUpstream(c, relayProtocolGemini, requestPathWithQuery(c, c.Request.URL.Path), body, modelName, stream, false)
 }
 
 func (a *App) geminiModels(c *gin.Context) {
@@ -183,7 +184,7 @@ func (a *App) geminiModels(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"models": out})
 }
 
-func (a *App) proxyJSONBody(c *gin.Context, protocol relayProtocol, upstreamPath string) {
+func (a *App) proxyJSONBody(c *gin.Context, protocol relayProtocol, upstreamPath string, allowConversion bool) {
 	body, err := readLimitedBody(c.Request.Body, 16<<20)
 	if err != nil {
 		errorJSON(c, http.StatusBadRequest, "read request failed")
@@ -195,10 +196,10 @@ func (a *App) proxyJSONBody(c *gin.Context, protocol relayProtocol, upstreamPath
 		errorJSON(c, http.StatusBadRequest, "model is required")
 		return
 	}
-	a.proxyUpstream(c, protocol, upstreamPath, body, modelName, getBool(payload, "stream"))
+	a.proxyUpstream(c, protocol, upstreamPath, body, modelName, getBool(payload, "stream"), allowConversion)
 }
 
-func (a *App) proxyUpstream(c *gin.Context, protocol relayProtocol, upstreamPath string, body []byte, modelName string, stream bool) {
+func (a *App) proxyUpstream(c *gin.Context, protocol relayProtocol, upstreamPath string, body []byte, modelName string, stream bool, allowConversion bool) {
 	user, key, ok := currentAPIIdentity(c)
 	if !ok {
 		errorJSON(c, http.StatusUnauthorized, "invalid api key")
@@ -213,7 +214,7 @@ func (a *App) proxyUpstream(c *gin.Context, protocol relayProtocol, upstreamPath
 	if !ok {
 		return
 	}
-	targets, err := a.routeTargets(modelName, protocol, modelGroupID)
+	targets, err := a.scheduledRouteTargets(modelName, protocol, allowConversion, modelGroupID)
 	if err != nil {
 		a.recordUsage(c, user, key, routeTarget{Model: ModelConfig{Name: modelName}}, usageTokens{}, http.StatusBadGateway, RequestStatusError, err.Error(), body, nil, 0, usageRecordMeta{RequestID: requestID, Protocol: protocol, Path: upstreamPath, Stream: stream})
 		errorJSON(c, http.StatusBadGateway, err.Error())
@@ -221,6 +222,10 @@ func (a *App) proxyUpstream(c *gin.Context, protocol relayProtocol, upstreamPath
 	}
 	settings, _ := a.getSettings()
 	attempts := settings.MaxRetries
+	group, _ := a.modelGroupForRouting(modelGroupID)
+	if !group.DynamicRouting {
+		attempts = 1
+	}
 	if attempts <= 0 {
 		attempts = 1
 	}
@@ -232,15 +237,36 @@ func (a *App) proxyUpstream(c *gin.Context, protocol relayProtocol, upstreamPath
 	attemptRows := make([]RequestAttempt, 0, attempts)
 	for attempt := 0; attempt < attempts; attempt++ {
 		target := targets[attempt]
+		// Resolve the protocol the upstream actually speaks; when it differs
+		// from the client protocol, convert the request on the way out and
+		// the response on the way back.
+		targetProtocol := protocol
+		targetPath := upstreamPath
+		targetBody := body
+		converted := false
+		if allowConversion && a.protocolConversionEnabled() {
+			if native := modelNativeProtocol(target.Model, protocol); native != protocol {
+				convertedBody, convErr := convertRequestBody(protocol, native, body, upstreamPath)
+				if convErr != nil {
+					lastErr = convErr
+					attemptRows = append(attemptRows, requestAttemptRow(requestID, attempt+1, target, native, targetPath, http.StatusBadRequest, RequestStatusError, convErr.Error(), 0, time.Now(), time.Now()))
+					continue
+				}
+				targetProtocol = native
+				targetPath = convertedUpstreamPathForTarget(target, native)
+				targetBody = convertedBody
+				converted = true
+			}
+		}
 		start := time.Now()
-		resp, err := a.callUpstream(c, target, protocol, upstreamPath, body, stream)
+		resp, err := a.callUpstream(c, target, targetProtocol, targetPath, targetBody, stream)
 		ended := time.Now()
 		latency := ended.Sub(start).Milliseconds()
 		if err != nil {
 			lastErr = err
 			statusCode := upstreamRequestErrorStatus(c, err)
 			lastStatus = statusCode
-			attemptRows = append(attemptRows, requestAttemptRow(requestID, attempt+1, target, protocol, upstreamPath, statusCode, RequestStatusError, err.Error(), latency, start, ended))
+			attemptRows = append(attemptRows, requestAttemptRow(requestID, attempt+1, target, targetProtocol, targetPath, statusCode, RequestStatusError, err.Error(), latency, start, ended))
 			if statusCode == 499 {
 				a.recordUsage(c, user, key, target, usageTokens{}, statusCode, RequestStatusError, err.Error(), body, nil, latency, usageRecordMeta{RequestID: requestID, Protocol: protocol, Path: upstreamPath, Stream: stream, Attempts: attemptRows})
 				return
@@ -253,7 +279,7 @@ func (a *App) proxyUpstream(c *gin.Context, protocol relayProtocol, upstreamPath
 			_ = resp.Body.Close()
 			lastErr = errors.New(resp.Status)
 			lastStatus = resp.StatusCode
-			attemptRows = append(attemptRows, requestAttemptRow(requestID, attempt+1, target, protocol, upstreamPath, resp.StatusCode, RequestStatusError, resp.Status, latency, start, ended))
+			attemptRows = append(attemptRows, requestAttemptRow(requestID, attempt+1, target, targetProtocol, targetPath, resp.StatusCode, RequestStatusError, resp.Status, latency, start, ended))
 			a.markTargetFailure(target, resp.StatusCode)
 			continue
 		}
@@ -263,10 +289,21 @@ func (a *App) proxyUpstream(c *gin.Context, protocol relayProtocol, upstreamPath
 			status = RequestStatusError
 			errMsg = resp.Status
 		}
-		attemptRows = append(attemptRows, requestAttemptRow(requestID, attempt+1, target, protocol, upstreamPath, resp.StatusCode, status, errMsg, latency, start, ended))
+		attemptRows = append(attemptRows, requestAttemptRow(requestID, attempt+1, target, targetProtocol, targetPath, resp.StatusCode, status, errMsg, latency, start, ended))
 		a.markTargetResult(target, resp.StatusCode)
 		meta := usageRecordMeta{RequestID: requestID, Protocol: protocol, Path: upstreamPath, Stream: stream, Attempts: attemptRows}
-		if stream || strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") {
+		isEventStream := strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream")
+		if converted {
+			// Decide by the actual upstream content type: some upstreams answer
+			// a streaming request with a plain JSON body.
+			if isEventStream {
+				a.proxyConvertedStreamResponse(c, resp, targetProtocol, protocol, user, key, target, body, latency, meta)
+				return
+			}
+			a.proxyConvertedBufferedResponse(c, resp, targetProtocol, protocol, user, key, target, body, latency, meta)
+			return
+		}
+		if stream || isEventStream {
 			a.proxyStreamResponse(c, resp, user, key, target, body, latency, meta)
 			return
 		}
@@ -306,7 +343,12 @@ func (a *App) callUpstream(c *gin.Context, target routeTarget, protocol relayPro
 	client := &http.Client{Timeout: timeout}
 	if stream {
 		client.Timeout = 0
-		client.Transport = &http.Transport{ResponseHeaderTimeout: timeout}
+		// 流式请求同样启用环境变量代理（HTTP_PROXY/HTTPS_PROXY/NO_PROXY），
+		// 否则会漏配代理导致直连上游。
+		client.Transport = &http.Transport{
+			ResponseHeaderTimeout: timeout,
+			Proxy:                 http.ProxyFromEnvironment,
+		}
 	}
 	return client.Do(req)
 }
@@ -474,7 +516,103 @@ func (a *App) proxyStreamResponse(c *gin.Context, resp *http.Response, user User
 	a.recordUsage(c, user, key, target, extractUsage(capture.Bytes()), resp.StatusCode, status, errMsg, requestBody, capture.Bytes(), latency, meta)
 }
 
+// proxyConvertedBufferedResponse reads a non-streaming upstream response,
+// converts it from the upstream protocol to the client protocol and writes it.
+func (a *App) proxyConvertedBufferedResponse(c *gin.Context, resp *http.Response, from, to relayProtocol, user User, key APIKey, target routeTarget, requestBody []byte, latency int64, meta usageRecordMeta) {
+	defer resp.Body.Close()
+	meta.ResponseHeaders = resp.Header.Clone()
+	responseBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		a.recordUsage(c, user, key, target, usageTokens{}, http.StatusBadGateway, RequestStatusError, err.Error(), requestBody, nil, latency, meta)
+		errorJSON(c, http.StatusBadGateway, "read upstream response failed")
+		return
+	}
+	var out []byte
+	if resp.StatusCode >= 400 {
+		out = convertErrorBody(to, responseBody)
+	} else {
+		converted, convErr := convertResponseBody(from, to, responseBody, target.Model.Name, meta.Path)
+		if convErr != nil {
+			a.recordUsage(c, user, key, target, usageTokens{}, http.StatusBadGateway, RequestStatusError, convErr.Error(), requestBody, responseBody, latency, meta)
+			errorJSON(c, http.StatusBadGateway, "convert upstream response failed")
+			return
+		}
+		out = converted
+	}
+	usage := extractUsage(out)
+	status := RequestStatusSuccess
+	errMsg := ""
+	if resp.StatusCode >= 400 {
+		status = RequestStatusError
+		errMsg = resp.Status
+	}
+	a.recordUsage(c, user, key, target, usage, resp.StatusCode, status, errMsg, requestBody, out, latency, meta)
+	c.Data(resp.StatusCode, "application/json; charset=utf-8", out)
+}
+
+// proxyConvertedStreamResponse converts an upstream SSE stream event-by-event
+// into the client protocol, flushing converted events as they are produced.
+func (a *App) proxyConvertedStreamResponse(c *gin.Context, resp *http.Response, from, to relayProtocol, user User, key APIKey, target routeTarget, requestBody []byte, latency int64, meta usageRecordMeta) {
+	defer resp.Body.Close()
+	meta.ResponseHeaders = resp.Header.Clone()
+	if resp.StatusCode >= 400 {
+		// Upstream errors arrive as plain JSON even for streaming requests.
+		body, _ := readLimitedBody(resp.Body, 1<<20)
+		out := convertErrorBody(to, body)
+		a.recordUsage(c, user, key, target, usageTokens{}, resp.StatusCode, RequestStatusError, resp.Status, requestBody, out, latency, meta)
+		c.Data(resp.StatusCode, "application/json; charset=utf-8", out)
+		return
+	}
+	header := c.Writer.Header()
+	header.Set("Content-Type", "text/event-stream")
+	header.Set("Cache-Control", "no-cache")
+	header.Set("Connection", "keep-alive")
+	c.Status(resp.StatusCode)
+	flusher, _ := c.Writer.(http.Flusher)
+	converter := newStreamConverter(from, to, meta.Path, target.Model.Name)
+	capture := &limitCapture{limit: 1 << 20}
+	reader := bufio.NewReader(resp.Body)
+	emit := func(events []sseEvent) error {
+		for _, ev := range events {
+			chunk := writeSSEEvent(to, ev)
+			_, _ = capture.Write([]byte(chunk))
+			if _, writeErr := c.Writer.Write([]byte(chunk)); writeErr != nil {
+				return writeErr
+			}
+		}
+		if flusher != nil {
+			flusher.Flush()
+		}
+		return nil
+	}
+	for {
+		ev, readErr := readSSEEvent(reader)
+		if readErr == nil || ev.data != "" || ev.event != "" {
+			if writeErr := emit(converter.push(ev)); writeErr != nil {
+				a.recordUsage(c, user, key, target, extractUsage(capture.Bytes()), 499, RequestStatusError, writeErr.Error(), requestBody, capture.Bytes(), latency, meta)
+				return
+			}
+		}
+		if readErr != nil {
+			break
+		}
+	}
+	if writeErr := emit(converter.finish()); writeErr != nil {
+		a.recordUsage(c, user, key, target, extractUsage(capture.Bytes()), 499, RequestStatusError, writeErr.Error(), requestBody, capture.Bytes(), latency, meta)
+		return
+	}
+	a.recordUsage(c, user, key, target, extractUsage(capture.Bytes()), resp.StatusCode, RequestStatusSuccess, "", requestBody, capture.Bytes(), latency, meta)
+}
+
+func (a *App) scheduledRouteTargets(modelName string, protocol relayProtocol, allowConversion bool, modelGroupIDs ...uint) ([]routeTarget, error) {
+	return a.routeTargetsWithScheduler(modelName, protocol, true, allowConversion, modelGroupIDs...)
+}
+
 func (a *App) routeTargets(modelName string, protocol relayProtocol, modelGroupIDs ...uint) ([]routeTarget, error) {
+	return a.routeTargetsWithScheduler(modelName, protocol, false, false, modelGroupIDs...)
+}
+
+func (a *App) routeTargetsWithScheduler(modelName string, protocol relayProtocol, advanceScheduler bool, allowConversion bool, modelGroupIDs ...uint) ([]routeTarget, error) {
 	modelGroupID := uint(0)
 	if len(modelGroupIDs) > 0 {
 		modelGroupID = modelGroupIDs[0]
@@ -491,7 +629,11 @@ func (a *App) routeTargets(modelName string, protocol relayProtocol, modelGroupI
 	candidates := make([]routeTarget, 0, len(models))
 	now := time.Now()
 	for _, model := range models {
-		if !modelSupportsRelayProtocol(model, protocol) {
+		allowed := modelSupportsRelayProtocol(model, protocol)
+		if !allowed && allowConversion {
+			allowed = a.modelProtocolAllowed(model, protocol)
+		}
+		if !allowed {
 			continue
 		}
 		bindings, err := a.modelBindings(model)
@@ -524,14 +666,14 @@ func (a *App) routeTargets(modelName string, protocol relayProtocol, modelGroupI
 				}
 				target.SourceKey = &sourceKey
 			}
-			target.Binding = a.refreshSchedulerState(target.Binding, now)
+			if advanceScheduler {
+				target.Binding = a.refreshSchedulerState(target.Binding, now)
+			}
 			candidates = append(candidates, target)
 		}
 	}
 	if len(candidates) == 1 {
-		// A single upstream is a direct route, not a schedulable pool.
 		candidates[0].SingleSource = true
-		return candidates, nil
 	}
 	targets := make([]routeTarget, 0, len(candidates))
 	for _, target := range candidates {
@@ -547,9 +689,37 @@ func (a *App) routeTargets(modelName string, protocol relayProtocol, modelGroupI
 		targets = append(targets, target)
 	}
 	if len(targets) == 0 {
+		if len(candidates) > 0 && anyCandidateFrozen(candidates, now) {
+			return nil, errors.New("当前模型所有上游源冷却中")
+		}
 		return nil, errors.New("no online source for model")
 	}
-	return a.scheduleTargets(targets, now), nil
+	group, err := a.modelGroupForRouting(modelGroupID)
+	if err != nil {
+		return nil, err
+	}
+	if !group.DynamicRouting {
+		fixed, err := a.fixedRouteTarget(targets, group)
+		if err != nil {
+			return nil, err
+		}
+		return []routeTarget{fixed}, nil
+	}
+	if advanceScheduler {
+		return a.scheduleTargets(targets, now), nil
+	}
+	return previewRouteTargets(targets, now), nil
+}
+
+func previewRouteTargets(targets []routeTarget, now time.Time) []routeTarget {
+	if len(targets) <= 1 {
+		return targets
+	}
+	out := append([]routeTarget(nil), targets...)
+	sort.SliceStable(out, func(i, j int) bool {
+		return routeTargetLess(out[i], out[j], now)
+	})
+	return out
 }
 
 func (a *App) requireAPIKeyModelGroup(c *gin.Context, key APIKey) (uint, bool) {
@@ -658,15 +828,10 @@ func (a *App) recordUsage(c *gin.Context, user User, key APIKey, target routeTar
 	if cost > 0 {
 		_ = a.db.Model(&User{}).Where("id = ?", user.ID).Update("balance", gorm.Expr("balance - ?", cost)).Error
 	}
-	if target.Source.ID != 0 && latency > 0 {
-		updates := map[string]any{"latency_ms": int(latency)}
+	if target.Source.ID != 0 {
+		// 转发延迟（latency_ms）只由测速接口更新，真实请求耗时含模型执行时间，不覆盖。
 		if status == RequestStatusSuccess && target.Source.Status != SourceStatusDisabled {
-			updates["status"] = SourceStatusOnline
-		}
-		_ = a.db.Model(&UpstreamSource{}).Where("id = ?", target.Source.ID).Updates(updates).Error
-		_ = a.db.Model(&ModelConfig{}).Where("id = ?", target.Model.ID).Update("latency_ms", int(latency)).Error
-		if target.Binding.ID != 0 {
-			_ = a.db.Model(&ModelRouteBinding{}).Where("id = ?", target.Binding.ID).Update("latency_ms", int(latency)).Error
+			_ = a.db.Model(&UpstreamSource{}).Where("id = ?", target.Source.ID).Update("status", SourceStatusOnline).Error
 		}
 	}
 	if target.SourceKey != nil && target.SourceKey.ID != 0 {
@@ -685,7 +850,7 @@ func newRelayRequestID() string {
 }
 
 func isRetryableUpstreamStatus(statusCode int) bool {
-	return statusCode == http.StatusTooManyRequests || statusCode >= http.StatusInternalServerError
+	return statusCode == http.StatusUnauthorized || statusCode == http.StatusForbidden || statusCode == http.StatusTooManyRequests || statusCode >= http.StatusInternalServerError
 }
 
 func requestAttemptRow(requestID string, index int, target routeTarget, protocol relayProtocol, path string, statusCode int, status string, errMsg string, latency int64, started time.Time, ended time.Time) RequestAttempt {
@@ -764,7 +929,9 @@ func (a *App) markTargetResult(target routeTarget, statusCode int) {
 		a.markTargetFailure(target, statusCode)
 		return
 	}
-	a.markTargetSuccess(target)
+	if statusCode < http.StatusBadRequest {
+		a.markTargetSuccess(target)
+	}
 }
 
 func (a *App) markTargetSuccess(target routeTarget) {
@@ -787,7 +954,11 @@ func (a *App) markTargetFailure(target routeTarget, statusCode int) {
 		return
 	}
 	now := time.Now()
-	a.markBindingFailure(target, now)
+	// 单上游源模型不启用熔断冷却：失败只累计源级统计，不写入绑定冷却状态，
+	// 后续请求继续直接转发该源。
+	if !target.SingleSource {
+		a.markBindingFailure(target, statusCode, now)
+	}
 	updates := map[string]any{
 		"failure_count":   gorm.Expr("failure_count + ?", 1),
 		"last_failure_at": now,

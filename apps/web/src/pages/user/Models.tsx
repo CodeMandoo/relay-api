@@ -1,6 +1,6 @@
 import { Fragment, useEffect, useMemo, useState } from 'react';
 import { motion } from 'framer-motion';
-import { Bot, CheckCircle2, Copy, Loader2, RotateCcw, Search, Zap } from 'lucide-react';
+import { Bot, CheckCircle2, Copy, Loader2, RotateCcw, Search, Shuffle, Zap } from 'lucide-react';
 import { toast } from 'sonner';
 import {
   Badge,
@@ -119,6 +119,40 @@ const latencyClass = (ms: number) => {
   return 'font-bold text-destructive';
 };
 
+const formatProbeTime = (iso: string) => {
+  const date = new Date(iso);
+  const diff = Date.now() - date.getTime();
+  if (diff < 60_000) return '刚刚';
+  if (diff < 3_600_000) return `${Math.floor(diff / 60_000)} 分钟前`;
+  if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)} 小时前`;
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${date.getMonth() + 1}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+};
+
+// ProbeBars 展示近 10 次后台检测结果（独立于用户请求）：成功绿色、失败红色、无记录灰色。
+function ProbeBars({ history, lastProbeAt }: { history?: { success: boolean; at: string }[]; lastProbeAt?: string | null }) {
+  const bars = Array.from({ length: 10 }, (_, i) => history?.[i]);
+  return (
+    <div className="min-w-[130px]">
+      <div className="flex items-center gap-[3px]">
+        {bars.map((item, i) => (
+          <span
+            key={i}
+            className={cn(
+              'h-4 w-1 shrink-0 rounded-full',
+              item === undefined ? 'bg-muted/60' : item.success ? 'bg-emerald-500' : 'bg-destructive',
+            )}
+            title={item ? `${item.success ? '成功' : '失败'} · ${new Date(item.at).toLocaleString()}` : '暂无记录'}
+          />
+        ))}
+      </div>
+      <div className="mt-1 text-[10px] text-muted-foreground/70">
+        {lastProbeAt ? `最近检测 ${formatProbeTime(lastProbeAt)}` : '暂无检测'}
+      </div>
+    </div>
+  );
+}
+
 const compactTokens = (tokens: number) => {
   if (tokens >= 1_000_000) return `${(tokens / 1_000_000).toFixed(1)}M`;
   if (tokens >= 1_000) return `${(tokens / 1_000).toFixed(1)}K`;
@@ -129,6 +163,13 @@ const modelFormats = (model: UserModel): ModelFormat[] => {
   if (model.formats?.length) return model.formats;
   return model.provider === 'Anthropic' ? ['anthropic'] : ['openai'];
 };
+
+const modelCompatibleFormats = (model: UserModel): ModelFormat[] => model.compatibleFormats ?? [];
+
+const modelAllFormats = (model: UserModel): ModelFormat[] => [
+  ...modelFormats(model),
+  ...modelCompatibleFormats(model),
+];
 
 const modelGroupFromDTO = (group: ModelAccessGroup): UserModelGroup => {
   return {
@@ -206,7 +247,7 @@ export default function Page() {
     const keyword = query.trim().toLowerCase();
     return models.filter((model) => {
       if (provider !== 'all' && model.provider !== provider) return false;
-      if (format !== 'all' && !modelFormats(model).includes(format)) return false;
+      if (format !== 'all' && !modelAllFormats(model).includes(format)) return false;
       if (groupFilter !== 'all' && model.modelGroupId !== groupFilter) return false;
       if (!keyword) return true;
       return (
@@ -214,7 +255,7 @@ export default function Page() {
         model.provider.toLowerCase().includes(keyword) ||
         model.modelGroupName.toLowerCase().includes(keyword) ||
         model.sourceName.toLowerCase().includes(keyword) ||
-        modelFormats(model).some((item) => item.includes(keyword))
+        modelAllFormats(model).some((item) => item.includes(keyword))
       );
     });
   }, [models, provider, format, groupFilter, query]);
@@ -249,12 +290,11 @@ export default function Page() {
     setInvokeMap((prev) => ({ ...prev, [model.id]: 'loading' }));
     try {
       const response = await userApi.invokeTestModel(model.id);
-      const { latencyMs, totalTokens } = response.data;
+      const { totalTokens } = response.data;
       setInvokeMap((prev) => ({ ...prev, [model.id]: 'success' }));
-      setLatencyMap((prev) => ({ ...prev, [model.id]: latencyMs }));
-      setModels((prev) => prev.map((item) => (item.id === model.id ? { ...item, latencyMs, status: 'online' } : item)));
+      // 转发延迟只由测速更新，调用耗时含模型执行时间，不覆盖显示。
       toast.success(`${model.name} 调用测试通过`, {
-        description: `真实模型响应: ${latencyMs}ms · 消耗 ${compactTokens(totalTokens)} tokens`,
+        description: `真实模型响应: ${response.data.latencyMs}ms · 消耗 ${compactTokens(totalTokens)} tokens`,
       });
     } catch (error) {
       setInvokeMap((prev) => ({ ...prev, [model.id]: 'error' }));
@@ -447,19 +487,33 @@ export default function Page() {
                               {item}
                             </Badge>
                           ))}
+                          {modelCompatibleFormats(model).map((item) => (
+                            <span key={`compatible-${item}`} className="inline-flex items-center gap-1">
+                              <Badge
+                                variant="outline"
+                                className={cn(
+                                  'h-6 rounded-md px-2 py-0 font-mono text-[10px] font-bold uppercase tracking-wider shadow-none',
+                                  item === 'openai'
+                                    ? 'border-sky-500/20 bg-sky-500/5 text-sky-600'
+                                    : 'border-orange-500/20 bg-orange-500/5 text-orange-600',
+                                )}
+                              >
+                                {item}
+                              </Badge>
+                              <Badge
+                                variant="outline"
+                                className="h-6 rounded-md border-amber-500/30 bg-amber-500/10 px-1.5 py-0 text-[10px] font-bold tracking-wider text-amber-600 shadow-none"
+                                title="该格式通过协议自动转换提供"
+                              >
+                                <Shuffle className="mr-0.5 h-3 w-3" />
+                                兼容
+                              </Badge>
+                            </span>
+                          ))}
                         </div>
                       </TableCell>
                       <TableCell>
-                        <span
-                          className={cn(
-                            'rounded-full border px-2 py-0.5 text-xs font-bold uppercase tracking-widest',
-                            isOffline
-                              ? 'border-destructive/20 bg-destructive/5 text-destructive'
-                              : 'border-emerald-500/20 bg-emerald-500/5 text-emerald-500',
-                          )}
-                        >
-                          {isOffline ? 'Offline' : 'Online'}
-                        </span>
+                        <ProbeBars history={model.probeHistory} lastProbeAt={model.lastProbeAt} />
                       </TableCell>
                       <TableCell>
                         <div className="min-w-[100px]">

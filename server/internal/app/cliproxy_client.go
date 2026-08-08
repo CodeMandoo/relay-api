@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -14,7 +15,13 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-const cliProxyManagementKeyMissingMessage = "CLIProxyAPI management key is empty; set RELAY_CLIPROXYAPI_MANAGEMENT_KEY to match CLIProxyAPI remote-management.secret-key"
+const (
+	cliProxyManagementKeyMissingMessage = "CLIProxyAPI management key is empty; set RELAY_CLIPROXYAPI_MANAGEMENT_KEY to match CLIProxyAPI remote-management.secret-key"
+	codexOAuthTokenURL                  = "https://auth.openai.com/oauth/token"
+	codexOAuthClientID                  = "app_EMoamEEZ73f0CkXaXp7hrann"
+	claudeOAuthTokenURL                 = "https://api.anthropic.com/v1/oauth/token"
+	claudeOAuthClientID                 = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+)
 
 func (a *App) startCLIProxyOAuth(c *gin.Context, source UpstreamSource, provider string) (gin.H, error) {
 	endpoint, err := cliProxyOAuthEndpoint(provider)
@@ -78,6 +85,10 @@ func (a *App) submitCLIProxyManualToken(ctx context.Context, source UpstreamSour
 	if err != nil {
 		return err
 	}
+	token, err = validateManualRefreshToken(ctx, authFileProvider, token)
+	if err != nil {
+		return err
+	}
 	now := time.Now().UTC()
 	payload := map[string]any{
 		"type":          authFileProvider,
@@ -88,9 +99,6 @@ func (a *App) submitCLIProxyManualToken(ctx context.Context, source UpstreamSour
 		"refresh_token": token.RefreshToken,
 		"expired":       time.Unix(0, 0).UTC().Format(time.RFC3339),
 		"last_refresh":  now.Format(time.RFC3339),
-	}
-	if token.AccessToken != "" {
-		payload["access_token"] = token.AccessToken
 	}
 	if token.IDToken != "" {
 		payload["id_token"] = token.IDToken
@@ -115,7 +123,6 @@ func (a *App) deleteCLIProxyAuthFile(ctx context.Context, source UpstreamSource,
 
 type manualTokenPayload struct {
 	RefreshToken string
-	AccessToken  string
 	IDToken      string
 }
 
@@ -131,15 +138,11 @@ func parseManualRefreshToken(raw string) (manualTokenPayload, error) {
 		}
 		token := manualTokenPayload{
 			RefreshToken: firstString(payload, "refresh_token", "refreshToken"),
-			AccessToken:  firstString(payload, "access_token", "accessToken"),
 			IDToken:      firstString(payload, "id_token", "idToken"),
 		}
 		if nested, ok := payload["token"].(map[string]any); ok {
 			if token.RefreshToken == "" {
 				token.RefreshToken = firstString(nested, "refresh_token", "refreshToken")
-			}
-			if token.AccessToken == "" {
-				token.AccessToken = firstString(nested, "access_token", "accessToken")
 			}
 			if token.IDToken == "" {
 				token.IDToken = firstString(nested, "id_token", "idToken")
@@ -151,6 +154,130 @@ func parseManualRefreshToken(raw string) (manualTokenPayload, error) {
 		return token, nil
 	}
 	return manualTokenPayload{RefreshToken: raw}, nil
+}
+
+type manualTokenValidationError struct {
+	message string
+}
+
+func (e *manualTokenValidationError) Error() string {
+	return e.message
+}
+
+func validateManualRefreshToken(ctx context.Context, provider string, token manualTokenPayload) (manualTokenPayload, error) {
+	refreshToken := strings.TrimSpace(token.RefreshToken)
+	if refreshToken == "" {
+		return manualTokenPayload{}, fmt.Errorf("refresh_token is required")
+	}
+	switch provider {
+	case "codex":
+		refreshed, err := validateCodexManualRefreshToken(ctx, refreshToken)
+		if err != nil {
+			return manualTokenPayload{}, err
+		}
+		token.RefreshToken = firstNonEmpty(refreshed.RefreshToken, refreshToken)
+		token.IDToken = firstNonEmpty(refreshed.IDToken, token.IDToken)
+		return token, nil
+	case "claude":
+		refreshed, err := validateClaudeManualRefreshToken(ctx, refreshToken)
+		if err != nil {
+			return manualTokenPayload{}, err
+		}
+		token.RefreshToken = firstNonEmpty(refreshed.RefreshToken, refreshToken)
+		return token, nil
+	default:
+		return manualTokenPayload{}, fmt.Errorf("manual token login currently supports ChatGPT and Claude only")
+	}
+}
+
+func validateCodexManualRefreshToken(ctx context.Context, refreshToken string) (manualTokenPayload, error) {
+	form := url.Values{
+		"client_id":     {codexOAuthClientID},
+		"grant_type":    {"refresh_token"},
+		"refresh_token": {refreshToken},
+		"scope":         {"openid profile email"},
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, manualCodexOAuthTokenURL(), strings.NewReader(form.Encode()))
+	if err != nil {
+		return manualTokenPayload{}, err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Accept", "application/json")
+	return doManualRefreshTokenValidation(req, "ChatGPT")
+}
+
+func validateClaudeManualRefreshToken(ctx context.Context, refreshToken string) (manualTokenPayload, error) {
+	raw, err := json.Marshal(map[string]string{
+		"client_id":     claudeOAuthClientID,
+		"grant_type":    "refresh_token",
+		"refresh_token": refreshToken,
+	})
+	if err != nil {
+		return manualTokenPayload{}, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, manualClaudeOAuthTokenURL(), strings.NewReader(string(raw)))
+	if err != nil {
+		return manualTokenPayload{}, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
+	return doManualRefreshTokenValidation(req, "Claude")
+}
+
+func doManualRefreshTokenValidation(req *http.Request, providerLabel string) (manualTokenPayload, error) {
+	resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
+	if err != nil {
+		return manualTokenPayload{}, fmt.Errorf("%s refresh token validation request failed: %w", providerLabel, err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return manualTokenPayload{}, manualRefreshValidationError(providerLabel, resp.StatusCode, raw)
+	}
+	var payload struct {
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+		IDToken      string `json:"id_token"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		return manualTokenPayload{}, fmt.Errorf("%s refresh token validation response is invalid: %w", providerLabel, err)
+	}
+	if strings.TrimSpace(payload.AccessToken) == "" {
+		return manualTokenPayload{}, &manualTokenValidationError{message: fmt.Sprintf("%s Refresh Token 校验失败：刷新接口未返回 access_token", providerLabel)}
+	}
+	return manualTokenPayload{
+		RefreshToken: strings.TrimSpace(payload.RefreshToken),
+		IDToken:      strings.TrimSpace(payload.IDToken),
+	}, nil
+}
+
+func manualRefreshValidationError(providerLabel string, status int, raw []byte) error {
+	message := strings.TrimSpace(string(raw))
+	var payload map[string]any
+	if err := json.Unmarshal(raw, &payload); err == nil {
+		code := firstString(payload, "error", "code", "type")
+		detail := firstString(payload, "error_description", "message", "detail")
+		switch {
+		case code != "" && detail != "":
+			message = code + ": " + detail
+		case detail != "":
+			message = detail
+		case code != "":
+			message = code
+		}
+	}
+	if message == "" {
+		message = http.StatusText(status)
+	}
+	return &manualTokenValidationError{message: fmt.Sprintf("%s Refresh Token 校验失败（HTTP %d）：%s", providerLabel, status, message)}
+}
+
+func manualCodexOAuthTokenURL() string {
+	return firstNonEmpty(os.Getenv("RELAY_CODEX_OAUTH_TOKEN_URL"), codexOAuthTokenURL)
+}
+
+func manualClaudeOAuthTokenURL() string {
+	return firstNonEmpty(os.Getenv("RELAY_CLAUDE_OAUTH_TOKEN_URL"), claudeOAuthTokenURL)
 }
 
 func manualAuthFileName(provider string, identifier string, now time.Time) string {

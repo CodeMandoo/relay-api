@@ -131,6 +131,93 @@ func (a *App) modelGroupIDForAPIKey(key APIKey) (uint, error) {
 	return group.ID, nil
 }
 
+func (a *App) modelGroupForRouting(groupID uint) (ModelGroup, error) {
+	groupID = a.normalizeModelGroupID(groupID)
+	var group ModelGroup
+	if err := a.db.First(&group, groupID).Error; err != nil {
+		return ModelGroup{}, err
+	}
+	return group, nil
+}
+
+func (a *App) fixedRouteTarget(targets []routeTarget, group ModelGroup) (routeTarget, error) {
+	if group.FixedSourceID == nil || *group.FixedSourceID == 0 {
+		return routeTarget{}, errors.New("fixed model is not configured")
+	}
+	for _, target := range targets {
+		if target.Source.ID != *group.FixedSourceID {
+			continue
+		}
+		if group.FixedSourceKeyID == nil {
+			if target.Binding.SourceKeyID != nil {
+				continue
+			}
+		} else if target.Binding.SourceKeyID == nil || *target.Binding.SourceKeyID != *group.FixedSourceKeyID {
+			continue
+		}
+		return target, nil
+	}
+	return routeTarget{}, errors.New("fixed model is unavailable")
+}
+
+func (a *App) normalizeFixedRoute(group *ModelGroup, bindings []modelBindingRequest) error {
+	if group.DynamicRouting || group.FixedSourceID != nil {
+		return nil
+	}
+	var best *UpstreamSource
+	var bestKey *uint
+	for _, binding := range bindings {
+		sourceID, err := parseNumericID(binding.SourceID)
+		if err != nil {
+			return err
+		}
+		var source UpstreamSource
+		if err := a.db.First(&source, sourceID).Error; err != nil {
+			return err
+		}
+		if best == nil || source.Priority < best.Priority || (source.Priority == best.Priority && source.ID < best.ID) {
+			best = &source
+			if binding.SourceKeyID != "" && binding.SourceKeyID != "default" {
+				keyID, err := parseNumericID(binding.SourceKeyID)
+				if err != nil {
+					return err
+				}
+				bestKey = &keyID
+			} else {
+				bestKey = nil
+			}
+		}
+	}
+	if best == nil {
+		return errors.New("fixed model is required when dynamic routing is disabled")
+	}
+	group.FixedSourceID = &best.ID
+	group.FixedSourceKeyID = bestKey
+	return nil
+}
+
+func (a *App) setFixedRoute(group *ModelGroup, rawSourceID, rawSourceKeyID string) error {
+	if strings.TrimSpace(rawSourceID) == "" {
+		group.FixedSourceID = nil
+		group.FixedSourceKeyID = nil
+		return nil
+	}
+	sourceID, err := parseNumericID(rawSourceID)
+	if err != nil {
+		return errors.New("invalid fixedSourceId")
+	}
+	if _, err := a.getSourceForModel(sourceID); err != nil {
+		return err
+	}
+	sourceKeyID, err := a.resolveSourceKeyID(sourceID, rawSourceKeyID)
+	if err != nil {
+		return err
+	}
+	group.FixedSourceID = &sourceID
+	group.FixedSourceKeyID = sourceKeyID
+	return nil
+}
+
 func (a *App) adminModelGroups(c *gin.Context) {
 	var groups []ModelGroup
 	if err := a.db.Order("is_default desc, created_at asc, id asc").Find(&groups).Error; err != nil {
@@ -150,9 +237,12 @@ func (a *App) adminModelGroups(c *gin.Context) {
 
 func (a *App) adminCreateModelGroup(c *gin.Context) {
 	var req struct {
-		Name        string                `json:"name"`
-		Description string                `json:"description"`
-		Bindings    []modelBindingRequest `json:"bindings"`
+		Name           string                `json:"name"`
+		Description    string                `json:"description"`
+		DynamicRouting *bool                 `json:"dynamicRouting"`
+		FixedSourceID  string                `json:"fixedSourceId"`
+		FixedSourceKey string                `json:"fixedSourceKeyId"`
+		Bindings       []modelBindingRequest `json:"bindings"`
 	}
 	if !bindJSON(c, &req) {
 		return
@@ -172,13 +262,30 @@ func (a *App) adminCreateModelGroup(c *gin.Context) {
 		bindings = parsed
 	}
 	group := ModelGroup{
-		Name:         name,
-		Description:  strings.TrimSpace(req.Description),
-		BindingsJSON: encodeModelGroupBindings(bindings),
+		Name:           name,
+		Description:    strings.TrimSpace(req.Description),
+		BindingsJSON:   encodeModelGroupBindings(bindings),
+		DynamicRouting: req.DynamicRouting == nil || *req.DynamicRouting,
+	}
+	if strings.TrimSpace(req.FixedSourceID) != "" {
+		if err := a.setFixedRoute(&group, req.FixedSourceID, req.FixedSourceKey); err != nil {
+			errorJSON(c, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+	if err := a.normalizeFixedRoute(&group, bindings); err != nil {
+		errorJSON(c, http.StatusBadRequest, err.Error())
+		return
 	}
 	if err := a.db.Create(&group).Error; err != nil {
 		errorJSON(c, http.StatusBadRequest, "create model group failed")
 		return
+	}
+	if !group.DynamicRouting {
+		if err := a.db.Model(&group).Update("dynamic_routing", false).Error; err != nil {
+			errorJSON(c, http.StatusBadRequest, "create model group failed")
+			return
+		}
 	}
 	c.JSON(http.StatusCreated, gin.H{"data": modelGroupDTO(group, 0, 0)})
 }
@@ -205,9 +312,11 @@ func (a *App) adminUpdateModelGroup(c *gin.Context) {
 	if value, ok := req["description"].(string); ok {
 		updates["description"] = strings.TrimSpace(value)
 	}
+	bindings := decodeModelGroupBindings(group.BindingsJSON)
 	if bindingRequests, hasBindingRequests := parseBindingRequests(req["bindings"]); hasBindingRequests {
 		if len(bindingRequests) == 0 {
 			updates["bindings_json"] = ""
+			bindings = nil
 		} else {
 			parsed, err := a.validateModelBindingRequests(bindingRequests)
 			if err != nil {
@@ -215,6 +324,33 @@ func (a *App) adminUpdateModelGroup(c *gin.Context) {
 				return
 			}
 			updates["bindings_json"] = encodeModelGroupBindings(parsed)
+			bindings = parsed
+		}
+	}
+	if value, ok := req["dynamicRouting"].(bool); ok {
+		group.DynamicRouting = value
+		updates["dynamic_routing"] = value
+	}
+	if value, ok := req["fixedSourceId"].(string); ok {
+		rawKey, _ := req["fixedSourceKeyId"].(string)
+		if err := a.setFixedRoute(&group, value, rawKey); err != nil {
+			errorJSON(c, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+	if err := a.normalizeFixedRoute(&group, bindings); err != nil {
+		errorJSON(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	if group.FixedSourceID == nil {
+		updates["fixed_source_id"] = gorm.Expr("NULL")
+		updates["fixed_source_key_id"] = gorm.Expr("NULL")
+	} else {
+		updates["fixed_source_id"] = *group.FixedSourceID
+		if group.FixedSourceKeyID == nil {
+			updates["fixed_source_key_id"] = gorm.Expr("NULL")
+		} else {
+			updates["fixed_source_key_id"] = *group.FixedSourceKeyID
 		}
 	}
 	if len(updates) == 0 {
@@ -244,20 +380,21 @@ func (a *App) adminDeleteModelGroup(c *gin.Context) {
 		errorJSON(c, http.StatusBadRequest, "default model group cannot be deleted")
 		return
 	}
-	var modelCount int64
-	if err := a.db.Model(&ModelConfig{}).Where("model_group_id = ?", group.ID).Count(&modelCount).Error; err != nil {
+	// 同步删除该分组下的模型配置及路由绑定。
+	var modelIDs []uint
+	if err := a.db.Model(&ModelConfig{}).Where("model_group_id = ?", group.ID).Pluck("id", &modelIDs).Error; err != nil {
 		errorJSON(c, http.StatusInternalServerError, "database error")
 		return
 	}
-	if modelCount > 0 {
-		errorJSON(c, http.StatusBadRequest, "model group is not empty")
-		return
+	if len(modelIDs) > 0 {
+		_ = a.db.Where("model_id IN ?", modelIDs).Delete(&ModelRouteBinding{}).Error
+		_ = a.db.Where("model_group_id = ?", group.ID).Delete(&ModelConfig{}).Error
 	}
 	if err := a.db.Delete(&group).Error; err != nil {
 		errorJSON(c, http.StatusBadRequest, "delete model group failed")
 		return
 	}
-	c.JSON(http.StatusOK, gin.H{"ok": true})
+	c.JSON(http.StatusOK, gin.H{"ok": true, "deletedModels": len(modelIDs)})
 }
 
 func (a *App) userModelGroups(c *gin.Context) {

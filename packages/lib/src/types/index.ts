@@ -34,6 +34,7 @@ export interface UpstreamSource {
   type: SourceType;
   apiBase: string;
   openaiBaseUrl?: string;
+  openaiProtocol?: 'chat' | 'responses';
   anthropicBaseUrl?: string;
   apiKey?: string;
   maskedKey?: string;
@@ -63,7 +64,6 @@ export interface SourceAccount {
   provider: AccountProvider;
   authIndex?: string;
   planType?: string;
-  openaiPlanType: string;
   subscriptionPlan?: string;
   hasSubscription?: boolean;
   subscriptionExpiresAt?: string;
@@ -104,6 +104,9 @@ export interface SourceKey {
   status: SourceKeyStatus;
   lastUsedAt?: string;
   createdAt: string;
+  recent10?: boolean[];
+  lastAt?: string;
+  isDefault?: boolean;
 }
 
 export const MODEL_PROVIDERS = [
@@ -285,6 +288,7 @@ export interface PlatformSettings {
   streamingEnabled?: boolean;
   requireEmailVerification?: boolean;
   hideUpstreamNameFromUsers?: boolean;
+  protocolConversionEnabled?: boolean;
 }
 
 export type ApiKeyStatus = 'valid' | 'disabled';
@@ -308,6 +312,9 @@ export interface ModelAccessGroup {
   name: string;
   description?: string;
   isDefault: boolean;
+  dynamicRouting: boolean;
+  fixedSourceId?: string;
+  fixedSourceKeyId?: string;
   keyCount?: number;
   modelCount?: number;
   bindings?: ModelBindingInput[];
@@ -332,6 +339,7 @@ export interface UserModel {
   name: string;
   provider: ModelProvider;
   formats: ModelFormat[];
+  compatibleFormats?: ModelFormat[];
   status: 'online' | 'offline';
   latencyMs: number;
   sourceId?: string;
@@ -341,6 +349,8 @@ export interface UserModel {
   sourceType?: SourceType;
   sourceStatus?: SourceStatus;
   routingCandidates?: number;
+  probeHistory?: { success: boolean; at: string }[];
+  lastProbeAt?: string | null;
 }
 
 export interface UserModelInvokeTestResult {

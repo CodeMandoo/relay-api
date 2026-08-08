@@ -204,6 +204,7 @@ func (a *App) userModels(c *gin.Context) {
 	}
 	models = currentUserModels(models, sourceMap, sourceKeyMap, time.Now(), defaultGroupID)
 	groupNames := a.modelGroupNameMap()
+	probeLogs := a.recentProbeLogsByModel(models)
 	out := make([]gin.H, 0, len(models))
 	for _, model := range models {
 		model.ModelGroupID = modelGroupBucketID(model, defaultGroupID)
@@ -221,6 +222,12 @@ func (a *App) userModels(c *gin.Context) {
 		if source.Status != SourceStatusOnline {
 			status = "offline"
 		}
+		logs := probeLogs[model.ID]
+		var lastProbeAt *string
+		if len(logs) > 0 {
+			v := logs[len(logs)-1].ProbedAt.UTC().Format(time.RFC3339)
+			lastProbeAt = &v
+		}
 		out = append(out, gin.H{
 			"id":                id("m", model.ID),
 			"name":              model.Name,
@@ -228,6 +235,7 @@ func (a *App) userModels(c *gin.Context) {
 			"modelGroupName":    groupNames[model.ModelGroupID],
 			"provider":          model.Provider,
 			"formats":           modelFormatList(model),
+			"compatibleFormats": compatibleModelFormats(model, settings.ProtocolConversionEnabled),
 			"status":            status,
 			"latencyMs":         latency,
 			"sourceId":          id("s", source.ID),
@@ -236,6 +244,8 @@ func (a *App) userModels(c *gin.Context) {
 			"sourceType":        source.Type,
 			"sourceStatus":      source.Status,
 			"routingCandidates": candidateCounts[modelGroupBucketKey(model.Name, model.ModelGroupID)],
+			"probeHistory":      probeHistoryDTO(logs),
+			"lastProbeAt":       lastProbeAt,
 		})
 	}
 	c.JSON(http.StatusOK, gin.H{"data": out})
@@ -264,19 +274,13 @@ func currentUserModels(models []ModelConfig, sources map[uint]UpstreamSource, so
 			}
 			leftSource := sources[group[i].SourceID]
 			rightSource := sources[group[j].SourceID]
-			leftWeight := group[i].RoutingWeight
-			if leftWeight <= 0 {
-				leftWeight = 1
-			}
-			rightWeight := group[j].RoutingWeight
-			if rightWeight <= 0 {
-				rightWeight = 1
-			}
-			if leftWeight != rightWeight {
-				return leftWeight > rightWeight
-			}
 			if leftSource.Priority != rightSource.Priority {
 				return leftSource.Priority < rightSource.Priority
+			}
+			leftWeight := nonZeroInt(group[i].RoutingWeight, 1)
+			rightWeight := nonZeroInt(group[j].RoutingWeight, 1)
+			if leftWeight != rightWeight {
+				return leftWeight > rightWeight
 			}
 			return group[i].ID < group[j].ID
 		})
@@ -389,8 +393,8 @@ func (a *App) userInvokeTestModel(c *gin.Context) {
 		return
 	}
 	usage := extractUsage(responseBody)
-	_ = a.db.Model(&target.Model).Update("latency_ms", latency).Error
-	_ = a.db.Model(&target.Source).Updates(map[string]any{"latency_ms": latency, "status": SourceStatusOnline}).Error
+	// 转发延迟只由测速接口更新，调用耗时含模型执行时间，不覆盖。
+	_ = a.db.Model(&target.Source).Updates(map[string]any{"status": SourceStatusOnline}).Error
 	if target.SourceKey != nil {
 		_ = a.db.Model(&SourceKey{}).Where("id = ?", target.SourceKey.ID).Update("last_used_at", time.Now()).Error
 	}
@@ -444,7 +448,7 @@ func modelInvokeTestPayload(protocol relayProtocol, modelName string) (string, [
 			"model":      modelName,
 			"max_tokens": 1,
 			"messages": []any{
-				map[string]any{"role": "user", "content": "Reply with ok."},
+				map[string]any{"role": "user", "content": "hi"},
 			},
 		}
 	case relayProtocolGemini:
@@ -452,7 +456,7 @@ func modelInvokeTestPayload(protocol relayProtocol, modelName string) (string, [
 		path = "/v1beta/models/" + url.PathEscape(geminiName) + ":generateContent"
 		payload = map[string]any{
 			"contents": []any{
-				map[string]any{"role": "user", "parts": []any{map[string]any{"text": "Reply with ok."}}},
+				map[string]any{"role": "user", "parts": []any{map[string]any{"text": "hi"}}},
 			},
 			"generationConfig": map[string]any{
 				"maxOutputTokens": 1,
@@ -466,7 +470,7 @@ func modelInvokeTestPayload(protocol relayProtocol, modelName string) (string, [
 			"max_tokens":  1,
 			"temperature": 0,
 			"messages": []any{
-				map[string]any{"role": "user", "content": "Reply with ok."},
+				map[string]any{"role": "user", "content": "hi"},
 			},
 		}
 	}
