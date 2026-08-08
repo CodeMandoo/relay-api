@@ -19,18 +19,18 @@ const (
 
 // LiteLLMPricing represents a single model's pricing from the LiteLLM dataset.
 type LiteLLMPricing struct {
-	InputCostPerToken          float64 `json:"input_cost_per_token"`
-	OutputCostPerToken         float64 `json:"output_cost_per_token"`
-	CacheReadInputTokenCost    float64 `json:"cache_read_input_token_cost"`
+	InputCostPerToken           float64 `json:"input_cost_per_token"`
+	OutputCostPerToken          float64 `json:"output_cost_per_token"`
+	CacheReadInputTokenCost     float64 `json:"cache_read_input_token_cost"`
 	CacheCreationInputTokenCost float64 `json:"cache_creation_input_token_cost"`
 }
 
 // pricingCache holds the fetched LiteLLM pricing data in memory.
 type pricingCache struct {
-	mu       sync.RWMutex
-	data     map[string]LiteLLMPricing
-	fetched  time.Time
-	loading  bool
+	mu      sync.RWMutex
+	data    map[string]LiteLLMPricing
+	fetched time.Time
+	loading bool
 }
 
 var globalPricingCache = &pricingCache{}

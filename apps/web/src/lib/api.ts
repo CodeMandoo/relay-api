@@ -202,6 +202,10 @@ export const adminApi = {
   updateSourceKey: (id: string, payload: Partial<Pick<SourceKey, 'alias' | 'key' | 'status'>>) =>
     apiRequest<ApiEnvelope<SourceKey>>(`/admin/source-keys/${id}`, { method: 'PUT', body: jsonBody(payload) }),
   deleteSourceKey: (id: string) => apiRequest<{ ok: boolean }>(`/admin/source-keys/${id}`, { method: 'DELETE' }),
+  updateDefaultKey: (sourceId: string, payload: { key: string }) =>
+    apiRequest<ApiEnvelope<SourceKey>>(`/admin/sources/${sourceId}/default-key`, { method: 'PUT', body: jsonBody(payload) }),
+  deleteDefaultKey: (sourceId: string) =>
+    apiRequest<{ ok: boolean }>(`/admin/sources/${sourceId}/default-key`, { method: 'DELETE' }),
   modelGroups: () => apiRequest<ApiEnvelope<ModelAccessGroup[]>>('/admin/model-groups'),
   createModelGroup: (payload: Partial<ModelAccessGroup>) =>
     apiRequest<ApiEnvelope<ModelAccessGroup>>('/admin/model-groups', { method: 'POST', body: jsonBody(payload) }),

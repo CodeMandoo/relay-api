@@ -970,7 +970,7 @@ func TestSchedulerSmoothWeightedRoundRobinUsesRoutingWeight(t *testing.T) {
 
 	hits := map[uint]int{}
 	for i := 0; i < 4; i++ {
-		targets, err := app.scheduledRouteTargets("weighted-scheduler-model", relayProtocolOpenAI)
+		targets, err := app.scheduledRouteTargets("weighted-scheduler-model", relayProtocolOpenAI, false)
 		if err != nil {
 			t.Fatalf("route targets: %v", err)
 		}
@@ -1124,6 +1124,51 @@ func TestSchedulerProbeCallsModelAndEntersRecovering(t *testing.T) {
 	}
 }
 
+func TestModelGroupFixedRouteUsesConfiguredSourceAndDoesNotFallback(t *testing.T) {
+	app := testApp(t)
+	fixedSource := UpstreamSource{Name: "fixed-route-source", Type: SourceTypeThirdParty, BaseURL: "https://fixed.example/v1", APIKey: "fixed-key", Priority: 2, Status: SourceStatusOnline}
+	fallbackSource := UpstreamSource{Name: "fallback-route-source", Type: SourceTypeThirdParty, BaseURL: "https://fallback.example/v1", APIKey: "fallback-key", Priority: 1, Status: SourceStatusOnline}
+	if err := app.db.Create(&fixedSource).Error; err != nil {
+		t.Fatalf("create fixed source: %v", err)
+	}
+	if err := app.db.Create(&fallbackSource).Error; err != nil {
+		t.Fatalf("create fallback source: %v", err)
+	}
+	fixedSourceID := fixedSource.ID
+	group := ModelGroup{Name: "fixed-route-group", DynamicRouting: false, FixedSourceID: &fixedSourceID}
+	if err := app.db.Create(&group).Error; err != nil {
+		t.Fatalf("create fixed route group: %v", err)
+	}
+	if err := app.db.Model(&group).Update("dynamic_routing", false).Error; err != nil {
+		t.Fatalf("disable dynamic routing: %v", err)
+	}
+	model := ModelConfig{ModelGroupID: group.ID, SourceID: fixedSource.ID, Name: "fixed-route-model", Provider: "OpenAI", Formats: ModelFormatOpenAI, Status: ModelStatusActive}
+	if err := app.db.Create(&model).Error; err != nil {
+		t.Fatalf("create fixed route model: %v", err)
+	}
+	if err := app.replaceModelBindings(model.ID, []modelBindingRequest{
+		{SourceID: id("s", fixedSource.ID), SourceKeyID: "default", RoutingWeight: 1},
+		{SourceID: id("s", fallbackSource.ID), SourceKeyID: "default", RoutingWeight: 100},
+	}); err != nil {
+		t.Fatalf("create fixed route bindings: %v", err)
+	}
+
+	targets, err := app.scheduledRouteTargets("fixed-route-model", relayProtocolOpenAI, false, group.ID)
+	if err != nil {
+		t.Fatalf("route fixed model: %v", err)
+	}
+	if len(targets) != 1 || targets[0].Source.ID != fixedSource.ID {
+		t.Fatalf("fixed target = %+v, want source %d", targets, fixedSource.ID)
+	}
+
+	if err := app.db.Model(&UpstreamSource{}).Where("id = ?", fixedSource.ID).Update("status", SourceStatusOffline).Error; err != nil {
+		t.Fatalf("take fixed source offline: %v", err)
+	}
+	if _, err := app.scheduledRouteTargets("fixed-route-model", relayProtocolOpenAI, false, group.ID); err == nil || err.Error() != "fixed model is unavailable" {
+		t.Fatalf("fixed unavailable error = %v, want direct fixed-model error", err)
+	}
+}
+
 func TestSchedulerUsesWeightOnlyWithinSamePriority(t *testing.T) {
 	app := testApp(t)
 	primary, backup, _ := createSchedulerModel(t, app, "strict-priority-model", 1, 100)
@@ -1227,7 +1272,7 @@ func createSchedulerModel(t *testing.T, app *App, name string, primaryWeight int
 
 func firstSchedulerTarget(t *testing.T, app *App, modelName string) routeTarget {
 	t.Helper()
-	targets, err := app.scheduledRouteTargets(modelName, relayProtocolOpenAI)
+	targets, err := app.scheduledRouteTargets(modelName, relayProtocolOpenAI, false)
 	if err != nil {
 		t.Fatalf("route targets: %v", err)
 	}
@@ -2490,7 +2535,7 @@ func TestProxySingleOpenBindingDoesNotReceiveTraffic(t *testing.T) {
 	}
 }
 
-func TestProxySingleSourceOpensAfterThreeFailures(t *testing.T) {
+func TestProxySingleSourceDoesNotFreezeOnFailures(t *testing.T) {
 	var calls int
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls++
@@ -2526,8 +2571,89 @@ func TestProxySingleSourceOpensAfterThreeFailures(t *testing.T) {
 		t.Fatalf("load binding: count=%d err=%v", len(bindings), err)
 	}
 	binding := loadRouteBinding(t, app, bindings[0].ID)
-	if schedulerBindingState(binding) != schedulerStateOpen || binding.FailureCount != schedulerFailureThreshold || binding.CooldownUntil == nil {
-		t.Fatalf("third single-source failure should open binding, got %+v", binding)
+	if schedulerBindingState(binding) != schedulerStateClosed || binding.FailureCount != 0 || binding.CooldownUntil != nil {
+		t.Fatalf("single-source failures must not open binding, got %+v", binding)
+	}
+	var sourceRef UpstreamSource
+	if err := app.db.First(&sourceRef, source.ID).Error; err != nil {
+		t.Fatalf("load source: %v", err)
+	}
+	if sourceRef.FailureCount != schedulerFailureThreshold {
+		t.Fatalf("source failure count should accumulate, got %d", sourceRef.FailureCount)
+	}
+	// 单源不冷却：第 4 次请求仍直接转发到该源，而不是被冷却跳过。
+	w := performJSON(app, http.MethodPost, "/v1/chat/completions", apiKey, map[string]any{
+		"model":    "single-failure-model",
+		"messages": []any{map[string]any{"role": "user", "content": "hello"}},
+	})
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("fourth request: expected upstream 500, got %d %s", w.Code, w.Body.String())
+	}
+	if calls != schedulerFailureThreshold+1 {
+		t.Fatalf("expected %d source calls after fourth request, got %d", schedulerFailureThreshold+1, calls)
+	}
+}
+
+func TestProxyAllSourcesFrozenReturnsFrozenError(t *testing.T) {
+	var calls int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		http.Error(w, "should not be called", http.StatusInternalServerError)
+	}))
+	defer upstream.Close()
+
+	app := testApp(t)
+	cooldownUntil := time.Now().Add(10 * time.Minute)
+	sourceA := UpstreamSource{Name: "Frozen_A", Type: SourceTypeThirdParty, BaseURL: upstream.URL + "/v1", APIKey: "key-a", Priority: 1, Status: SourceStatusOnline}
+	sourceB := UpstreamSource{Name: "Frozen_B", Type: SourceTypeThirdParty, BaseURL: upstream.URL + "/v1", APIKey: "key-b", Priority: 2, Status: SourceStatusOnline}
+	if err := app.db.Create(&sourceA).Error; err != nil {
+		t.Fatalf("create source A: %v", err)
+	}
+	if err := app.db.Create(&sourceB).Error; err != nil {
+		t.Fatalf("create source B: %v", err)
+	}
+	models := []ModelConfig{
+		{SourceID: sourceA.ID, Name: "frozen-model", DisplayName: "Frozen Model", Provider: "OpenAI", Formats: ModelFormatOpenAI, Status: ModelStatusActive},
+		{SourceID: sourceB.ID, Name: "frozen-model", DisplayName: "Frozen Model", Provider: "OpenAI", Formats: ModelFormatOpenAI, Status: ModelStatusActive},
+	}
+	if err := app.db.Create(&models).Error; err != nil {
+		t.Fatalf("create models: %v", err)
+	}
+	bindingsA, err := app.modelBindings(models[0])
+	if err != nil || len(bindingsA) != 1 {
+		t.Fatalf("load binding A: count=%d err=%v", len(bindingsA), err)
+	}
+	if err := app.db.Model(&ModelRouteBinding{}).Where("id = ?", bindingsA[0].ID).Updates(map[string]any{
+		"scheduler_state": schedulerStateOpen,
+		"failure_count":   schedulerFailureThreshold,
+		"cooldown_until":  cooldownUntil,
+	}).Error; err != nil {
+		t.Fatalf("freeze binding A: %v", err)
+	}
+	bindingsB, err := app.modelBindings(models[1])
+	if err != nil || len(bindingsB) != 1 {
+		t.Fatalf("load binding B: count=%d err=%v", len(bindingsB), err)
+	}
+	if err := app.db.Model(&ModelRouteBinding{}).Where("id = ?", bindingsB[0].ID).Updates(map[string]any{
+		"scheduler_state": schedulerStateOpen,
+		"failure_count":   schedulerFailureThreshold,
+		"cooldown_until":  cooldownUntil,
+	}).Error; err != nil {
+		t.Fatalf("freeze binding B: %v", err)
+	}
+
+	w := performJSON(app, http.MethodPost, "/v1/chat/completions", createRelayAPIKey(t, app), map[string]any{
+		"model":    "frozen-model",
+		"messages": []any{map[string]any{"role": "user", "content": "hello"}},
+	})
+	if w.Code != http.StatusBadGateway {
+		t.Fatalf("expected 502 frozen error, got %d %s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "当前模型所有上游源冷却中") {
+		t.Fatalf("expected frozen error message, got %s", w.Body.String())
+	}
+	if calls != 0 {
+		t.Fatalf("frozen sources must not receive traffic, got %d calls", calls)
 	}
 }
 
@@ -3485,5 +3611,163 @@ func TestNonCLIProxySourceDoesNotExposeAccountPool(t *testing.T) {
 	w = performJSON(app, http.MethodPost, sourcePath+"/oauth", adminToken, map[string]any{"provider": "ChatGPT"})
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("expected oauth to fail, got %d %s", w.Code, w.Body.String())
+	}
+}
+
+func TestUserModelsExposeProbeHistory(t *testing.T) {
+	app := testApp(t)
+	source := UpstreamSource{Name: "Probe_Source", Type: SourceTypeThirdParty, BaseURL: "https://probe.example.com/v1", APIKey: "probe-key", Priority: 1, Status: SourceStatusOnline}
+	if err := app.db.Create(&source).Error; err != nil {
+		t.Fatalf("create source: %v", err)
+	}
+	model := ModelConfig{SourceID: source.ID, Name: "probe-history-model", DisplayName: "Probe History Model", Provider: "OpenAI", Formats: ModelFormatOpenAI, Status: ModelStatusActive}
+	if err := app.db.Create(&model).Error; err != nil {
+		t.Fatalf("create model: %v", err)
+	}
+	now := time.Now()
+	logs := []SchedulerProbeLog{
+		{ModelID: model.ID, ModelName: model.Name, BindingID: 1, SourceID: source.ID, Success: true, StatusCode: 200, LatencyMS: 80, ProbedAt: now.Add(-3 * time.Minute)},
+		{ModelID: model.ID, ModelName: model.Name, BindingID: 1, SourceID: source.ID, Success: false, StatusCode: 503, LatencyMS: 120, Message: "upstream error", ProbedAt: now.Add(-2 * time.Minute)},
+		{ModelID: model.ID, ModelName: model.Name, BindingID: 1, SourceID: source.ID, Success: true, StatusCode: 200, LatencyMS: 65, ProbedAt: now.Add(-time.Minute)},
+	}
+	if err := app.db.Create(&logs).Error; err != nil {
+		t.Fatalf("create probe logs: %v", err)
+	}
+
+	createTestUser(t, app)
+	userToken := loginToken(t, app, testUserEmail, testUserPassword, RoleUser)
+	w := performJSON(app, http.MethodGet, "/api/user/models", userToken, nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("user models: %d %s", w.Code, w.Body.String())
+	}
+	rows := decodeBody(t, w)["data"].([]any)
+	for _, row := range rows {
+		item := row.(map[string]any)
+		if item["name"] != "probe-history-model" {
+			continue
+		}
+		history, ok := item["probeHistory"].([]any)
+		if !ok || len(history) != 3 {
+			t.Fatalf("expected 3 probe history entries, got %v", item["probeHistory"])
+		}
+		first := history[0].(map[string]any)
+		if first["success"] != true {
+			t.Fatalf("expected first probe success, got %v", first)
+		}
+		second := history[1].(map[string]any)
+		if second["success"] != false {
+			t.Fatalf("expected second probe failure, got %v", second)
+		}
+		if item["lastProbeAt"] == nil {
+			t.Fatalf("expected lastProbeAt, got nil")
+		}
+		return
+	}
+	t.Fatalf("probe-history-model not found in %v", rows)
+}
+
+func TestAdminSourceKeysRequestStatusAndDefaultKey(t *testing.T) {
+	app := testApp(t)
+	source := UpstreamSource{Name: "Status_Source", Type: SourceTypeThirdParty, BaseURL: "https://status.example.com/v1", APIKey: "default-secret-key", Priority: 1, Status: SourceStatusOnline}
+	if err := app.db.Create(&source).Error; err != nil {
+		t.Fatalf("create source: %v", err)
+	}
+	sourceKey := SourceKey{SourceID: source.ID, Alias: "team-a", APIKey: "bound-key", Status: APIKeyStatusValid}
+	if err := app.db.Create(&sourceKey).Error; err != nil {
+		t.Fatalf("create source key: %v", err)
+	}
+	model := ModelConfig{SourceID: source.ID, Name: "status-model", DisplayName: "Status Model", Provider: "OpenAI", Formats: ModelFormatOpenAI, Status: ModelStatusActive}
+	if err := app.db.Create(&model).Error; err != nil {
+		t.Fatalf("create model: %v", err)
+	}
+	now := time.Now()
+	usageLog := UsageLog{UserID: 1, SourceID: source.ID, SourceKeyID: sourceKey.ID, Model: model.Name, RequestID: "req-status", Protocol: "openai", Path: "/v1/chat/completions", TotalTokens: 10, CreatedAt: now}
+	if err := app.db.Create(&usageLog).Error; err != nil {
+		t.Fatalf("create usage log: %v", err)
+	}
+	attempts := []RequestAttempt{
+		{UsageLogID: usageLog.ID, RequestID: "req-status", AttemptIndex: 0, ModelConfigID: model.ID, SourceID: source.ID, SourceKeyID: sourceKey.ID, StatusCode: 200, Status: "success", StartedAt: now.Add(-3 * time.Minute), EndedAt: now.Add(-3 * time.Minute)},
+		{UsageLogID: usageLog.ID, RequestID: "req-status", AttemptIndex: 1, ModelConfigID: model.ID, SourceID: source.ID, SourceKeyID: sourceKey.ID, StatusCode: 200, Status: "success", StartedAt: now.Add(-2 * time.Minute), EndedAt: now.Add(-2 * time.Minute)},
+		{UsageLogID: usageLog.ID, RequestID: "req-status", AttemptIndex: 2, ModelConfigID: model.ID, SourceID: source.ID, SourceKeyID: sourceKey.ID, StatusCode: 500, Status: "error", StartedAt: now.Add(-time.Minute), EndedAt: now.Add(-time.Minute)},
+		{UsageLogID: usageLog.ID, RequestID: "req-default", AttemptIndex: 3, ModelConfigID: model.ID, SourceID: source.ID, SourceKeyID: 0, StatusCode: 200, Status: "success", StartedAt: now.Add(-3 * time.Minute), EndedAt: now.Add(-3 * time.Minute)},
+		{UsageLogID: usageLog.ID, RequestID: "req-default", AttemptIndex: 4, ModelConfigID: model.ID, SourceID: source.ID, SourceKeyID: 0, StatusCode: 502, Status: "error", StartedAt: now.Add(-time.Minute), EndedAt: now.Add(-time.Minute)},
+	}
+	if err := app.db.Create(&attempts).Error; err != nil {
+		t.Fatalf("create attempts: %v", err)
+	}
+
+	adminToken := loginToken(t, app, testAdminEmail, testAdminPassword, RoleAdmin)
+	w := performJSON(app, http.MethodGet, "/api/admin/sources/"+id("s", source.ID)+"/keys", adminToken, nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("source keys: %d %s", w.Code, w.Body.String())
+	}
+	rows := decodeBody(t, w)["data"].([]any)
+	var defaultKey map[string]any
+	var boundKey map[string]any
+	for _, row := range rows {
+		item := row.(map[string]any)
+		if item["id"] == "sk_default" {
+			defaultKey = item
+		}
+		if item["id"] == id("sk", sourceKey.ID) {
+			boundKey = item
+		}
+	}
+	if defaultKey == nil {
+		t.Fatalf("expected default key entry, got %v", rows)
+	}
+	if defaultKey["isDefault"] != true || defaultKey["alias"] != "默认 Key" {
+		t.Fatalf("unexpected default key: %v", defaultKey)
+	}
+	defaultRecent, _ := defaultKey["recent10"].([]any)
+	if len(defaultRecent) != 2 || defaultRecent[0] != true || defaultRecent[1] != false {
+		t.Fatalf("unexpected default key recent10: %v", defaultKey["recent10"])
+	}
+	if defaultKey["lastAt"] == nil {
+		t.Fatalf("expected default key lastAt")
+	}
+	if boundKey == nil {
+		t.Fatalf("expected bound key entry, got %v", rows)
+	}
+	boundRecent, _ := boundKey["recent10"].([]any)
+	if len(boundRecent) != 3 || boundRecent[0] != true || boundRecent[1] != true || boundRecent[2] != false {
+		t.Fatalf("unexpected bound key recent10: %v", boundKey["recent10"])
+	}
+}
+
+func TestAdminDefaultKeyUpdateAndDelete(t *testing.T) {
+	app := testApp(t)
+	source := UpstreamSource{Name: "DefaultKey_Source", Type: SourceTypeThirdParty, BaseURL: "https://defaultkey.example.com/v1", APIKey: "old-default", Priority: 1, Status: SourceStatusOnline}
+	if err := app.db.Create(&source).Error; err != nil {
+		t.Fatalf("create source: %v", err)
+	}
+	adminToken := loginToken(t, app, testAdminEmail, testAdminPassword, RoleAdmin)
+	sourcePath := "/api/admin/sources/" + id("s", source.ID) + "/default-key"
+
+	w := performJSON(app, http.MethodPut, sourcePath, adminToken, map[string]any{"key": "new-default-secret"})
+	if w.Code != http.StatusOK {
+		t.Fatalf("update default key: %d %s", w.Code, w.Body.String())
+	}
+	body := decodeBody(t, w)["data"].(map[string]any)
+	if body["id"] != "sk_default" {
+		t.Fatalf("unexpected default key response: %v", body)
+	}
+	var refreshed UpstreamSource
+	if err := app.db.First(&refreshed, source.ID).Error; err != nil {
+		t.Fatalf("load source: %v", err)
+	}
+	if refreshed.APIKey != "new-default-secret" {
+		t.Fatalf("expected updated api key, got %q", refreshed.APIKey)
+	}
+
+	w = performJSON(app, http.MethodDelete, sourcePath, adminToken, nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("delete default key: %d %s", w.Code, w.Body.String())
+	}
+	if err := app.db.First(&refreshed, source.ID).Error; err != nil {
+		t.Fatalf("load source: %v", err)
+	}
+	if refreshed.APIKey != "" {
+		t.Fatalf("expected cleared api key, got %q", refreshed.APIKey)
 	}
 }

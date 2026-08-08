@@ -8,6 +8,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 )
 
@@ -26,6 +27,9 @@ const (
 	schedulerObservationDuration      = 30 * time.Second
 	schedulerObservingWeightPercent   = 10
 	schedulerRecoverySuccessThreshold = 3
+
+	// maxProbeLogsPerModel 每个模型保留的探测历史条数上限。
+	maxProbeLogsPerModel = 50
 )
 
 func schedulerBindingState(binding ModelRouteBinding) string {
@@ -35,6 +39,21 @@ func schedulerBindingState(binding ModelRouteBinding) string {
 	default:
 		return schedulerStateClosed
 	}
+}
+
+// anyCandidateFrozen 报告候选集中是否存在处于冻结状态的上游绑定或源级冷却。
+// 用于区分“全部上游源已冻结”与“没有可用的在线上游源”。
+func anyCandidateFrozen(candidates []routeTarget, now time.Time) bool {
+	for _, target := range candidates {
+		switch schedulerBindingState(target.Binding) {
+		case schedulerStateOpen, schedulerStateHalfOpen, schedulerStateRecovering:
+			return true
+		}
+		if target.Source.CooldownUntil != nil && target.Source.CooldownUntil.After(now) {
+			return true
+		}
+	}
+	return false
 }
 
 func schedulerResetUpdates() map[string]any {
@@ -343,17 +362,88 @@ func (a *App) probeSchedulerBinding(bindingID uint, now time.Time) {
 	if protocol == relayProtocolAnthropic {
 		req.Header.Set("anthropic-version", "2023-06-01")
 	}
+	started := time.Now()
 	resp, err := (&http.Client{Timeout: schedulerProbeTimeout}).Do(req)
 	if err != nil {
+		a.recordSchedulerProbe(target, false, 0, time.Since(started).Milliseconds(), err.Error())
 		a.markSchedulerProbeFailure(bindingID, time.Now())
 		return
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= http.StatusBadRequest {
+		a.recordSchedulerProbe(target, false, resp.StatusCode, time.Since(started).Milliseconds(), resp.Status)
 		a.markSchedulerProbeFailure(bindingID, time.Now())
 		return
 	}
+	a.recordSchedulerProbe(target, true, resp.StatusCode, time.Since(started).Milliseconds(), "")
 	a.markSchedulerProbeSuccess(bindingID, time.Now())
+}
+
+// recordSchedulerProbe 持久化一次后台探测结果（独立于用户请求），并按模型限制保留条数。
+func (a *App) recordSchedulerProbe(target routeTarget, success bool, statusCode int, latencyMS int64, message string) {
+	log := SchedulerProbeLog{
+		ModelID:     target.Model.ID,
+		ModelName:   target.Model.Name,
+		BindingID:   target.Binding.ID,
+		SourceID:    target.Source.ID,
+		SourceKeyID: sourceKeyIDFromTarget(target),
+		Success:     success,
+		StatusCode:  statusCode,
+		LatencyMS:   latencyMS,
+		Message:     message,
+		ProbedAt:    time.Now(),
+	}
+	if err := a.db.Create(&log).Error; err != nil {
+		return
+	}
+	var count int64
+	if err := a.db.Model(&SchedulerProbeLog{}).Where("model_id = ?", target.Model.ID).Count(&count).Error; err != nil {
+		return
+	}
+	if count > maxProbeLogsPerModel {
+		excess := count - maxProbeLogsPerModel
+		_ = a.db.Exec("DELETE FROM scheduler_probe_logs WHERE model_id = ? ORDER BY id ASC LIMIT ?", target.Model.ID, excess).Error
+	}
+}
+
+// recentProbeLogsByModel 返回每个模型最近 10 条探测记录（按探测时间正序，旧→新）。
+func (a *App) recentProbeLogsByModel(models []ModelConfig) map[uint][]SchedulerProbeLog {
+	result := map[uint][]SchedulerProbeLog{}
+	if len(models) == 0 {
+		return result
+	}
+	ids := make([]uint, 0, len(models))
+	for _, model := range models {
+		ids = append(ids, model.ID)
+	}
+	var logs []SchedulerProbeLog
+	if err := a.db.Where("model_id IN ?", ids).Order("id desc").Limit(500).Find(&logs).Error; err != nil {
+		return result
+	}
+	buckets := map[uint][]SchedulerProbeLog{}
+	for _, log := range logs {
+		if len(buckets[log.ModelID]) >= 10 {
+			continue
+		}
+		buckets[log.ModelID] = append(buckets[log.ModelID], log)
+	}
+	for id, list := range buckets {
+		sort.SliceStable(list, func(i, j int) bool { return list[i].ProbedAt.Before(list[j].ProbedAt) })
+		result[id] = list
+	}
+	return result
+}
+
+// probeHistoryDTO 将探测记录转为对外 DTO（近 10 条，旧→新）。
+func probeHistoryDTO(logs []SchedulerProbeLog) []gin.H {
+	out := make([]gin.H, 0, len(logs))
+	for _, log := range logs {
+		out = append(out, gin.H{
+			"success": log.Success,
+			"at":      log.ProbedAt.UTC().Format(time.RFC3339),
+		})
+	}
+	return out
 }
 
 func (a *App) schedulerProbeTarget(bindingID uint) (routeTarget, relayProtocol, error) {

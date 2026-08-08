@@ -206,6 +206,7 @@ func (a *App) adminCreateSource(c *gin.Context) {
 		Name             string `json:"name"`
 		Type             string `json:"type"`
 		APIBase          string `json:"apiBase"`
+		OpenAIProtocol   string `json:"openaiProtocol"`
 		OpenAIBaseURL    string `json:"openaiBaseUrl"`
 		AnthropicBaseURL string `json:"anthropicBaseUrl"`
 		APIKey           string `json:"apiKey"`
@@ -913,11 +914,128 @@ func (a *App) adminSourceKeys(c *gin.Context) {
 		errorJSON(c, http.StatusInternalServerError, "database error")
 		return
 	}
-	out := make([]SourceKeyDTO, 0, len(keys))
+	out := make([]SourceKeyDTO, 0, len(keys)+1)
 	for _, key := range keys {
-		out = append(out, sourceKeyDTO(key, false))
+		dto := sourceKeyDTO(key, false)
+		dto.Recent10, dto.LastAt = a.sourceKeyRequestStatus(sourceID, key.ID)
+		out = append(out, dto)
+	}
+	// 默认 Key：绑定未指定 SourceKey 时使用源级 APIKey，作为独立条目展示、可编辑和删除。
+	if strings.TrimSpace(source.APIKey) != "" {
+		recent10, lastAt := a.sourceKeyRequestStatus(sourceID, 0)
+		out = append(out, SourceKeyDTO{
+			ID:        "sk_default",
+			SourceID:  id("s", source.ID),
+			Alias:     "默认 Key",
+			Masked:    maskSecret(source.APIKey),
+			Status:    APIKeyStatusValid,
+			CreatedAt: source.CreatedAt.UTC().Format(time.RFC3339),
+			Recent10:  recent10,
+			LastAt:    lastAt,
+			IsDefault: true,
+		})
 	}
 	c.JSON(http.StatusOK, gin.H{"data": out})
+}
+
+// sourceKeyRequestStatus 返回指定上游源密钥的最近 10 次请求状态（旧→新）与最近执行时间。
+// sourceKeyID 为 0 表示默认 Key（源级 APIKey）参与的请求。
+func (a *App) sourceKeyRequestStatus(sourceID, sourceKeyID uint) ([]bool, *string) {
+	var attempts []RequestAttempt
+	query := a.db.Where("source_id = ?", sourceID)
+	if sourceKeyID == 0 {
+		query = query.Where("source_key_id = ?", 0)
+	} else {
+		query = query.Where("source_key_id = ?", sourceKeyID)
+	}
+	if err := query.Order("id desc").Limit(10).Find(&attempts).Error; err != nil {
+		return nil, nil
+	}
+	recent := make([]bool, 0, len(attempts))
+	for i := len(attempts) - 1; i >= 0; i-- {
+		recent = append(recent, attempts[i].StatusCode < 400)
+	}
+	var lastAt *string
+	if len(attempts) > 0 {
+		v := attempts[0].StartedAt.UTC().Format(time.RFC3339)
+		lastAt = &v
+	}
+	return recent, lastAt
+}
+
+func (a *App) adminUpdateDefaultKey(c *gin.Context) {
+	sourceID, err := parseNumericID(c.Param("id"))
+	if err != nil {
+		errorJSON(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	var source UpstreamSource
+	if err := a.db.First(&source, sourceID).Error; err != nil {
+		errorJSON(c, http.StatusNotFound, "source not found")
+		return
+	}
+	var req struct {
+		Key string `json:"key"`
+	}
+	if !bindJSON(c, &req) {
+		return
+	}
+	secret := strings.TrimSpace(req.Key)
+	if secret == "" {
+		errorJSON(c, http.StatusBadRequest, "key is required")
+		return
+	}
+	if err := a.db.Model(&source).Update("api_key", secret).Error; err != nil {
+		errorJSON(c, http.StatusBadRequest, "update default key failed")
+		return
+	}
+	if err := a.db.Exec("UPDATE upstream_sources SET failure_count = 0, cooldown_until = NULL, last_failure_at = NULL WHERE id = ?", sourceID).Error; err != nil {
+		errorJSON(c, http.StatusBadRequest, "reset source health failed")
+		return
+	}
+	if err := a.recoverSourceBindings(sourceID); err != nil {
+		errorJSON(c, http.StatusBadRequest, "recover source bindings failed")
+		return
+	}
+	_ = a.db.First(&source, sourceID).Error
+	recent10, lastAt := a.sourceKeyRequestStatus(sourceID, 0)
+	c.JSON(http.StatusOK, gin.H{"data": SourceKeyDTO{
+		ID:        "sk_default",
+		SourceID:  id("s", source.ID),
+		Alias:     "默认 Key",
+		Masked:    maskSecret(source.APIKey),
+		Status:    APIKeyStatusValid,
+		CreatedAt: source.CreatedAt.UTC().Format(time.RFC3339),
+		Recent10:  recent10,
+		LastAt:    lastAt,
+		IsDefault: true,
+	}})
+}
+
+func (a *App) adminDeleteDefaultKey(c *gin.Context) {
+	sourceID, err := parseNumericID(c.Param("id"))
+	if err != nil {
+		errorJSON(c, http.StatusBadRequest, err.Error())
+		return
+	}
+	var source UpstreamSource
+	if err := a.db.First(&source, sourceID).Error; err != nil {
+		errorJSON(c, http.StatusNotFound, "source not found")
+		return
+	}
+	if err := a.db.Model(&source).Update("api_key", "").Error; err != nil {
+		errorJSON(c, http.StatusBadRequest, "clear default key failed")
+		return
+	}
+	if err := a.db.Exec("UPDATE upstream_sources SET failure_count = 0, cooldown_until = NULL, last_failure_at = NULL WHERE id = ?", sourceID).Error; err != nil {
+		errorJSON(c, http.StatusBadRequest, "reset source health failed")
+		return
+	}
+	if err := a.recoverSourceBindings(sourceID); err != nil {
+		errorJSON(c, http.StatusBadRequest, "recover source bindings failed")
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true})
 }
 
 func (a *App) adminCreateSourceKey(c *gin.Context) {
@@ -1953,6 +2071,7 @@ func (a *App) adminUpdateSettings(c *gin.Context) {
 		"requireInviteCode":         "require_invite_code",
 		"streamingEnabled":          "streaming_enabled",
 		"hideUpstreamNameFromUsers": "hide_upstream_name_from_users",
+		"protocolConversionEnabled": "protocol_conversion_enabled",
 	} {
 		if value, ok := req[jsonKey].(bool); ok {
 			updates[dbKey] = value
@@ -1996,6 +2115,7 @@ func settingsDTO(settings PlatformSettings) gin.H {
 		"defaultTimeout":            settings.DefaultTimeout,
 		"streamingEnabled":          settings.StreamingEnabled,
 		"hideUpstreamNameFromUsers": settings.HideUpstreamNameFromUsers,
+		"protocolConversionEnabled": settings.ProtocolConversionEnabled,
 	}
 }
 

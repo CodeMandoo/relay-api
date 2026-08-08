@@ -76,6 +76,7 @@ export default function Page() {
   const [hideUpstreamNameFromUsers, setHideUpstreamNameFromUsers] = useState(
     defaultSettings.hideUpstreamNameFromUsers ?? false,
   );
+  const [protocolConversion, setProtocolConversion] = useState(false);
   const [alertEmail, setAlertEmail] = useState('ops@relay.io');
   const [sourceAlert, setSourceAlert] = useState(true);
   const [quotaAlert, setQuotaAlert] = useState(true);
@@ -91,6 +92,7 @@ export default function Page() {
     setDefaultTimeout(String(settings.defaultTimeout));
     setStreaming(settings.streamingEnabled ?? true);
     setHideUpstreamNameFromUsers(settings.hideUpstreamNameFromUsers ?? false);
+    setProtocolConversion(settings.protocolConversionEnabled ?? false);
   };
 
   useEffect(() => {
@@ -154,6 +156,7 @@ export default function Page() {
         defaultTimeout: Math.max(1, Number(defaultTimeout) || 1),
         streamingEnabled: streaming,
         hideUpstreamNameFromUsers,
+        protocolConversionEnabled: protocolConversion,
       });
       applySettings(response.data);
       toast.success('配置已保存', { description: '更改将应用至后续所有请求调度中。' });
@@ -307,6 +310,14 @@ export default function Page() {
             </div>
             <div className="mt-4">
               <SwitchRow title="启用流式响应" description="允许 /v1/chat/completions 透传 SSE 流。" checked={streaming} onCheckedChange={setStreaming} />
+            </div>
+            <div className="mt-4">
+              <SwitchRow
+                title="协议自动转换"
+                description="开启后 OpenAI 与 Anthropic 格式请求自动互相转换，无匹配协议源时兜底可用（Responses 与 Completions 接口不参与转换）。"
+                checked={protocolConversion}
+                onCheckedChange={setProtocolConversion}
+              />
             </div>
             <div className="mt-4">
               <SwitchRow

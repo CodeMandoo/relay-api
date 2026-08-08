@@ -204,6 +204,7 @@ func (a *App) userModels(c *gin.Context) {
 	}
 	models = currentUserModels(models, sourceMap, sourceKeyMap, time.Now(), defaultGroupID)
 	groupNames := a.modelGroupNameMap()
+	probeLogs := a.recentProbeLogsByModel(models)
 	out := make([]gin.H, 0, len(models))
 	for _, model := range models {
 		model.ModelGroupID = modelGroupBucketID(model, defaultGroupID)
@@ -221,6 +222,12 @@ func (a *App) userModels(c *gin.Context) {
 		if source.Status != SourceStatusOnline {
 			status = "offline"
 		}
+		logs := probeLogs[model.ID]
+		var lastProbeAt *string
+		if len(logs) > 0 {
+			v := logs[len(logs)-1].ProbedAt.UTC().Format(time.RFC3339)
+			lastProbeAt = &v
+		}
 		out = append(out, gin.H{
 			"id":                id("m", model.ID),
 			"name":              model.Name,
@@ -228,6 +235,7 @@ func (a *App) userModels(c *gin.Context) {
 			"modelGroupName":    groupNames[model.ModelGroupID],
 			"provider":          model.Provider,
 			"formats":           modelFormatList(model),
+			"compatibleFormats": compatibleModelFormats(model, settings.ProtocolConversionEnabled),
 			"status":            status,
 			"latencyMs":         latency,
 			"sourceId":          id("s", source.ID),
@@ -236,6 +244,8 @@ func (a *App) userModels(c *gin.Context) {
 			"sourceType":        source.Type,
 			"sourceStatus":      source.Status,
 			"routingCandidates": candidateCounts[modelGroupBucketKey(model.Name, model.ModelGroupID)],
+			"probeHistory":      probeHistoryDTO(logs),
+			"lastProbeAt":       lastProbeAt,
 		})
 	}
 	c.JSON(http.StatusOK, gin.H{"data": out})

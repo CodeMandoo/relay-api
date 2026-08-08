@@ -78,6 +78,7 @@ func migrate(db *gorm.DB) error {
 		&APIKey{},
 		&UsageLog{},
 		&RequestAttempt{},
+		&SchedulerProbeLog{},
 		&PlatformSettings{},
 	)
 	if err != nil {
@@ -134,6 +135,8 @@ func (a *App) buildRouter() *gin.Engine {
 			admin.POST("/sources/:id/accounts/oauth/callback", a.adminSubmitOAuthCallback)
 			admin.POST("/sources/:id/accounts/token", a.adminSubmitSourceAccountToken)
 			admin.GET("/sources/:id/keys", a.adminSourceKeys)
+			admin.PUT("/sources/:id/default-key", a.adminUpdateDefaultKey)
+			admin.DELETE("/sources/:id/default-key", a.adminDeleteDefaultKey)
 			admin.POST("/sources/:id/keys", a.adminCreateSourceKey)
 			admin.PUT("/source-accounts/:id", a.adminUpdateSourceAccount)
 			admin.DELETE("/source-accounts/:id", a.adminDeleteSourceAccount)

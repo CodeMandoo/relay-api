@@ -84,22 +84,27 @@ type EmailVerificationCode struct {
 }
 
 type ModelGroup struct {
-	ID           uint   `gorm:"primaryKey"`
-	Name         string `gorm:"size:120;index;not null"`
-	Description  string `gorm:"size:255"`
-	BindingsJSON string `gorm:"type:text"`
-	IsDefault    bool   `gorm:"not null;default:false"`
-	CreatedAt    time.Time
-	UpdatedAt    time.Time
-	DeletedAt    gorm.DeletedAt `gorm:"index"`
+	ID               uint   `gorm:"primaryKey"`
+	Name             string `gorm:"size:120;index;not null"`
+	Description      string `gorm:"size:255"`
+	BindingsJSON     string `gorm:"type:text"`
+	DynamicRouting   bool   `gorm:"not null;default:true"`
+	FixedSourceID    *uint  `gorm:"index"`
+	FixedSourceKeyID *uint  `gorm:"index"`
+	IsDefault        bool   `gorm:"not null;default:false"`
+	CreatedAt        time.Time
+	UpdatedAt        time.Time
+	DeletedAt        gorm.DeletedAt `gorm:"index"`
 }
 
 type UpstreamSource struct {
-	ID               uint   `gorm:"primaryKey"`
-	Name             string `gorm:"size:255;not null;index"`
-	Type             string `gorm:"size:50;not null;index"`
-	BaseURL          string `gorm:"size:512;not null"`
-	OpenAIBaseURL    string `gorm:"size:512"`
+	ID            uint   `gorm:"primaryKey"`
+	Name          string `gorm:"size:255;not null;index"`
+	Type          string `gorm:"size:50;not null;index"`
+	BaseURL       string `gorm:"size:512;not null"`
+	OpenAIBaseURL string `gorm:"size:512"`
+	// OpenAIProtocol selects the upstream API shape: chat (default) or responses.
+	OpenAIProtocol   string `gorm:"size:32;not null;default:chat"`
 	AnthropicBaseURL string `gorm:"size:512"`
 	APIKey           string `gorm:"type:text"`
 	ManagementKey    string `gorm:"type:text"`
@@ -307,6 +312,22 @@ type RequestAttempt struct {
 	CreatedAt     time.Time
 }
 
+// SchedulerProbeLog 记录每次后台调度器探测上游绑定的结果，独立于用户请求。
+// 用于用户端模型检测状态与后台密钥请求状态展示。
+type SchedulerProbeLog struct {
+	ID          uint `gorm:"primaryKey"`
+	ModelID     uint `gorm:"index"`
+	ModelName   string `gorm:"size:255;index"`
+	BindingID   uint `gorm:"index"`
+	SourceID    uint `gorm:"index"`
+	SourceKeyID uint `gorm:"index"` // 0 表示使用默认 Key（源级 APIKey）
+	Success     bool
+	StatusCode  int
+	LatencyMS   int64
+	Message     string `gorm:"type:text"`
+	ProbedAt    time.Time `gorm:"index"`
+}
+
 type PlatformSettings struct {
 	ID                        uint `gorm:"primaryKey"`
 	PlatformName              string
@@ -318,6 +339,7 @@ type PlatformSettings struct {
 	DefaultTimeout            int
 	StreamingEnabled          bool
 	HideUpstreamNameFromUsers bool
+	ProtocolConversionEnabled bool
 	UpdatedAt                 time.Time
 }
 
@@ -361,6 +383,7 @@ type SourceDTO struct {
 	Type             string `json:"type"`
 	APIBase          string `json:"apiBase"`
 	OpenAIBaseURL    string `json:"openaiBaseUrl,omitempty"`
+	OpenAIProtocol   string `json:"openaiProtocol,omitempty"`
 	AnthropicBaseURL string `json:"anthropicBaseUrl,omitempty"`
 	APIKey           string `json:"apiKey,omitempty"`
 	MaskedKey        string `json:"maskedKey,omitempty"`
@@ -425,6 +448,9 @@ type SourceKeyDTO struct {
 	Status     string  `json:"status"`
 	LastUsedAt *string `json:"lastUsedAt,omitempty"`
 	CreatedAt  string  `json:"createdAt"`
+	Recent10   []bool  `json:"recent10,omitempty"`
+	LastAt     *string `json:"lastAt,omitempty"`
+	IsDefault  bool    `json:"isDefault,omitempty"`
 }
 
 type ModelDTO struct {
@@ -488,14 +514,17 @@ type APIKeyDTO struct {
 }
 
 type ModelGroupDTO struct {
-	ID          string                `json:"id"`
-	Name        string                `json:"name"`
-	Description string                `json:"description,omitempty"`
-	IsDefault   bool                  `json:"isDefault"`
-	KeyCount    int64                 `json:"keyCount,omitempty"`
-	ModelCount  int64                 `json:"modelCount,omitempty"`
-	Bindings    []modelBindingRequest `json:"bindings,omitempty"`
-	CreatedAt   string                `json:"createdAt"`
+	ID               string                `json:"id"`
+	Name             string                `json:"name"`
+	Description      string                `json:"description,omitempty"`
+	IsDefault        bool                  `json:"isDefault"`
+	DynamicRouting   bool                  `json:"dynamicRouting"`
+	FixedSourceID    string                `json:"fixedSourceId,omitempty"`
+	FixedSourceKeyID string                `json:"fixedSourceKeyId,omitempty"`
+	KeyCount         int64                 `json:"keyCount,omitempty"`
+	ModelCount       int64                 `json:"modelCount,omitempty"`
+	Bindings         []modelBindingRequest `json:"bindings,omitempty"`
+	CreatedAt        string                `json:"createdAt"`
 }
 
 func userDTO(user User, used int64) UserDTO {
@@ -549,6 +578,7 @@ func sourceDTO(source UpstreamSource, includeSecret bool) SourceDTO {
 		Type:             source.Type,
 		APIBase:          source.BaseURL,
 		OpenAIBaseURL:    source.OpenAIBaseURL,
+		OpenAIProtocol:   normalizeOpenAIProtocol(source.OpenAIProtocol),
 		AnthropicBaseURL: source.AnthropicBaseURL,
 		MaskedKey:        maskSecret(source.APIKey),
 		HasManagementKey: strings.TrimSpace(source.ManagementKey) != "",
@@ -751,15 +781,26 @@ func apiKeyDTOWithGroup(key APIKey, reveal bool, groupName string) APIKeyDTO {
 }
 
 func modelGroupDTO(group ModelGroup, keyCount, modelCount int64) ModelGroupDTO {
+	fixedSourceID := ""
+	if group.FixedSourceID != nil && *group.FixedSourceID > 0 {
+		fixedSourceID = id("s", *group.FixedSourceID)
+	}
+	fixedSourceKeyID := ""
+	if group.FixedSourceKeyID != nil && *group.FixedSourceKeyID > 0 {
+		fixedSourceKeyID = id("sk", *group.FixedSourceKeyID)
+	}
 	return ModelGroupDTO{
-		ID:          id("mg", group.ID),
-		Name:        group.Name,
-		Description: group.Description,
-		IsDefault:   group.IsDefault,
-		KeyCount:    keyCount,
-		ModelCount:  modelCount,
-		Bindings:    decodeModelGroupBindings(group.BindingsJSON),
-		CreatedAt:   group.CreatedAt.UTC().Format(time.RFC3339),
+		ID:               id("mg", group.ID),
+		Name:             group.Name,
+		Description:      group.Description,
+		IsDefault:        group.IsDefault,
+		DynamicRouting:   group.DynamicRouting,
+		FixedSourceID:    fixedSourceID,
+		FixedSourceKeyID: fixedSourceKeyID,
+		KeyCount:         keyCount,
+		ModelCount:       modelCount,
+		Bindings:         decodeModelGroupBindings(group.BindingsJSON),
+		CreatedAt:        group.CreatedAt.UTC().Format(time.RFC3339),
 	}
 }
 

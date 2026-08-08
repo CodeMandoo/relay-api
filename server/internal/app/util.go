@@ -354,3 +354,70 @@ func modelSupportsRelayProtocol(model ModelConfig, protocol relayProtocol) bool 
 		return true
 	}
 }
+
+// protocolConversionEnabled reports whether automatic OpenAI <-> Anthropic
+// protocol conversion is turned on in platform settings.
+func (a *App) protocolConversionEnabled() bool {
+	settings, err := a.getSettings()
+	return err == nil && settings.ProtocolConversionEnabled
+}
+
+// modelProtocolAllowed reports whether a model may serve a request of the
+// given protocol, either natively or (when conversion is enabled) through
+// the OpenAI <-> Anthropic compatibility layer.
+func (a *App) modelProtocolAllowed(model ModelConfig, protocol relayProtocol) bool {
+	if modelSupportsRelayProtocol(model, protocol) {
+		return true
+	}
+	if !a.protocolConversionEnabled() {
+		return false
+	}
+	switch protocol {
+	case relayProtocolOpenAI:
+		return modelHasFormat(model, ModelFormatAnthropic)
+	case relayProtocolAnthropic:
+		return modelHasFormat(model, ModelFormatOpenAI)
+	default:
+		return false
+	}
+}
+
+// modelNativeProtocol resolves the protocol the upstream actually speaks for
+// a model, preferring the client-requested protocol when natively supported.
+func modelNativeProtocol(model ModelConfig, preferred relayProtocol) relayProtocol {
+	if modelSupportsRelayProtocol(model, preferred) {
+		return preferred
+	}
+	if modelHasFormat(model, ModelFormatAnthropic) {
+		return relayProtocolAnthropic
+	}
+	if modelHasFormat(model, ModelFormatOpenAI) {
+		return relayProtocolOpenAI
+	}
+	return preferred
+}
+
+// compatibleModelFormats lists the additional formats a model can serve via
+// protocol conversion (empty when conversion is disabled or not applicable).
+func compatibleModelFormats(model ModelConfig, conversionEnabled bool) []string {
+	if !conversionEnabled {
+		return nil
+	}
+	hasOpenAI := modelHasFormat(model, ModelFormatOpenAI)
+	hasAnthropic := modelHasFormat(model, ModelFormatAnthropic)
+	switch {
+	case hasAnthropic && !hasOpenAI:
+		return []string{ModelFormatOpenAI}
+	case hasOpenAI && !hasAnthropic:
+		return []string{ModelFormatAnthropic}
+	default:
+		return nil
+	}
+}
+
+func normalizeOpenAIProtocol(value string) string {
+	if strings.EqualFold(strings.TrimSpace(value), "responses") {
+		return "responses"
+	}
+	return "chat"
+}

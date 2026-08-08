@@ -108,6 +108,9 @@ export default function Page() {
   const [keySource, setKeySource] = useState<UpstreamSource | null>(null);
   const [sourceKeys, setSourceKeys] = useState<SourceKey[]>([]);
   const [editingKey, setEditingKey] = useState<SourceKey | null>(null);
+  const [defaultKeyOpen, setDefaultKeyOpen] = useState(false);
+  const [defaultKeySecret, setDefaultKeySecret] = useState('');
+  const [defaultKeyDeleting, setDefaultKeyDeleting] = useState(false);
   const [keyAlias, setKeyAlias] = useState('');
   const [keySecret, setKeySecret] = useState('');
   const [keyLoading, setKeyLoading] = useState(false);
@@ -377,6 +380,48 @@ export default function Page() {
     }
   };
 
+  const saveDefaultKey = async () => {
+    if (!keySource) return;
+    if (!defaultKeySecret.trim()) {
+      toast.error('请输入默认 Key');
+      return;
+    }
+    try {
+      const response = await adminApi.updateDefaultKey(keySource.id, { key: defaultKeySecret.trim() });
+      setSourceKeys((prev) => prev.map((item) => (item.id === 'sk_default' ? response.data : item)));
+      setDefaultKeySecret('');
+      setDefaultKeyOpen(false);
+      toast.success('默认 Key 已更新');
+    } catch (error) {
+      toast.error(getErrorMessage(error, '更新默认 Key 失败'));
+    }
+  };
+
+  const removeDefaultKey = async () => {
+    if (!keySource) return;
+    setDefaultKeyDeleting(true);
+    try {
+      await adminApi.deleteDefaultKey(keySource.id);
+      setSourceKeys((prev) => prev.filter((item) => item.id !== 'sk_default'));
+      toast.success('默认 Key 已删除，请为模型绑定具体 API Key');
+    } catch (error) {
+      toast.error(getErrorMessage(error, '删除默认 Key 失败'));
+    } finally {
+      setDefaultKeyDeleting(false);
+    }
+  };
+
+  const formatLastAt = (iso?: string) => {
+    if (!iso) return '暂无请求';
+    const date = new Date(iso);
+    const diff = Date.now() - date.getTime();
+    if (diff < 60_000) return '刚刚';
+    if (diff < 3_600_000) return `${Math.floor(diff / 60_000)} 分钟前`;
+    if (diff < 86_400_000) return `${Math.floor(diff / 3_600_000)} 小时前`;
+    const pad = (n: number) => String(n).padStart(2, '0');
+    return `${date.getMonth() + 1}-${pad(date.getDate())} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+  };
+
   return (
     <div className="space-y-6">
       <PageHeader
@@ -581,9 +626,10 @@ export default function Page() {
             </div>
 
             <div className="overflow-hidden rounded-lg border">
-              <div className="grid grid-cols-[1fr_1.4fr_88px_112px] gap-3 border-b bg-muted/35 px-3 py-2 text-xs font-semibold text-muted-foreground">
+              <div className="grid grid-cols-[1fr_1.4fr_130px_88px_112px] gap-3 border-b bg-muted/35 px-3 py-2 text-xs font-semibold text-muted-foreground">
                 <span>别名</span>
                 <span>Key</span>
+                <span>请求状态</span>
                 <span>状态</span>
                 <span className="text-right">操作</span>
               </div>
@@ -592,31 +638,134 @@ export default function Page() {
               ) : sourceKeys.length === 0 ? (
                 <div className="px-3 py-8 text-center text-sm text-muted-foreground">暂无 API Key，模型将使用上游源默认 Key。</div>
               ) : (
-                sourceKeys.map((item) => (
-                  <div key={item.id} className="grid grid-cols-[1fr_1.4fr_88px_112px] items-center gap-3 border-b px-3 py-2 last:border-b-0">
-                    <div className="min-w-0">
-                      <div className="truncate text-sm font-semibold">{item.alias}</div>
-                      <div className="text-[11px] text-muted-foreground">
-                        {item.lastUsedAt ? `最近使用 ${new Date(item.lastUsedAt).toLocaleString()}` : '尚未使用'}
+                sourceKeys.map((item) => {
+                  const isDefault = item.id === 'sk_default';
+                  return (
+                    <div key={item.id} className="grid grid-cols-[1fr_1.4fr_130px_88px_112px] items-center gap-3 border-b px-3 py-2 last:border-b-0">
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-1.5">
+                          <span className="truncate text-sm font-semibold">{item.alias}</span>
+                          {isDefault && (
+                            <span className="rounded border-amber-500/30 bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-bold text-amber-600">默认</span>
+                          )}
+                        </div>
+                        <div className="text-[11px] text-muted-foreground">
+                          {item.lastUsedAt ? `最近使用 ${new Date(item.lastUsedAt).toLocaleString()}` : '尚未使用'}
+                        </div>
+                      </div>
+                      <div className="truncate font-mono text-xs text-muted-foreground">{item.masked}</div>
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-[3px]">
+                          {Array.from({ length: 10 }, (_, i) => {
+                            const state = item.recent10?.[i];
+                            return (
+                              <span
+                                key={i}
+                                className={cn(
+                                  'h-3.5 w-1.5 rounded-[2px]',
+                                  state === undefined ? 'bg-muted/60' : state ? 'bg-emerald-500' : 'bg-destructive',
+                                )}
+                                title={state === undefined ? '暂无请求' : `${state ? '成功' : '失败'} · 最近 ${i + 1} 次`}
+                              />
+                            );
+                          })}
+                        </div>
+                        <div className="mt-1 text-[10px] text-muted-foreground/60">{formatLastAt(item.lastAt)}</div>
+                      </div>
+                      {isDefault ? (
+                        <span className="text-[11px] font-semibold text-emerald-500">启用</span>
+                      ) : (
+                        <Switch checked={item.status === 'valid'} onCheckedChange={() => toggleSourceKey(item)} />
+                      )}
+                      <div className="ml-auto flex items-center gap-1">
+                        {isDefault ? (
+                          <>
+                            <Button
+                              variant="ghost"
+                              size="icon"
+                              className="h-8 w-8 text-muted-foreground hover:text-foreground"
+                              title="编辑默认 Key"
+                              onClick={() => {
+                                setDefaultKeySecret('');
+                                setDefaultKeyOpen(true);
+                              }}
+                            >
+                              <Edit className="h-4 w-4" />
+                            </Button>
+                            <AlertDialog>
+                              <AlertDialogTrigger asChild>
+                                <Button
+                                  variant="ghost"
+                                  size="icon"
+                                  disabled={defaultKeyDeleting}
+                                  className="h-8 w-8 text-muted-foreground hover:text-destructive"
+                                  title="删除默认 Key"
+                                >
+                                  <Trash2 className="h-4 w-4" />
+                                </Button>
+                              </AlertDialogTrigger>
+                              <AlertDialogContent>
+                                <AlertDialogHeader>
+                                  <AlertDialogTitle>删除默认 Key?</AlertDialogTitle>
+                                  <AlertDialogDescription>
+                                    删除后源级 API Key 将被清空，绑定默认 Key 的模型将无密钥可用，需要为模型绑定具体 API Key。
+                                  </AlertDialogDescription>
+                                </AlertDialogHeader>
+                                <AlertDialogFooter>
+                                  <AlertDialogCancel>取消</AlertDialogCancel>
+                                  <AlertDialogAction className="bg-destructive text-destructive-foreground hover:bg-destructive/90" onClick={removeDefaultKey}>
+                                    删除
+                                  </AlertDialogAction>
+                                </AlertDialogFooter>
+                              </AlertDialogContent>
+                            </AlertDialog>
+                          </>
+                        ) : (
+                          <>
+                            <Button variant="ghost" size="icon" className="h-8 w-8 text-muted-foreground hover:text-foreground" onClick={() => editSourceKey(item)}>
+                              <Edit className="h-4 w-4" />
+                            </Button>
+                            <Button variant="ghost" size="icon" className="h-8 w-8 text-muted-foreground hover:text-destructive" onClick={() => removeSourceKey(item)}>
+                              <Trash2 className="h-4 w-4" />
+                            </Button>
+                          </>
+                        )}
                       </div>
                     </div>
-                    <div className="truncate font-mono text-xs text-muted-foreground">{item.masked}</div>
-                    <Switch checked={item.status === 'valid'} onCheckedChange={() => toggleSourceKey(item)} />
-                    <div className="ml-auto flex items-center gap-1">
-                      <Button variant="ghost" size="icon" className="h-8 w-8 text-muted-foreground hover:text-foreground" onClick={() => editSourceKey(item)}>
-                        <Edit className="h-4 w-4" />
-                      </Button>
-                      <Button variant="ghost" size="icon" className="h-8 w-8 text-muted-foreground hover:text-destructive" onClick={() => removeSourceKey(item)}>
-                        <Trash2 className="h-4 w-4" />
-                      </Button>
-                    </div>
-                  </div>
-                ))
+                  );
+                })
               )}
             </div>
           </div>
           <DialogFooter>
             <Button variant="ghost" onClick={() => setKeyOpen(false)}>关闭</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={defaultKeyOpen} onOpenChange={setDefaultKeyOpen}>
+        <DialogContent className="max-w-md">
+          <DialogHeader>
+            <DialogTitle>编辑默认 Key</DialogTitle>
+            <DialogDescription>
+              为 <span className="font-mono font-semibold text-foreground">{keySource?.name}</span> 更新源级 API Key（绑定默认 Key 的模型使用）。
+            </DialogDescription>
+          </DialogHeader>
+          <div className="grid gap-3 py-2">
+            <div className="grid gap-2">
+              <Label htmlFor="default-key-secret">默认 Key</Label>
+              <Input
+                id="default-key-secret"
+                type="password"
+                value={defaultKeySecret}
+                onChange={(e) => setDefaultKeySecret(e.target.value)}
+                placeholder="sk-..."
+              />
+            </div>
+          </div>
+          <DialogFooter>
+            <Button variant="ghost" onClick={() => setDefaultKeyOpen(false)}>取消</Button>
+            <Button onClick={saveDefaultKey}>保存</Button>
           </DialogFooter>
         </DialogContent>
       </Dialog>
