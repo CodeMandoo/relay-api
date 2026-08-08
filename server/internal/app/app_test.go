@@ -3771,3 +3771,111 @@ func TestAdminDefaultKeyUpdateAndDelete(t *testing.T) {
 		t.Fatalf("expected cleared api key, got %q", refreshed.APIKey)
 	}
 }
+
+func TestHealthProbeRecordsHistoryForClosedBinding(t *testing.T) {
+	var calls int
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if r.Method != http.MethodPost || r.URL.Path != "/v1/chat/completions" {
+			t.Fatalf("unexpected probe request: %s %s", r.Method, r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"health-ok"}`))
+	}))
+	defer upstream.Close()
+
+	app := testApp(t)
+	source := UpstreamSource{Name: "Health_Source", Type: SourceTypeThirdParty, BaseURL: upstream.URL + "/v1", APIKey: "health-key", Priority: 1, Status: SourceStatusOnline}
+	if err := app.db.Create(&source).Error; err != nil {
+		t.Fatalf("create health source: %v", err)
+	}
+	model := ModelConfig{SourceID: source.ID, Name: "health-model", Provider: "OpenAI", Formats: ModelFormatOpenAI, Status: ModelStatusActive}
+	if err := app.db.Create(&model).Error; err != nil {
+		t.Fatalf("create health model: %v", err)
+	}
+	if err := app.replaceModelBindings(model.ID, []modelBindingRequest{{SourceID: id("s", source.ID), SourceKeyID: "default", RoutingWeight: 1}}); err != nil {
+		t.Fatalf("create health binding: %v", err)
+	}
+	var binding ModelRouteBinding
+	if err := app.db.Where("model_id = ?", model.ID).First(&binding).Error; err != nil {
+		t.Fatalf("load health binding: %v", err)
+	}
+
+	app.healthProbeBinding(binding.ID)
+
+	binding = loadRouteBinding(t, app, binding.ID)
+	if schedulerBindingState(binding) != schedulerStateClosed {
+		t.Fatalf("health probe must not change scheduler state, got %+v", binding)
+	}
+	if binding.LastProbeAt == nil {
+		t.Fatalf("expected last_probe_at updated, got nil")
+	}
+	var logs []SchedulerProbeLog
+	if err := app.db.Where("binding_id = ?", binding.ID).Find(&logs).Error; err != nil {
+		t.Fatalf("load probe logs: %v", err)
+	}
+	if len(logs) != 1 || !logs[0].Success || logs[0].StatusCode != 200 {
+		t.Fatalf("expected one successful probe log, got %+v", logs)
+	}
+	if calls != 1 {
+		t.Fatalf("expected 1 health probe call, got %d", calls)
+	}
+
+	// 刚探测完成后，runDueHealthProbes 不应立即重复探测（5 分钟间隔未到）。
+	app.runDueHealthProbes(time.Now())
+	time.Sleep(500 * time.Millisecond)
+	if calls != 1 {
+		t.Fatalf("expected no immediate re-probe, got %d calls", calls)
+	}
+
+	// 将 last_probe_at 设为很久以前，runDueHealthProbes 会重新触发探测。
+	if err := app.db.Model(&ModelRouteBinding{}).Where("id = ?", binding.ID).Update("last_probe_at", time.Now().Add(-10*time.Minute)).Error; err != nil {
+		t.Fatalf("reset last_probe_at: %v", err)
+	}
+	app.runDueHealthProbes(time.Now())
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && calls < 2 {
+		time.Sleep(50 * time.Millisecond)
+	}
+	if calls != 2 {
+		t.Fatalf("expected re-probe after interval, got %d calls", calls)
+	}
+}
+
+func TestHealthProbeRecordsFailureWithoutTrippingBreaker(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "temporary", http.StatusServiceUnavailable)
+	}))
+	defer upstream.Close()
+
+	app := testApp(t)
+	source := UpstreamSource{Name: "Health_Fail_Source", Type: SourceTypeThirdParty, BaseURL: upstream.URL + "/v1", APIKey: "health-fail-key", Priority: 1, Status: SourceStatusOnline}
+	if err := app.db.Create(&source).Error; err != nil {
+		t.Fatalf("create source: %v", err)
+	}
+	model := ModelConfig{SourceID: source.ID, Name: "health-fail-model", Provider: "OpenAI", Formats: ModelFormatOpenAI, Status: ModelStatusActive}
+	if err := app.db.Create(&model).Error; err != nil {
+		t.Fatalf("create model: %v", err)
+	}
+	if err := app.replaceModelBindings(model.ID, []modelBindingRequest{{SourceID: id("s", source.ID), SourceKeyID: "default", RoutingWeight: 1}}); err != nil {
+		t.Fatalf("create binding: %v", err)
+	}
+	var binding ModelRouteBinding
+	if err := app.db.Where("model_id = ?", model.ID).First(&binding).Error; err != nil {
+		t.Fatalf("load binding: %v", err)
+	}
+
+	app.healthProbeBinding(binding.ID)
+
+	binding = loadRouteBinding(t, app, binding.ID)
+	if schedulerBindingState(binding) != schedulerStateClosed {
+		t.Fatalf("health probe failure must not open binding, got %+v", binding)
+	}
+	var logs []SchedulerProbeLog
+	if err := app.db.Where("binding_id = ?", binding.ID).Find(&logs).Error; err != nil {
+		t.Fatalf("load probe logs: %v", err)
+	}
+	if len(logs) != 1 || logs[0].Success || logs[0].StatusCode != 503 {
+		t.Fatalf("expected one failed probe log, got %+v", logs)
+	}
+}

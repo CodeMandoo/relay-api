@@ -30,6 +30,9 @@ const (
 
 	// maxProbeLogsPerModel 每个模型保留的探测历史条数上限。
 	maxProbeLogsPerModel = 50
+
+	// schedulerHealthProbeInterval 健康绑定的周期性检测间隔。
+	schedulerHealthProbeInterval = 5 * time.Minute
 )
 
 func schedulerBindingState(binding ModelRouteBinding) string {
@@ -329,6 +332,31 @@ func (a *App) runDueSchedulerProbes(now time.Time) {
 		}
 		go a.probeSchedulerBinding(binding.ID, now)
 	}
+	a.runDueHealthProbes(now)
+}
+
+// runDueHealthProbes 对健康（closed）绑定执行周期性检测，只记录检测状态，不改变调度状态。
+func (a *App) runDueHealthProbes(now time.Time) {
+	cutoff := now.Add(-schedulerHealthProbeInterval)
+	var bindings []ModelRouteBinding
+	if err := a.db.Where("scheduler_state = ? AND enabled = ? AND (last_probe_at IS NULL OR last_probe_at <= ?)", schedulerStateClosed, true, cutoff).Find(&bindings).Error; err != nil {
+		return
+	}
+	for _, binding := range bindings {
+		if !a.claimHealthProbe(binding, now) {
+			continue
+		}
+		go a.healthProbeBinding(binding.ID)
+	}
+}
+
+// claimHealthProbe 抢占健康探测租约（写 last_probe_at 为未来时间），避免多实例重复探测。
+func (a *App) claimHealthProbe(binding ModelRouteBinding, now time.Time) bool {
+	leaseUntil := now.Add(schedulerProbeLeaseDuration)
+	result := a.db.Model(&ModelRouteBinding{}).
+		Where("id = ? AND scheduler_state = ? AND (last_probe_at IS NULL OR last_probe_at <= ?)", binding.ID, schedulerStateClosed, now).
+		Updates(map[string]any{"last_probe_at": leaseUntil})
+	return result.Error == nil && result.RowsAffected == 1
 }
 
 func (a *App) claimSchedulerProbe(binding ModelRouteBinding, now time.Time) bool {
@@ -345,17 +373,74 @@ func (a *App) probeSchedulerBinding(bindingID uint, now time.Time) {
 		a.markSchedulerProbeFailure(bindingID, now)
 		return
 	}
+	statusCode, latencyMS, err := a.doSchedulerProbe(target, protocol)
+	if err != nil {
+		a.recordSchedulerProbe(target, false, 0, latencyMS, err.Error())
+		a.markSchedulerProbeFailure(bindingID, time.Now())
+		return
+	}
+	if statusCode >= http.StatusBadRequest {
+		a.recordSchedulerProbe(target, false, statusCode, latencyMS, http.StatusText(statusCode))
+		a.markSchedulerProbeFailure(bindingID, time.Now())
+		return
+	}
+	a.recordSchedulerProbe(target, true, statusCode, latencyMS, "")
+	a.markSchedulerProbeSuccess(bindingID, time.Now())
+}
+
+// healthProbeBinding 对健康绑定执行一次检测，结果只写入探测日志并更新 last_probe_at。
+func (a *App) healthProbeBinding(bindingID uint) {
+	target, protocol, err := a.schedulerProbeTarget(bindingID)
+	if err != nil {
+		a.recordHealthProbeResult(bindingID, false, 0, 0, err.Error())
+		return
+	}
+	statusCode, latencyMS, err := a.doSchedulerProbe(target, protocol)
+	if err != nil {
+		a.recordHealthProbeResult(bindingID, false, 0, latencyMS, err.Error())
+		return
+	}
+	if statusCode >= http.StatusBadRequest {
+		a.recordHealthProbeResult(bindingID, false, statusCode, latencyMS, http.StatusText(statusCode))
+		return
+	}
+	a.recordHealthProbeResult(bindingID, true, statusCode, latencyMS, "")
+}
+
+// recordHealthProbeResult 写入健康探测日志并记录最近探测时间。
+func (a *App) recordHealthProbeResult(bindingID uint, success bool, statusCode int, latencyMS int64, message string) {
+	var binding ModelRouteBinding
+	if err := a.db.First(&binding, bindingID).Error; err != nil {
+		return
+	}
+	target := routeTarget{Model: ModelConfig{}, Binding: binding, Source: UpstreamSource{}}
+	if err := a.db.First(&target.Model, binding.ModelID).Error; err != nil {
+		return
+	}
+	if err := a.db.First(&target.Source, binding.SourceID).Error; err != nil {
+		return
+	}
+	if binding.SourceKeyID != nil {
+		var key SourceKey
+		if err := a.db.Where("id = ? AND status = ?", *binding.SourceKeyID, APIKeyStatusValid).First(&key).Error; err == nil {
+			target.SourceKey = &key
+		}
+	}
+	a.recordSchedulerProbe(target, success, statusCode, latencyMS, message)
+	_ = a.db.Model(&ModelRouteBinding{}).Where("id = ?", bindingID).Update("last_probe_at", time.Now()).Error
+}
+
+// doSchedulerProbe 执行一次探测请求，返回状态码、耗时和错误。
+func (a *App) doSchedulerProbe(target routeTarget, protocol relayProtocol) (int, int64, error) {
 	path, body, err := modelInvokeTestPayload(protocol, target.Model.Name)
 	if err != nil {
-		a.markSchedulerProbeFailure(bindingID, now)
-		return
+		return 0, 0, err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), schedulerProbeTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, upstreamURL(target, protocol, path), bytes.NewReader(body))
 	if err != nil {
-		a.markSchedulerProbeFailure(bindingID, now)
-		return
+		return 0, 0, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	applyUpstreamAuth(req.Header, target.Source, effectiveUpstreamAPIKey(target), protocol)
@@ -365,18 +450,10 @@ func (a *App) probeSchedulerBinding(bindingID uint, now time.Time) {
 	started := time.Now()
 	resp, err := (&http.Client{Timeout: schedulerProbeTimeout}).Do(req)
 	if err != nil {
-		a.recordSchedulerProbe(target, false, 0, time.Since(started).Milliseconds(), err.Error())
-		a.markSchedulerProbeFailure(bindingID, time.Now())
-		return
+		return 0, time.Since(started).Milliseconds(), err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode >= http.StatusBadRequest {
-		a.recordSchedulerProbe(target, false, resp.StatusCode, time.Since(started).Milliseconds(), resp.Status)
-		a.markSchedulerProbeFailure(bindingID, time.Now())
-		return
-	}
-	a.recordSchedulerProbe(target, true, resp.StatusCode, time.Since(started).Milliseconds(), "")
-	a.markSchedulerProbeSuccess(bindingID, time.Now())
+	return resp.StatusCode, time.Since(started).Milliseconds(), nil
 }
 
 // recordSchedulerProbe 持久化一次后台探测结果（独立于用户请求），并按模型限制保留条数。

@@ -237,6 +237,7 @@ type ModelRouteBinding struct {
 	ProbeLeaseUntil  *time.Time `gorm:"index"`
 	LastFailureAt    *time.Time
 	LastSuccessAt    *time.Time
+	LastProbeAt      *time.Time `gorm:"index"` // 最近一次健康探测时间（含租约控制）
 	CreatedAt        time.Time
 	UpdatedAt        time.Time
 	DeletedAt        gorm.DeletedAt `gorm:"index"`
