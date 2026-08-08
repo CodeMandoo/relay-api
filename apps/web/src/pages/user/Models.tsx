@@ -313,7 +313,11 @@ export default function Page() {
       const response = await userApi.testModel(model.id);
       const newLatency = response.data.latencyMs;
       setLatencyMap((prev) => ({ ...prev, [model.id]: newLatency }));
-      setModels((prev) => prev.map((item) => (item.id === model.id ? { ...item, latencyMs: newLatency, status: 'online' } : item)));
+      setModels((prev) =>
+        prev.map((item) =>
+          item.id === model.id ? { ...item, latencyMs: newLatency, lastTestedAt: new Date().toISOString(), status: 'online' } : item,
+        ),
+      );
       toast.success(`${model.name} 延迟测试完成`, { description: `当前转发延迟: ${newLatency}ms` });
     } catch (error) {
       setLatencyMap((prev) => ({ ...prev, [model.id]: model.latencyMs }));
@@ -362,7 +366,9 @@ export default function Page() {
           const index = onlineModels.findIndex((item) => item.id === model.id);
           if (index < 0) return model;
           const result = results[index];
-          return result.status === 'fulfilled' ? { ...model, latencyMs: result.value.data.latencyMs, status: 'online' } : model;
+          return result.status === 'fulfilled'
+            ? { ...model, latencyMs: result.value.data.latencyMs, lastTestedAt: new Date().toISOString(), status: 'online' }
+            : model;
         }),
       );
       toast.success('已刷新当前页面所有在线模型延迟');
@@ -561,7 +567,9 @@ export default function Page() {
                               <div className="h-1.5 w-1.5 rounded-full bg-primary" />
                               PINGING...
                             </div>
-                          ) : isOffline ? (
+                          ) : !model.lastTestedAt ? (
+                            <span className="font-mono text-xs text-muted-foreground/60">待测速</span>
+                          ) : isOffline || (state as number) === 0 ? (
                             <span className="font-mono text-xs text-muted-foreground opacity-40">TIMEOUT</span>
                           ) : (
                             <div className="flex items-center gap-2">

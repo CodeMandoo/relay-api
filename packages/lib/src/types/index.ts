@@ -342,6 +342,7 @@ export interface UserModel {
   compatibleFormats?: ModelFormat[];
   status: 'online' | 'offline';
   latencyMs: number;
+  lastTestedAt?: string | null;
   sourceId?: string;
   sourceName?: string;
   modelGroupId?: string;

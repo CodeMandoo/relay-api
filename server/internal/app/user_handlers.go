@@ -228,6 +228,11 @@ func (a *App) userModels(c *gin.Context) {
 			v := logs[len(logs)-1].ProbedAt.UTC().Format(time.RFC3339)
 			lastProbeAt = &v
 		}
+		var lastTestedAt *string
+		if model.LastTestedAt != nil {
+			v := model.LastTestedAt.UTC().Format(time.RFC3339)
+			lastTestedAt = &v
+		}
 		out = append(out, gin.H{
 			"id":                id("m", model.ID),
 			"name":              model.Name,
@@ -238,6 +243,7 @@ func (a *App) userModels(c *gin.Context) {
 			"compatibleFormats": compatibleModelFormats(model, settings.ProtocolConversionEnabled),
 			"status":            status,
 			"latencyMs":         latency,
+			"lastTestedAt":      lastTestedAt,
 			"sourceId":          id("s", source.ID),
 			"source":            sourceName,
 			"sourceName":        sourceName,
@@ -335,12 +341,12 @@ func (a *App) userTestModel(c *gin.Context) {
 	resp, err := client.Do(req)
 	latency := int(time.Since(start).Milliseconds())
 	if err != nil {
-		_ = a.db.Model(&target.Model).Update("latency_ms", 0).Error
+		_ = a.db.Model(&target.Model).Updates(map[string]any{"latency_ms": 0, "last_tested_at": time.Now()}).Error
 		errorJSON(c, http.StatusBadGateway, err.Error())
 		return
 	}
 	defer resp.Body.Close()
-	_ = a.db.Model(&target.Model).Update("latency_ms", latency).Error
+	_ = a.db.Model(&target.Model).Updates(map[string]any{"latency_ms": latency, "last_tested_at": time.Now()}).Error
 	_ = a.db.Model(&target.Source).Updates(map[string]any{"latency_ms": latency, "status": SourceStatusOnline}).Error
 	if target.SourceKey != nil {
 		_ = a.db.Model(&SourceKey{}).Where("id = ?", target.SourceKey.ID).Update("last_used_at", time.Now()).Error

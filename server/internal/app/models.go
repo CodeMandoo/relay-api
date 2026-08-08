@@ -213,6 +213,7 @@ type ModelConfig struct {
 	BillingCacheRead   float64
 	Status             string `gorm:"size:20;index;not null;default:active"`
 	LatencyMS          int
+	LastTestedAt       *time.Time `gorm:"index"` // 最近一次测速时间（转发延迟只以测速结果为准）
 	RoutingWeight      int  `gorm:"not null;default:1"`
 	RoutingEnabled     bool `gorm:"not null;default:true"`
 	CreatedAt          time.Time
