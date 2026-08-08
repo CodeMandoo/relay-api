@@ -139,7 +139,7 @@ function ProbeBars({ history, lastProbeAt }: { history?: { success: boolean; at:
           <span
             key={i}
             className={cn(
-              'h-4 w-1.5 rounded-[2px]',
+              'h-4 w-1 shrink-0 rounded-[1px]',
               item === undefined ? 'bg-muted/60' : item.success ? 'bg-emerald-500' : 'bg-destructive',
             )}
             title={item ? `${item.success ? '成功' : '失败'} · ${new Date(item.at).toLocaleString()}` : '暂无记录'}

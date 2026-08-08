@@ -662,7 +662,7 @@ export default function Page() {
                               <span
                                 key={i}
                                 className={cn(
-                                  'h-3.5 w-1.5 rounded-[2px]',
+                                  'h-3.5 w-1 shrink-0 rounded-[1px]',
                                   state === undefined ? 'bg-muted/60' : state ? 'bg-emerald-500' : 'bg-destructive',
                                 )}
                                 title={state === undefined ? '暂无请求' : `${state ? '成功' : '失败'} · 最近 ${i + 1} 次`}
