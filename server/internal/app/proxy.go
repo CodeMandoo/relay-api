@@ -343,7 +343,12 @@ func (a *App) callUpstream(c *gin.Context, target routeTarget, protocol relayPro
 	client := &http.Client{Timeout: timeout}
 	if stream {
 		client.Timeout = 0
-		client.Transport = &http.Transport{ResponseHeaderTimeout: timeout}
+		// 流式请求同样启用环境变量代理（HTTP_PROXY/HTTPS_PROXY/NO_PROXY），
+		// 否则会漏配代理导致直连上游。
+		client.Transport = &http.Transport{
+			ResponseHeaderTimeout: timeout,
+			Proxy:                 http.ProxyFromEnvironment,
+		}
 	}
 	return client.Do(req)
 }
