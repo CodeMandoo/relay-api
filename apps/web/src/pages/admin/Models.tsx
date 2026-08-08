@@ -60,6 +60,8 @@ import {
   Cpu,
   Sparkles,
   Info,
+  ChevronDown,
+  ChevronRight,
 } from 'lucide-react';
 import { MODEL_PROVIDERS, copyToClipboard } from '@relay-api/lib';
 import type { ModelAccessGroup, ModelFormat, PlatformModel, SourceKey, UpstreamSource } from '@relay-api/lib';
@@ -269,6 +271,7 @@ export default function Page() {
   const [search, setSearch] = useState('');
   const [filter, setFilter] = useState<Filter>('all');
   const [modelGroupFilter, setModelGroupFilter] = useState<string>('all');
+  const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set());
   const [modelGroupOptions, setModelGroupOptions] = useState<ModelGroupDefinition[]>(INITIAL_MODEL_GROUPS);
   const [groupEditorOpen, setGroupEditorOpen] = useState(false);
   const [editingModelGroup, setEditingModelGroup] = useState<ModelGroupDefinition | null>(null);
@@ -571,6 +574,18 @@ export default function Page() {
       }
     }
     setGroupEditorOpen(false);
+  };
+
+  const toggleGroupCollapsed = (groupId: string) => {
+    setCollapsedGroups((current) => {
+      const next = new Set(current);
+      if (next.has(groupId)) {
+        next.delete(groupId);
+      } else {
+        next.add(groupId);
+      }
+      return next;
+    });
   };
 
   const deleteModelGroupDefinition = async (group: ModelGroupDefinition) => {
@@ -1167,12 +1182,22 @@ export default function Page() {
                   <TableRow className="border-b bg-muted/25 hover:bg-muted/25">
                     <TableCell colSpan={6} className="px-4 py-2">
                       <div className="flex flex-wrap items-center justify-between gap-3">
-                        <div className="flex min-w-0 items-center gap-2 text-xs text-muted-foreground">
+                        <button
+                          type="button"
+                          className="flex min-w-0 cursor-pointer items-center gap-2 text-left text-xs text-muted-foreground hover:text-foreground"
+                          onClick={() => toggleGroupCollapsed(section.group.id)}
+                          title={collapsedGroups.has(section.group.id) ? '展开分组' : '收起分组'}
+                        >
+                          {collapsedGroups.has(section.group.id) ? (
+                            <ChevronRight className="h-4 w-4 shrink-0" />
+                          ) : (
+                            <ChevronDown className="h-4 w-4 shrink-0" />
+                          )}
                           <span className={cn('h-2 w-2 shrink-0 rounded-full', style.dot)} />
                           <span className="font-semibold text-foreground">{section.group.name}</span>
                           <span>· {section.models.length} 个模型</span>
                           <span className="min-w-0 truncate">{section.group.description}</span>
-                        </div>
+                        </button>
                         <div className="flex items-center gap-1.5">
                           <Button size="sm" variant="ghost" onClick={() => openAddModelDialog(section.group.id)}>
                             <Plus className="mr-1.5 h-3.5 w-3.5" />
@@ -1186,10 +1211,11 @@ export default function Page() {
                       </div>
                     </TableCell>
                   </TableRow>
-                  {section.models.map((group, i) => {
-                    const currentCandidateId = group.currentCandidate?.id;
-                    return (
-                      <motion.tr
+                  {!collapsedGroups.has(section.group.id) &&
+                    section.models.map((group, i) => {
+                      const currentCandidateId = group.currentCandidate?.id;
+                      return (
+                        <motion.tr
                         key={`${section.group.id}:${group.key}`}
                         initial={{ opacity: 0, y: 6 }}
                         animate={{ opacity: 1, y: 0 }}
