@@ -104,7 +104,6 @@ func ensureBindingsForLegacyModels(db *gorm.DB, canonical ModelConfig, models []
 			RoutingWeight:  nonZeroInt(model.RoutingWeight, 1),
 			RoutingEnabled: model.RoutingEnabled,
 			Enabled:        model.Status == ModelStatusActive,
-			LatencyMS:      model.LatencyMS,
 			SchedulerState: schedulerStateClosed,
 		}
 		if err := db.Create(&binding).Error; err != nil {
@@ -169,7 +168,6 @@ func legacyBindingFromModel(model ModelConfig) ModelRouteBinding {
 		RoutingWeight:  nonZeroInt(model.RoutingWeight, 1),
 		RoutingEnabled: model.RoutingEnabled,
 		Enabled:        model.Status == ModelStatusActive,
-		LatencyMS:      model.LatencyMS,
 	}
 }
 

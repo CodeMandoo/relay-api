@@ -212,7 +212,6 @@ func (a *App) userModels(c *gin.Context) {
 		latency := model.LatencyMS
 		if targets, err := a.routeTargets(model.Name, modelTestProtocol(model), model.ModelGroupID); err == nil && len(targets) > 0 {
 			source = targets[0].Source
-			latency = nonZeroInt(targets[0].Binding.LatencyMS, targets[0].Model.LatencyMS)
 		}
 		sourceName := source.Name
 		if settings.HideUpstreamNameFromUsers {
