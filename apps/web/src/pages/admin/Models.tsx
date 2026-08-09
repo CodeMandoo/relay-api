@@ -91,6 +91,7 @@ type ModelGroupDefinition = {
   fixedSourceId?: string;
   fixedSourceKeyId?: string;
   locked?: boolean;
+  status?: 'active' | 'disabled';
 };
 
 type GroupBindingConfig = {
@@ -195,6 +196,7 @@ const modelGroupDefinitionFromDTO = (group: ModelAccessGroup): ModelGroupDefinit
   fixedSourceKeyId: group.fixedSourceKeyId,
   description: group.description ?? '模型分组',
   locked: group.isDefault,
+  status: group.status ?? 'active',
   bindings: (group.bindings ?? []).map((binding) => ({
     sourceId: binding.sourceId,
     sourceKeyId: binding.sourceKeyId ?? 'default',
@@ -586,6 +588,19 @@ export default function Page() {
       }
       return next;
     });
+  };
+
+  const toggleModelGroupStatus = async (group: ModelGroupDefinition) => {
+    const nextStatus = group.status === 'disabled' ? 'active' : 'disabled';
+    try {
+      const response = await adminApi.updateModelGroup(group.id, { status: nextStatus });
+      setModelGroupOptions((current) =>
+        current.map((item) => (item.id === group.id ? { ...item, status: response.data.status ?? nextStatus } : item)),
+      );
+      toast.success(nextStatus === 'disabled' ? '分组已禁用' : '分组已启用', { description: group.name });
+    } catch (error) {
+      toast.error(getErrorMessage(error, nextStatus === 'disabled' ? '禁用分组失败' : '启用分组失败'));
+    }
   };
 
   const deleteModelGroupDefinition = async (group: ModelGroupDefinition) => {
@@ -1184,7 +1199,10 @@ export default function Page() {
                       <div className="flex flex-wrap items-center justify-between gap-3">
                         <button
                           type="button"
-                          className="flex min-w-0 cursor-pointer items-center gap-2 text-left text-xs text-muted-foreground hover:text-foreground"
+                          className={cn(
+                            'flex min-w-0 cursor-pointer items-center gap-2 text-left text-xs text-muted-foreground hover:text-foreground',
+                            section.group.status === 'disabled' && 'opacity-60',
+                          )}
                           onClick={() => toggleGroupCollapsed(section.group.id)}
                           title={collapsedGroups.has(section.group.id) ? '展开分组' : '收起分组'}
                         >
@@ -1195,6 +1213,9 @@ export default function Page() {
                           )}
                           <span className={cn('h-2 w-2 shrink-0 rounded-full', style.dot)} />
                           <span className="font-semibold text-foreground">{section.group.name}</span>
+                          {section.group.status === 'disabled' && (
+                            <span className="rounded border-destructive/30 bg-destructive/10 px-1.5 py-0.5 text-[10px] font-bold text-destructive">已禁用</span>
+                          )}
                           <span>· {section.models.length} 个模型</span>
                           <span className="min-w-0 truncate">{section.group.description}</span>
                         </button>
@@ -1203,6 +1224,16 @@ export default function Page() {
                             <Plus className="mr-1.5 h-3.5 w-3.5" />
                             添加模型
                           </Button>
+                          {!section.group.locked && (
+                            <Button
+                              size="sm"
+                              variant="ghost"
+                              className={cn(section.group.status === 'disabled' && 'text-destructive hover:text-destructive')}
+                              onClick={() => toggleModelGroupStatus(section.group)}
+                            >
+                              {section.group.status === 'disabled' ? '启用' : '禁用'}
+                            </Button>
+                          )}
                           <Button size="sm" variant="ghost" onClick={() => openEditGroup(section.group)}>
                             <Edit className="mr-1.5 h-3.5 w-3.5" />
                             编辑分组

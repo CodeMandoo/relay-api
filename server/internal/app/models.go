@@ -92,6 +92,7 @@ type ModelGroup struct {
 	FixedSourceID    *uint  `gorm:"index"`
 	FixedSourceKeyID *uint  `gorm:"index"`
 	IsDefault        bool   `gorm:"not null;default:false"`
+	Status           string `gorm:"size:20;index;not null;default:active"`
 	CreatedAt        time.Time
 	UpdatedAt        time.Time
 	DeletedAt        gorm.DeletedAt `gorm:"index"`
@@ -520,6 +521,7 @@ type ModelGroupDTO struct {
 	Name             string                `json:"name"`
 	Description      string                `json:"description,omitempty"`
 	IsDefault        bool                  `json:"isDefault"`
+	Status           string                `json:"status"`
 	DynamicRouting   bool                  `json:"dynamicRouting"`
 	FixedSourceID    string                `json:"fixedSourceId,omitempty"`
 	FixedSourceKeyID string                `json:"fixedSourceKeyId,omitempty"`
@@ -796,6 +798,7 @@ func modelGroupDTO(group ModelGroup, keyCount, modelCount int64) ModelGroupDTO {
 		Name:             group.Name,
 		Description:      group.Description,
 		IsDefault:        group.IsDefault,
+		Status:           group.Status,
 		DynamicRouting:   group.DynamicRouting,
 		FixedSourceID:    fixedSourceID,
 		FixedSourceKeyID: fixedSourceKeyID,

@@ -11,7 +11,12 @@ import (
 	"gorm.io/gorm"
 )
 
-var errModelGroupDeleted = errors.New("当前分组已删除")
+const (
+	ModelGroupStatusActive   = "active"
+	ModelGroupStatusDisabled = "disabled"
+)
+
+var errModelGroupDeleted = errors.New("当前分组不存在")
 
 func encodeModelGroupBindings(bindings []modelBindingRequest) string {
 	if len(bindings) == 0 {
@@ -122,11 +127,14 @@ func (a *App) modelGroupIDForAPIKey(key APIKey) (uint, error) {
 		return 0, errModelGroupDeleted
 	}
 	var group ModelGroup
-	if err := a.db.Select("id").First(&group, groupID).Error; err != nil {
+	if err := a.db.Select("id", "status").First(&group, groupID).Error; err != nil {
 		if errors.Is(err, gorm.ErrRecordNotFound) {
 			return 0, errModelGroupDeleted
 		}
 		return 0, err
+	}
+	if group.Status == ModelGroupStatusDisabled {
+		return 0, errModelGroupDeleted
 	}
 	return group.ID, nil
 }
@@ -331,6 +339,13 @@ func (a *App) adminUpdateModelGroup(c *gin.Context) {
 		group.DynamicRouting = value
 		updates["dynamic_routing"] = value
 	}
+	if value, ok := req["status"].(string); ok && (value == ModelGroupStatusActive || value == ModelGroupStatusDisabled) {
+		if group.IsDefault && value == ModelGroupStatusDisabled {
+			errorJSON(c, http.StatusBadRequest, "default model group cannot be disabled")
+			return
+		}
+		updates["status"] = value
+	}
 	if value, ok := req["fixedSourceId"].(string); ok {
 		rawKey, _ := req["fixedSourceKeyId"].(string)
 		if err := a.setFixedRoute(&group, value, rawKey); err != nil {
@@ -403,7 +418,8 @@ func (a *App) userModelGroups(c *gin.Context) {
 		return
 	}
 	var groups []ModelGroup
-	if err := a.db.Order("is_default desc, created_at asc, id asc").Find(&groups).Error; err != nil {
+	// 用户端只展示启用状态的分组
+	if err := a.db.Where("status = ?", ModelGroupStatusActive).Order("is_default desc, created_at asc, id asc").Find(&groups).Error; err != nil {
 		errorJSON(c, http.StatusInternalServerError, "database error")
 		return
 	}

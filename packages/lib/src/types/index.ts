@@ -312,6 +312,7 @@ export interface ModelAccessGroup {
   name: string;
   description?: string;
   isDefault: boolean;
+  status?: 'active' | 'disabled';
   dynamicRouting: boolean;
   fixedSourceId?: string;
   fixedSourceKeyId?: string;

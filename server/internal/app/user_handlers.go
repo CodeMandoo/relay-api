@@ -166,6 +166,12 @@ func (a *App) userModels(c *gin.Context) {
 	var models []ModelConfig
 	settings, _ := a.getSettings()
 	query := a.db.Where("status = ?", ModelStatusActive)
+	// 用户端不展示禁用分组下的模型
+	var disabledGroupIDs []uint
+	a.db.Model(&ModelGroup{}).Where("status = ?", ModelGroupStatusDisabled).Pluck("id", &disabledGroupIDs)
+	if len(disabledGroupIDs) > 0 {
+		query = query.Where("model_group_id NOT IN ?", disabledGroupIDs)
+	}
 	if err := query.Order("model_group_id asc, name asc").Find(&models).Error; err != nil {
 		errorJSON(c, http.StatusInternalServerError, "database error")
 		return

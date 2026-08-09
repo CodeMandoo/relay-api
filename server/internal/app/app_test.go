@@ -898,7 +898,7 @@ func TestAPIKeyDeletedModelGroupReturnsClearError(t *testing.T) {
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("deleted group proxy: %d %s", w.Code, w.Body.String())
 	}
-	if got := decodeBody(t, w)["error"]; got != "当前分组已删除" {
+	if got := decodeBody(t, w)["error"]; got != "当前分组不存在" {
 		t.Fatalf("expected deleted group error, got %v", got)
 	}
 
@@ -906,7 +906,7 @@ func TestAPIKeyDeletedModelGroupReturnsClearError(t *testing.T) {
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("deleted group model list: %d %s", w.Code, w.Body.String())
 	}
-	if got := decodeBody(t, w)["error"]; got != "当前分组已删除" {
+	if got := decodeBody(t, w)["error"]; got != "当前分组不存在" {
 		t.Fatalf("expected deleted group model list error, got %v", got)
 	}
 }
@@ -3922,5 +3922,76 @@ func TestAdminDeleteModelGroupCascadesModelsAndDisappears(t *testing.T) {
 		if item["name"] == "group-delete-model" {
 			t.Fatalf("deleted group model still listed: %v", item)
 		}
+	}
+}
+
+func TestDisabledModelGroupBlocksKeyAndHiddenFromUsers(t *testing.T) {
+	app := testApp(t)
+	source := UpstreamSource{Name: "Disabled_Group_Source", Type: SourceTypeThirdParty, BaseURL: "https://disabled-group.example/v1", APIKey: "key", Priority: 1, Status: SourceStatusOnline}
+	if err := app.db.Create(&source).Error; err != nil {
+		t.Fatalf("create source: %v", err)
+	}
+	group := ModelGroup{Name: "Disabled_Group"}
+	if err := app.db.Create(&group).Error; err != nil {
+		t.Fatalf("create group: %v", err)
+	}
+	if err := app.db.Create(&ModelConfig{ModelGroupID: group.ID, SourceID: source.ID, Name: "disabled-group-model", DisplayName: "Disabled Group Model", Provider: "OpenAI", Formats: ModelFormatOpenAI, Status: ModelStatusActive}).Error; err != nil {
+		t.Fatalf("create model: %v", err)
+	}
+	user := loadTestUser(t, app)
+	secret := "sk-relay-disabled-group"
+	key := APIKey{UserID: user.ID, ModelGroupID: group.ID, Name: "disabled-group-key", Secret: secret, KeyHash: hashKey(secret), Masked: maskKey(secret), Status: APIKeyStatusValid}
+	if err := app.db.Create(&key).Error; err != nil {
+		t.Fatalf("create api key: %v", err)
+	}
+
+	// 禁用分组
+	adminToken := loginToken(t, app, testAdminEmail, testAdminPassword, RoleAdmin)
+	w := performJSON(app, http.MethodPut, "/api/admin/model-groups/"+id("mg", group.ID), adminToken, map[string]any{"status": "disabled"})
+	if w.Code != http.StatusOK {
+		t.Fatalf("disable group: %d %s", w.Code, w.Body.String())
+	}
+
+	// key 使用禁用分组调用 -> 当前分组不存在
+	payload := map[string]any{"model": "disabled-group-model", "messages": []any{map[string]any{"role": "user", "content": "hello"}}}
+	w = performJSON(app, http.MethodPost, "/v1/chat/completions", secret, payload)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("disabled group proxy: %d %s", w.Code, w.Body.String())
+	}
+	if got := decodeBody(t, w)["error"]; got != "当前分组不存在" {
+		t.Fatalf("expected disabled group error, got %v", got)
+	}
+
+	// 用户端分组列表不包含禁用分组
+	createTestUser(t, app)
+	userToken := loginToken(t, app, testUserEmail, testUserPassword, RoleUser)
+	w = performJSON(app, http.MethodGet, "/api/user/model-groups", userToken, nil)
+	rows := decodeBody(t, w)["data"].([]any)
+	for _, row := range rows {
+		if item := row.(map[string]any); item["id"] == id("mg", group.ID) {
+			t.Fatalf("disabled group visible to user: %v", item)
+		}
+	}
+
+	// 用户端模型列表不包含禁用分组的模型
+	w = performJSON(app, http.MethodGet, "/api/user/models", userToken, nil)
+	modelRows := decodeBody(t, w)["data"].([]any)
+	for _, row := range modelRows {
+		if item := row.(map[string]any); item["name"] == "disabled-group-model" {
+			t.Fatalf("disabled group model visible to user: %v", item)
+		}
+	}
+}
+
+func TestDefaultModelGroupCannotBeDisabled(t *testing.T) {
+	app := testApp(t)
+	defaultGroupID := app.defaultModelGroupID()
+	adminToken := loginToken(t, app, testAdminEmail, testAdminPassword, RoleAdmin)
+	w := performJSON(app, http.MethodPut, "/api/admin/model-groups/"+id("mg", defaultGroupID), adminToken, map[string]any{"status": "disabled"})
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("disable default group: %d %s", w.Code, w.Body.String())
+	}
+	if got := decodeBody(t, w)["error"]; got != "default model group cannot be disabled" {
+		t.Fatalf("unexpected error: %v", got)
 	}
 }
