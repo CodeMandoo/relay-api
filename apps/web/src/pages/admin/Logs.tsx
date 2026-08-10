@@ -156,7 +156,7 @@ export default function Page() {
         <StatCard label="成功请求" value={stats.success} icon={DatabaseZap} tone="success" delay={0} hint="当前页" />
         <StatCard label="失败请求" value={stats.error} icon={AlertTriangle} tone={stats.error > 0 ? 'destructive' : 'neutral'} delay={0.05} hint="含上游错误与超时" />
         <StatCard label="总 Tokens" value={formatNumberFull(stats.tokens)} icon={TerminalSquare} tone="primary" delay={0.1} hint="Prompt + Completion" />
-        <StatCard label="平均延迟" value={`${stats.avgLatency}ms`} icon={Clock} tone="warning" delay={0.15} hint="端到端响应耗时" />
+        <StatCard label="平均耗时" value={`${stats.avgLatency}ms`} icon={Clock} tone="warning" delay={0.15} hint="端到端响应耗时" />
       </div>
 
       <Card className="overflow-hidden">
@@ -213,7 +213,7 @@ export default function Page() {
                 <TableHead>上游</TableHead>
                 <TableHead className="text-right">Token</TableHead>
                 <TableHead className="text-right">成本</TableHead>
-                <TableHead>延迟</TableHead>
+                <TableHead>耗时</TableHead>
                 <TableHead>状态</TableHead>
                 <TableHead className="text-right">操作</TableHead>
               </TableRow>
@@ -396,7 +396,7 @@ function RequestLogSheet({
                   <InfoTile icon={TerminalSquare} label="模型" value={log.model} />
                   <InfoTile icon={Server} label="上游" value={log.upstreamName || '-'} />
                   <InfoTile icon={KeyRound} label="API Key" value={log.apiKeyName} />
-                  <InfoTile icon={Clock} label="延迟" value={`${log.latencyMs}ms`} tone={latencyClass(log.latencyMs)} />
+                  <InfoTile icon={Clock} label="耗时" value={`${log.latencyMs}ms`} tone={latencyClass(log.latencyMs)} />
                   <InfoTile icon={Hash} label="总 Tokens" value={formatNumberFull(tokens.total)} />
                   <InfoTile icon={Coins} label="成本" value={formatCurrency(log.estimatedCost ?? 0)} />
                   <InfoTile icon={Server} label="尝试次数" value={String(log.attemptCount ?? attempts.length ?? 0)} />

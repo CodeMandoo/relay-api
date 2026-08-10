@@ -224,7 +224,7 @@ export default function Page() {
       <PageHeader
         eyebrow="请求观测"
         title="请求日志"
-        description="按请求查看模型调用、Token 明细、成本、延迟和结果状态。"
+        description="按请求查看模型调用、Token 明细、成本、耗时和结果状态。"
         actions={
           <div className="flex items-center gap-2">
             <Button variant="outline" onClick={refreshLogs} disabled={manualRefreshing}>
@@ -321,7 +321,7 @@ export default function Page() {
                 <TableHead className="text-right">Token</TableHead>
                 <TableHead className="text-right">缓存</TableHead>
                 <TableHead className="text-right">成本</TableHead>
-                <TableHead>延迟</TableHead>
+                <TableHead>耗时</TableHead>
                 <TableHead>状态</TableHead>
                 <TableHead className="text-right">操作</TableHead>
               </TableRow>
@@ -469,7 +469,7 @@ function RequestLogSheet({
             <ScrollArea className="min-h-0 flex-1">
               <div className="space-y-5 p-6">
                 <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
-                  <InfoTile icon={Clock} label="延迟" value={`${log.latencyMs}ms`} tone={latencyTone(log.latencyMs)} />
+                  <InfoTile icon={Clock} label="耗时" value={`${log.latencyMs}ms`} tone={latencyTone(log.latencyMs)} />
                   <InfoTile icon={Hash} label="总 Tokens" value={formatNumberFull(tokens.total)} />
                   <InfoTile icon={KeyRound} label="API Key" value={log.apiKeyName} />
                   <InfoTile icon={ScrollText} label="尝试次数" value={String(log.attemptCount ?? attempts.length ?? 0)} />
