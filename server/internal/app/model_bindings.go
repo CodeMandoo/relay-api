@@ -12,6 +12,7 @@ type modelBindingRequest struct {
 	ID             string `json:"id"`
 	SourceID       string `json:"sourceId"`
 	SourceKeyID    string `json:"sourceKeyId"`
+	Priority       int    `json:"priority"`
 	RoutingWeight  int    `json:"routingWeight"`
 	RoutingEnabled *bool  `json:"routingEnabled"`
 	Enabled        *bool  `json:"enabled"`
@@ -101,6 +102,7 @@ func ensureBindingsForLegacyModels(db *gorm.DB, canonical ModelConfig, models []
 			ModelID:        canonical.ID,
 			SourceID:       model.SourceID,
 			SourceKeyID:    model.SourceKeyID,
+			Priority:       1,
 			RoutingWeight:  nonZeroInt(model.RoutingWeight, 1),
 			RoutingEnabled: model.RoutingEnabled,
 			Enabled:        model.Status == ModelStatusActive,
@@ -165,6 +167,7 @@ func legacyBindingFromModel(model ModelConfig) ModelRouteBinding {
 		ModelID:        model.ID,
 		SourceID:       model.SourceID,
 		SourceKeyID:    model.SourceKeyID,
+		Priority:       1,
 		RoutingWeight:  nonZeroInt(model.RoutingWeight, 1),
 		RoutingEnabled: model.RoutingEnabled,
 		Enabled:        model.Status == ModelStatusActive,
@@ -191,6 +194,7 @@ func modelBindingRequestFromBinding(binding ModelRouteBinding, keepID bool) mode
 	req := modelBindingRequest{
 		SourceID:      id("s", binding.SourceID),
 		SourceKeyID:   "default",
+		Priority:      nonZeroInt(binding.Priority, 1),
 		RoutingWeight: nonZeroInt(binding.RoutingWeight, 1),
 	}
 	if keepID && binding.ID != 0 {
@@ -264,6 +268,10 @@ func (a *App) primaryModelBindingRequest(bindings []modelBindingRequest) modelBi
 		if leftSchedulable != rightSchedulable {
 			return leftSchedulable
 		}
+		// 模型绑定级优先级为主（值小优先）
+		if nonZeroInt(out[i].Priority, 1) != nonZeroInt(out[j].Priority, 1) {
+			return nonZeroInt(out[i].Priority, 1) < nonZeroInt(out[j].Priority, 1)
+		}
 		if leftSource.Priority != rightSource.Priority {
 			return leftSource.Priority < rightSource.Priority
 		}
@@ -305,6 +313,9 @@ func parseBindingRequests(raw any) ([]modelBindingRequest, bool) {
 		if value, ok := row["sourceKeyId"].(string); ok {
 			req.SourceKeyID = value
 		}
+		if value, ok := numberFromMap(row, "priority"); ok {
+			req.Priority = int(value)
+		}
 		if value, ok := numberFromMap(row, "routingWeight"); ok {
 			req.RoutingWeight = int(value)
 		}
@@ -344,6 +355,10 @@ func (a *App) validateModelBindingRequests(bindings []modelBindingRequest) ([]mo
 		if weight <= 0 {
 			weight = 1
 		}
+		priority := binding.Priority
+		if priority <= 0 {
+			priority = 1
+		}
 		routingEnabled := true
 		if binding.RoutingEnabled != nil {
 			routingEnabled = *binding.RoutingEnabled
@@ -355,6 +370,7 @@ func (a *App) validateModelBindingRequests(bindings []modelBindingRequest) ([]mo
 		normalized := modelBindingRequest{
 			ID:             binding.ID,
 			SourceID:       id("s", sourceID),
+			Priority:       priority,
 			RoutingWeight:  weight,
 			RoutingEnabled: &routingEnabled,
 			Enabled:        &enabled,
@@ -399,6 +415,10 @@ func (a *App) replaceModelBindings(modelID uint, bindings []modelBindingRequest)
 		if weight <= 0 {
 			weight = 1
 		}
+		priority := binding.Priority
+		if priority <= 0 {
+			priority = 1
+		}
 		if binding.ID != "" {
 			bindingID, err := parseNumericID(binding.ID)
 			if err != nil {
@@ -411,6 +431,7 @@ func (a *App) replaceModelBindings(modelID uint, bindings []modelBindingRequest)
 			updates := map[string]any{
 				"source_id":       sourceID,
 				"source_key_id":   sourceKeyValue,
+				"priority":        priority,
 				"routing_weight":  weight,
 				"routing_enabled": routingEnabled,
 				"enabled":         enabled,
@@ -434,6 +455,7 @@ func (a *App) replaceModelBindings(modelID uint, bindings []modelBindingRequest)
 			ModelID:        modelID,
 			SourceID:       sourceID,
 			SourceKeyID:    sourceKeyID,
+			Priority:       priority,
 			RoutingWeight:  weight,
 			RoutingEnabled: routingEnabled,
 			Enabled:        enabled,

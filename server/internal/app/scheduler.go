@@ -21,12 +21,9 @@ const (
 
 	schedulerFailureThreshold         = 3
 	schedulerProbeInterval            = 5 * time.Minute
-	schedulerRecoveryProbeInterval    = 10 * time.Second
 	schedulerProbeTimeout             = 10 * time.Second
 	schedulerProbeLeaseDuration       = 30 * time.Second
-	schedulerObservationDuration      = 30 * time.Second
 	schedulerObservingWeightPercent   = 10
-	schedulerRecoverySuccessThreshold = 3
 
 	// maxProbeLogsPerModel 每个模型保留的探测历史条数上限。
 	maxProbeLogsPerModel = 50
@@ -149,7 +146,7 @@ func (a *App) scheduleTargets(targets []routeTarget, now time.Time) []routeTarge
 	groups := make([][]routeTarget, 0)
 	for start := 0; start < len(eligible); {
 		end := start + 1
-		for end < len(eligible) && eligible[end].Source.Priority == eligible[start].Source.Priority {
+		for end < len(eligible) && schedulerTargetGroupKey(eligible[end]) == schedulerTargetGroupKey(eligible[start]) {
 			end++
 		}
 		groups = append(groups, a.schedulePriorityGroup(eligible[start:end], now))
@@ -178,7 +175,7 @@ func priorityGroupOnlyObserving(group []routeTarget) bool {
 }
 
 func (a *App) shouldRouteObservation(group []routeTarget) bool {
-	key := fmt.Sprintf("observe:p:%d", group[0].Source.Priority)
+	key := fmt.Sprintf("observe:%s", schedulerTargetGroupKey(group[0]))
 	a.schedulerMu.Lock()
 	defer a.schedulerMu.Unlock()
 	count := a.schedulerCurrent[key] + 1
@@ -235,6 +232,11 @@ func schedulerKey(target routeTarget) string {
 }
 
 func routeTargetLess(left routeTarget, right routeTarget, now time.Time) bool {
+	// 模型绑定级优先级为主（值小优先，正常只走高优先级，故障切换）。
+	if left.Binding.Priority != right.Binding.Priority {
+		return left.Binding.Priority < right.Binding.Priority
+	}
+	// 同优先级内再按源级优先级。
 	if left.Source.Priority != right.Source.Priority {
 		return left.Source.Priority < right.Source.Priority
 	}
@@ -253,6 +255,12 @@ func routeTargetLess(left routeTarget, right routeTarget, now time.Time) bool {
 		return left.Source.ID < right.Source.ID
 	}
 	return sourceKeyIDValueFromBinding(left.Binding) < sourceKeyIDValueFromBinding(right.Binding)
+}
+
+// schedulerTargetGroupKey 返回目标的分组键：绑定级优先级 + 源级优先级（两级严格优先级）。
+// 只有两级优先级都相同的绑定才在同一组内做权重分流。
+func schedulerTargetGroupKey(target routeTarget) string {
+	return fmt.Sprintf("%d:%d", target.Binding.Priority, target.Source.Priority)
 }
 
 func (a *App) markBindingSuccess(target routeTarget, now time.Time) {
@@ -302,6 +310,7 @@ func (a *App) markBindingFailure(target routeTarget, statusCode int, now time.Ti
 		"scheduler_state":   schedulerStateOpen,
 		"cooldown_until":    now.Add(schedulerProbeInterval),
 		"observation_until": nil,
+		"last_probe_at":     now, // 重置检测计时：冷却 5 分钟后由统一检测决定恢复
 	})
 	if opened.Error == nil && opened.RowsAffected == 1 {
 		a.resetSchedulerBindingMemory(target.Binding.ID)
@@ -322,93 +331,53 @@ func (a *App) runSchedulerProbeLoop(done <-chan struct{}) {
 }
 
 func (a *App) runDueSchedulerProbes(now time.Time) {
-	var bindings []ModelRouteBinding
-	if err := a.db.Where("scheduler_state IN ? AND cooldown_until IS NOT NULL AND cooldown_until <= ?", []string{schedulerStateOpen, schedulerStateRecovering, schedulerStateHalfOpen}, now).Find(&bindings).Error; err != nil {
-		return
-	}
-	for _, binding := range bindings {
-		if !a.claimSchedulerProbe(binding, now) {
-			continue
-		}
-		go a.probeSchedulerBinding(binding.ID, now)
-	}
-	a.runDueHealthProbes(now)
-}
-
-// runDueHealthProbes 对健康（closed）绑定执行周期性检测，只记录检测状态，不改变调度状态。
-func (a *App) runDueHealthProbes(now time.Time) {
+	// 统一检测：对健康（closed）绑定做周期检测，对熔断（open）绑定在冷却到期后做恢复检测。
+	// 不再有独立的 10 秒恢复探测，全部复用同一个检测循环（5 分钟周期）。
 	cutoff := now.Add(-schedulerHealthProbeInterval)
 	var bindings []ModelRouteBinding
-	if err := a.db.Where("scheduler_state = ? AND enabled = ? AND (last_probe_at IS NULL OR last_probe_at <= ?)", schedulerStateClosed, true, cutoff).Find(&bindings).Error; err != nil {
+	if err := a.db.Where("enabled = ? AND (last_probe_at IS NULL OR last_probe_at <= ?)", true, cutoff).Find(&bindings).Error; err != nil {
 		return
 	}
 	for _, binding := range bindings {
-		if !a.claimHealthProbe(binding, now) {
+		if !a.claimProbe(binding, now) {
 			continue
 		}
-		go a.healthProbeBinding(binding.ID)
+		go a.probeBinding(binding.ID)
 	}
 }
 
-// claimHealthProbe 抢占健康探测租约（写 last_probe_at 为未来时间），避免多实例重复探测。
-func (a *App) claimHealthProbe(binding ModelRouteBinding, now time.Time) bool {
+// claimProbe 抢占统一检测租约（写 last_probe_at 为未来时间），避免多实例重复检测。
+func (a *App) claimProbe(binding ModelRouteBinding, now time.Time) bool {
 	leaseUntil := now.Add(schedulerProbeLeaseDuration)
 	result := a.db.Model(&ModelRouteBinding{}).
-		Where("id = ? AND scheduler_state = ? AND (last_probe_at IS NULL OR last_probe_at <= ?)", binding.ID, schedulerStateClosed, now).
+		Where("id = ? AND (last_probe_at IS NULL OR last_probe_at <= ?)", binding.ID, now).
 		Updates(map[string]any{"last_probe_at": leaseUntil})
 	return result.Error == nil && result.RowsAffected == 1
 }
 
-func (a *App) claimSchedulerProbe(binding ModelRouteBinding, now time.Time) bool {
-	leaseUntil := now.Add(schedulerProbeLeaseDuration)
-	result := a.db.Model(&ModelRouteBinding{}).
-		Where("id = ? AND scheduler_state = ? AND cooldown_until <= ? AND (probe_lease_until IS NULL OR probe_lease_until <= ?)", binding.ID, schedulerBindingState(binding), now, now).
-		Updates(map[string]any{"scheduler_state": schedulerStateHalfOpen, "probe_lease_until": leaseUntil})
-	return result.Error == nil && result.RowsAffected == 1
-}
-
-func (a *App) probeSchedulerBinding(bindingID uint, now time.Time) {
+// probeBinding 执行一次统一检测：复用检测状态结果，成功即恢复（open→closed），失败保持冷却。
+func (a *App) probeBinding(bindingID uint) {
 	target, protocol, err := a.schedulerProbeTarget(bindingID)
 	if err != nil {
-		a.markSchedulerProbeFailure(bindingID, now)
+		a.recordProbeResult(bindingID, false, 0, 0, err.Error())
 		return
 	}
 	statusCode, latencyMS, err := a.doSchedulerProbe(target, protocol)
 	if err != nil {
-		a.recordSchedulerProbe(target, false, 0, latencyMS, err.Error())
-		a.markSchedulerProbeFailure(bindingID, time.Now())
+		a.recordProbeResult(bindingID, false, 0, latencyMS, err.Error())
 		return
 	}
 	if statusCode >= http.StatusBadRequest {
-		a.recordSchedulerProbe(target, false, statusCode, latencyMS, http.StatusText(statusCode))
-		a.markSchedulerProbeFailure(bindingID, time.Now())
+		a.recordProbeResult(bindingID, false, statusCode, latencyMS, http.StatusText(statusCode))
 		return
 	}
-	a.recordSchedulerProbe(target, true, statusCode, latencyMS, "")
-	a.markSchedulerProbeSuccess(bindingID, time.Now())
+	a.recordProbeResult(bindingID, true, statusCode, latencyMS, "")
 }
 
-// healthProbeBinding 对健康绑定执行一次检测，结果只写入探测日志并更新 last_probe_at。
-func (a *App) healthProbeBinding(bindingID uint) {
-	target, protocol, err := a.schedulerProbeTarget(bindingID)
-	if err != nil {
-		a.recordHealthProbeResult(bindingID, false, 0, 0, err.Error())
-		return
-	}
-	statusCode, latencyMS, err := a.doSchedulerProbe(target, protocol)
-	if err != nil {
-		a.recordHealthProbeResult(bindingID, false, 0, latencyMS, err.Error())
-		return
-	}
-	if statusCode >= http.StatusBadRequest {
-		a.recordHealthProbeResult(bindingID, false, statusCode, latencyMS, http.StatusText(statusCode))
-		return
-	}
-	a.recordHealthProbeResult(bindingID, true, statusCode, latencyMS, "")
-}
-
-// recordHealthProbeResult 写入健康探测日志并记录最近探测时间。
-func (a *App) recordHealthProbeResult(bindingID uint, success bool, statusCode int, latencyMS int64, message string) {
+// recordProbeResult 统一处理检测结果：写探测日志并更新绑定状态。
+// 检测成功：无论当前是否熔断，恢复为 closed（清空冷却）；检测可用即切回高优先级。
+// 检测失败：closed 保持健康（不触发熔断，仅记录）；open 重新冷却计时。
+func (a *App) recordProbeResult(bindingID uint, success bool, statusCode int, latencyMS int64, message string) {
 	var binding ModelRouteBinding
 	if err := a.db.First(&binding, bindingID).Error; err != nil {
 		return
@@ -427,7 +396,23 @@ func (a *App) recordHealthProbeResult(bindingID uint, success bool, statusCode i
 		}
 	}
 	a.recordSchedulerProbe(target, success, statusCode, latencyMS, message)
-	_ = a.db.Model(&ModelRouteBinding{}).Where("id = ?", bindingID).Update("last_probe_at", time.Now()).Error
+	now := time.Now()
+	if success {
+		_ = a.db.Model(&ModelRouteBinding{}).Where("id = ?", bindingID).Updates(map[string]any{
+			"scheduler_state":   schedulerStateClosed,
+			"failure_count":     0,
+			"success_streak":    0,
+			"cooldown_until":    nil,
+			"observation_until": nil,
+			"last_probe_at":     now,
+		}).Error
+		return
+	}
+	_ = a.db.Model(&ModelRouteBinding{}).Where("id = ?", bindingID).Update("last_probe_at", now).Error
+	// 熔断绑定检测失败：重新冷却计时（失败后 5 分钟再检测）
+	_ = a.db.Model(&ModelRouteBinding{}).Where("id = ? AND scheduler_state = ?", bindingID, schedulerStateOpen).Updates(map[string]any{
+		"cooldown_until": now.Add(schedulerProbeInterval),
+	}).Error
 }
 
 // doSchedulerProbe 执行一次探测请求，返回状态码、耗时和错误。
@@ -545,29 +530,4 @@ func (a *App) schedulerProbeTarget(bindingID uint) (routeTarget, relayProtocol, 
 		target.SourceKey = &key
 	}
 	return target, modelTestProtocol(model), nil
-}
-
-func (a *App) markSchedulerProbeSuccess(bindingID uint, now time.Time) {
-	var binding ModelRouteBinding
-	if err := a.db.First(&binding, bindingID).Error; err != nil {
-		return
-	}
-	streak := binding.SuccessStreak + 1
-	updates := map[string]any{"success_streak": streak, "last_success_at": now, "probe_lease_until": nil}
-	if streak >= schedulerRecoverySuccessThreshold {
-		updates["scheduler_state"] = schedulerStateObserving
-		updates["observation_until"] = now.Add(schedulerObservationDuration)
-		updates["cooldown_until"] = nil
-	} else {
-		updates["scheduler_state"] = schedulerStateRecovering
-		updates["cooldown_until"] = now.Add(schedulerRecoveryProbeInterval)
-	}
-	_ = a.db.Model(&ModelRouteBinding{}).Where("id = ? AND scheduler_state = ?", bindingID, schedulerStateHalfOpen).Updates(updates).Error
-}
-
-func (a *App) markSchedulerProbeFailure(bindingID uint, now time.Time) {
-	_ = a.db.Model(&ModelRouteBinding{}).Where("id = ?", bindingID).Updates(map[string]any{
-		"scheduler_state": schedulerStateOpen, "success_streak": 0, "cooldown_until": now.Add(schedulerProbeInterval), "observation_until": nil, "probe_lease_until": nil, "last_failure_at": now,
-	}).Error
-	a.resetSchedulerBindingMemory(bindingID)
 }

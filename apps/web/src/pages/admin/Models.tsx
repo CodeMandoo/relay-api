@@ -97,7 +97,8 @@ type ModelGroupDefinition = {
 type GroupBindingConfig = {
   sourceId: string;
   sourceKeyId: string;
-  routingWeight: number;
+  priority: number;
+  routingWeight?: number;
 };
 
 const INITIAL_MODEL_GROUPS: ModelGroupDefinition[] = [
@@ -143,7 +144,8 @@ type ModelBindingDraft = {
   id?: string;
   sourceId: string;
   sourceKeyId: string;
-  routingWeight: number;
+  priority: number;
+  routingWeight?: number;
 };
 type ModelGroup = {
   key: string;
@@ -200,7 +202,8 @@ const modelGroupDefinitionFromDTO = (group: ModelAccessGroup): ModelGroupDefinit
   bindings: (group.bindings ?? []).map((binding) => ({
     sourceId: binding.sourceId,
     sourceKeyId: binding.sourceKeyId ?? 'default',
-    routingWeight: binding.routingWeight,
+    priority: binding.priority ?? 1,
+    routingWeight: binding.routingWeight ?? 1,
   })),
 });
 
@@ -213,7 +216,7 @@ function RoutingRuleHint() {
         </button>
       </TooltipTrigger>
       <TooltipContent side="top" align="start" className="max-w-sm text-xs leading-relaxed">
-        启用状态即参与调度。先过滤未启用、上游非在线和冷却中候选；正常请求按权重 W 做平滑加权轮询，失败、超时、429 或 5xx 会切到下一个候选，并按连续失败进入短/中/长冷却。
+        优先级值越小优先级越高（1 为最高）：正常只走最低优先级（健康）的绑定，故障、超时、429 或 5xx 会切换到下一优先级，并按连续失败进入冷却。
       </TooltipContent>
     </Tooltip>
   );
@@ -223,6 +226,7 @@ const makeBindingDraft = (sourceId = '', overrides: Partial<ModelBindingDraft> =
   clientId: `binding_${Date.now()}_${Math.random().toString(36).slice(2)}`,
   sourceId,
   sourceKeyId: 'default',
+  priority: 1,
   routingWeight: 1,
   ...overrides,
 });
@@ -394,7 +398,8 @@ export default function Page() {
       return group.bindings.map((binding) =>
         makeBindingDraft(binding.sourceId, {
           sourceKeyId: binding.sourceKeyId,
-          routingWeight: binding.routingWeight,
+          priority: binding.priority,
+          routingWeight: binding.routingWeight ?? 1,
         }),
       );
     }
@@ -426,7 +431,8 @@ export default function Page() {
       .map((binding) => ({
         sourceId: binding.sourceId,
         sourceKeyId: binding.sourceKeyId,
-        routingWeight: Math.max(1, binding.routingWeight || 1),
+        priority: Math.max(1, binding.priority || 1),
+        routingWeight: binding.routingWeight ?? 1,
       }));
 
   const bindingsChanged = (left: GroupBindingConfig[], right: GroupBindingConfig[]) =>
@@ -705,7 +711,8 @@ export default function Page() {
         bindings: bindings.map((binding) => ({
           sourceId: binding.sourceId,
           sourceKeyId: binding.sourceKeyId === 'default' ? undefined : binding.sourceKeyId,
-          routingWeight: binding.routingWeight,
+          priority: Math.max(1, binding.priority || 1),
+          routingWeight: binding.routingWeight ?? 1,
         })),
       });
       setModels((current) => [{ ...response.data, modelGroupId: response.data.modelGroupId ?? addingModelGroupId }, ...current]);
@@ -727,7 +734,8 @@ export default function Page() {
             bindings: pendingGroupUpdate.bindings.map((binding) => ({
               sourceId: binding.sourceId,
               sourceKeyId: binding.sourceKeyId === 'default' ? 'default' : binding.sourceKeyId,
-              routingWeight: binding.routingWeight,
+              priority: binding.priority,
+              routingWeight: binding.routingWeight ?? 1,
             })),
           }),
         ),
@@ -843,6 +851,7 @@ export default function Page() {
         makeBindingDraft(candidate.sourceId, {
           id: candidate.id,
           sourceKeyId: candidate.sourceKeyId ?? 'default',
+          priority: candidate.priority ?? 1,
           routingWeight: routeCandidateWeight(candidate),
         }),
       ),
@@ -862,7 +871,8 @@ export default function Page() {
           id: binding.id,
           sourceId: binding.sourceId,
           sourceKeyId: binding.sourceKeyId === 'default' ? 'default' : binding.sourceKeyId,
-          routingWeight: binding.routingWeight,
+          priority: Math.max(1, binding.priority || 1),
+          routingWeight: binding.routingWeight ?? 1,
         })),
       });
       await reloadModels();

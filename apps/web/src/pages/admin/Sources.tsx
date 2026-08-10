@@ -121,6 +121,7 @@ export default function Page() {
   const [openaiBaseUrl, setOpenaiBaseUrl] = useState('');
   const [anthropicBaseUrl, setAnthropicBaseUrl] = useState('');
   const [apiKey, setApiKey] = useState('');
+  const [priority, setPriority] = useState(1);
 
   const reloadSources = () => {
     setLoading(true);
@@ -197,6 +198,7 @@ export default function Page() {
     setOpenaiBaseUrl(s.openaiBaseUrl ?? '');
     setAnthropicBaseUrl(s.anthropicBaseUrl ?? '');
     setApiKey(s.apiKey ?? '');
+    setPriority(s.priority || 1);
     setEditOpen(true);
   };
 
@@ -212,6 +214,7 @@ export default function Page() {
             apiBase: apiBase.trim(),
             openaiBaseUrl: openaiBaseUrl.trim(),
             anthropicBaseUrl: anthropicBaseUrl.trim(),
+            priority: Math.max(1, priority),
           };
       const response = await adminApi.updateSource(editingSource.id, payload);
       setSources((prev) => prev.map((s) => (s.id === editingSource.id ? response.data : s)));
@@ -573,6 +576,19 @@ export default function Page() {
                   onChange={(e) => setApiKey(e.target.value)}
                   placeholder="留空则不修改"
                 />
+              </div>
+            )}
+            {type !== 'CLIProxyAPI' && (
+              <div className="grid gap-2">
+                <Label htmlFor="edit-priority">优先级</Label>
+                <Input
+                  id="edit-priority"
+                  type="number"
+                  min={1}
+                  value={priority}
+                  onChange={(e) => setPriority(Math.max(1, parseInt(e.target.value, 10) || 1))}
+                />
+                <p className="text-xs text-muted-foreground">值越小优先级越高（1 为最高）；同优先级内按权重分流，权重越大流量越多。</p>
               </div>
             )}
           </div>

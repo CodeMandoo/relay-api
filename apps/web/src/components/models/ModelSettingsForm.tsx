@@ -19,7 +19,8 @@ export type ModelSettingsBinding = {
   id?: string;
   sourceId: string;
   sourceKeyId: string;
-  routingWeight: number;
+  priority: number;
+  routingWeight?: number;
 };
 
 export type ModelSettingsSource = {
@@ -118,14 +119,14 @@ export function ModelBindingFields({
               </div>
               <div className="grid min-w-0 gap-2">
                 <Label className="inline-flex items-center gap-1.5">
-                  调度权重
+                  优先级
                   {routingHint}
                 </Label>
                 <Input
                   type="number"
                   min={1}
-                  value={binding.routingWeight}
-                  onChange={(event) => onUpdate(binding.clientId, { routingWeight: Math.max(1, Number(event.target.value) || 1) })}
+                  value={binding.priority}
+                  onChange={(event) => onUpdate(binding.clientId, { priority: Math.max(1, Number(event.target.value) || 1) })}
                 />
               </div>
             </div>

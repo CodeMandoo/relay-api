@@ -227,6 +227,7 @@ type ModelRouteBinding struct {
 	ModelID          uint `gorm:"index;not null"`
 	SourceID         uint `gorm:"index;not null"`
 	SourceKeyID      *uint
+	Priority         int  `gorm:"not null;default:1"` // 模型绑定级优先级：值越小优先级越高，正常只走最低值健康绑定
 	RoutingWeight    int  `gorm:"not null;default:1"`
 	RoutingEnabled   bool `gorm:"not null;default:true"`
 	Enabled          bool `gorm:"not null;default:true"`
@@ -494,6 +495,7 @@ type ModelRouteCandidateDTO struct {
 	SourcePriority int    `json:"sourcePriority"`
 	SourceKeyID    string `json:"sourceKeyId,omitempty"`
 	SourceKeyAlias string `json:"sourceKeyAlias,omitempty"`
+	Priority       int    `json:"priority"`
 	RoutingWeight  int    `json:"routingWeight"`
 	RoutingEnabled bool   `json:"routingEnabled"`
 	ModelEnabled   bool   `json:"modelEnabled"`
@@ -739,6 +741,7 @@ func modelRouteCandidateDTOFromBinding(model ModelConfig, binding ModelRouteBind
 		SourceName:     source.Name,
 		SourceStatus:   source.Status,
 		SourcePriority: source.Priority,
+		Priority:       nonZeroInt(binding.Priority, 1),
 		RoutingWeight:  nonZeroInt(binding.RoutingWeight, 1),
 		RoutingEnabled: binding.RoutingEnabled,
 		ModelEnabled:   model.Status == ModelStatusActive && binding.Enabled,

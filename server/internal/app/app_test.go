@@ -1010,21 +1010,11 @@ func TestSchedulerOpensAfterThreeConsecutiveFailures(t *testing.T) {
 		t.Fatalf("third failure should open breaker, got %+v", binding)
 	}
 	assertCooldownNear(t, binding.CooldownUntil, schedulerProbeInterval)
-
-	past := time.Now().Add(-time.Second)
-	if err := app.db.Model(&ModelRouteBinding{}).Where("id = ?", target.Binding.ID).Updates(map[string]any{
-		"scheduler_state": schedulerStateOpen,
-		"cooldown_until":  past,
-	}).Error; err != nil {
-		t.Fatalf("expire cooldown: %v", err)
+	// 熔断时重置检测计时：冷却 5 分钟后由统一检测决定恢复
+	if binding.LastProbeAt == nil {
+		t.Fatalf("expected last_probe_at reset on open, got nil")
 	}
-	if !app.claimSchedulerProbe(binding, time.Now()) {
-		t.Fatal("expected due open binding probe lease to be claimed")
-	}
-	binding = loadRouteBinding(t, app, target.Binding.ID)
-	if schedulerBindingState(binding) != schedulerStateHalfOpen {
-		t.Fatalf("expected due open binding to be claimed for background probing, got %+v", binding)
-	}
+	assertCooldownNear(t, binding.LastProbeAt, 0)
 }
 
 func TestSchedulerProbeRecoveryAndObservation(t *testing.T) {
@@ -1032,43 +1022,21 @@ func TestSchedulerProbeRecoveryAndObservation(t *testing.T) {
 	_, _, _ = createSchedulerModel(t, app, "recovering-scheduler-model", 5, 1)
 	target := firstSchedulerTarget(t, app, "recovering-scheduler-model")
 	if err := app.db.Model(&ModelRouteBinding{}).Where("id = ?", target.Binding.ID).Updates(map[string]any{
-		"scheduler_state": schedulerStateHalfOpen,
+		"scheduler_state": schedulerStateOpen,
 		"failure_count":   4,
-		"success_streak":  0,
-		"cooldown_until":  nil,
+		"cooldown_until":  time.Now().Add(-time.Minute),
 	}).Error; err != nil {
-		t.Fatalf("set half-open binding: %v", err)
+		t.Fatalf("set open binding: %v", err)
 	}
 
-	app.markSchedulerProbeSuccess(target.Binding.ID, time.Now())
+	// 统一检测：熔断绑定检测成功直接恢复 closed，不再经过恢复确认/观察期。
+	app.recordProbeResult(target.Binding.ID, true, 200, 40, "")
 	binding := loadRouteBinding(t, app, target.Binding.ID)
-	if schedulerBindingState(binding) != schedulerStateRecovering || binding.SuccessStreak != 1 || binding.CooldownUntil == nil {
-		t.Fatalf("half-open success should enter recovering, got %+v", binding)
-	}
-	for i := 0; i < 2; i++ {
-		if err := app.db.Model(&ModelRouteBinding{}).Where("id = ?", target.Binding.ID).Update("scheduler_state", schedulerStateHalfOpen).Error; err != nil {
-			t.Fatalf("claim next recovery probe: %v", err)
-		}
-		app.markSchedulerProbeSuccess(target.Binding.ID, time.Now())
-	}
-	binding = loadRouteBinding(t, app, target.Binding.ID)
-	if schedulerBindingState(binding) != schedulerStateObserving || binding.SuccessStreak != schedulerRecoverySuccessThreshold || binding.ObservationUntil == nil {
-		t.Fatalf("three probe successes should enter observation, got %+v", binding)
-	}
-
-	past := time.Now().Add(-time.Second)
-	if err := app.db.Model(&ModelRouteBinding{}).Where("id = ?", target.Binding.ID).Updates(map[string]any{
-		"observation_until": past,
-	}).Error; err != nil {
-		t.Fatalf("expire observation: %v", err)
-	}
-	target.Binding = loadRouteBinding(t, app, target.Binding.ID)
-	_ = app.refreshSchedulerState(target.Binding, time.Now())
-	binding = loadRouteBinding(t, app, target.Binding.ID)
-	if schedulerBindingState(binding) != schedulerStateClosed || binding.FailureCount != 0 || binding.SuccessStreak != 0 || binding.ObservationUntil != nil {
-		t.Fatalf("successful observation should close breaker, got %+v", binding)
+	if schedulerBindingState(binding) != schedulerStateClosed || binding.FailureCount != 0 || binding.CooldownUntil != nil || binding.SuccessStreak != 0 || binding.ObservationUntil != nil {
+		t.Fatalf("successful probe should restore closed, got %+v", binding)
 	}
 }
+
 
 func TestSchedulerCredentialFailureOpensImmediately(t *testing.T) {
 	app := testApp(t)
@@ -1081,7 +1049,7 @@ func TestSchedulerCredentialFailureOpensImmediately(t *testing.T) {
 	}
 }
 
-func TestSchedulerProbeCallsModelAndEntersRecovering(t *testing.T) {
+func TestUnifiedProbeRestoresOpenBinding(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || r.URL.Path != "/v1/chat/completions" {
 			t.Fatalf("unexpected probe request: %s %s", r.Method, r.URL.Path)
@@ -1111,16 +1079,18 @@ func TestSchedulerProbeCallsModelAndEntersRecovering(t *testing.T) {
 		t.Fatalf("load probe binding: %v", err)
 	}
 	if err := app.db.Model(&ModelRouteBinding{}).Where("id = ?", binding.ID).Updates(map[string]any{
-		"scheduler_state": schedulerStateHalfOpen,
+		"scheduler_state": schedulerStateOpen,
 		"failure_count":   schedulerFailureThreshold,
+		"cooldown_until":  time.Now().Add(time.Minute),
 	}).Error; err != nil {
-		t.Fatalf("prepare probe binding: %v", err)
+		t.Fatalf("prepare open binding: %v", err)
 	}
 
-	app.probeSchedulerBinding(binding.ID, time.Now())
+	// 统一检测：熔断绑定检测成功即恢复为 closed，不再经过恢复确认/观察期。
+	app.probeBinding(binding.ID)
 	binding = loadRouteBinding(t, app, binding.ID)
-	if schedulerBindingState(binding) != schedulerStateRecovering || binding.SuccessStreak != 1 {
-		t.Fatalf("successful real probe should enter recovering, got %+v", binding)
+	if schedulerBindingState(binding) != schedulerStateClosed || binding.FailureCount != 0 || binding.CooldownUntil != nil {
+		t.Fatalf("successful unified probe should restore closed, got %+v", binding)
 	}
 }
 
@@ -1183,31 +1153,44 @@ func TestSchedulerUsesWeightOnlyWithinSamePriority(t *testing.T) {
 	}
 }
 
-func TestSchedulerObservesRecoveredHigherPriorityAtTenPercent(t *testing.T) {
+func TestOpenBindingSkipsTrafficUntilUnifiedProbeRestores(t *testing.T) {
 	app := testApp(t)
-	primary, backup, _ := createSchedulerModel(t, app, "observation-traffic-model", 1, 1)
-	if err := app.db.Model(&UpstreamSource{}).Where("id = ?", backup.ID).Update("priority", 2).Error; err != nil {
-		t.Fatalf("lower backup priority: %v", err)
+	primary, backup, model := createSchedulerModel(t, app, "open-recover-model", 1, 1)
+	// 备份绑定使用模型绑定级优先级 2（严格主备）
+	var bBinding ModelRouteBinding
+	if err := app.db.Where("model_id = ? AND source_id = ?", model.ID, backup.ID).First(&bBinding).Error; err != nil {
+		t.Fatalf("load backup binding: %v", err)
 	}
-	var binding ModelRouteBinding
-	if err := app.db.Where("source_id = ?", primary.ID).First(&binding).Error; err != nil {
+	if err := app.db.Model(&ModelRouteBinding{}).Where("id = ?", bBinding.ID).Update("priority", 2).Error; err != nil {
+		t.Fatalf("set backup priority: %v", err)
+	}
+	var pBinding ModelRouteBinding
+	if err := app.db.Where("model_id = ? AND source_id = ?", model.ID, primary.ID).First(&pBinding).Error; err != nil {
 		t.Fatalf("load primary binding: %v", err)
 	}
-	observationUntil := time.Now().Add(time.Minute)
-	if err := app.db.Model(&ModelRouteBinding{}).Where("id = ?", binding.ID).Updates(map[string]any{
-		"scheduler_state":   schedulerStateObserving,
-		"observation_until": observationUntil,
+	if err := app.db.Model(&ModelRouteBinding{}).Where("id = ?", pBinding.ID).Updates(map[string]any{
+		"scheduler_state": schedulerStateOpen,
+		"failure_count":   schedulerFailureThreshold,
+		"cooldown_until":  time.Now().Add(time.Hour),
 	}).Error; err != nil {
-		t.Fatalf("observe primary binding: %v", err)
+		t.Fatalf("open primary binding: %v", err)
 	}
 	app.resetSchedulerMemory()
-	hits := map[uint]int{}
-	for i := 0; i < 20; i++ {
-		target := firstSchedulerTarget(t, app, "observation-traffic-model")
-		hits[target.Source.ID]++
+	// open 的主源不接流量，全部走备用
+	for i := 0; i < 5; i++ {
+		target := firstSchedulerTarget(t, app, model.Name)
+		if target.Source.ID != backup.ID {
+			t.Fatalf("open primary must not receive traffic, got %+v", target.Source)
+		}
 	}
-	if hits[primary.ID] != 2 || hits[backup.ID] != 18 {
-		t.Fatalf("expected 10%% observation traffic, got primary=%d backup=%d", hits[primary.ID], hits[backup.ID])
+	// 统一检测成功即恢复主源，切回高优先级
+	app.recordProbeResult(pBinding.ID, true, 200, 30, "")
+	app.resetSchedulerMemory()
+	for i := 0; i < 5; i++ {
+		target := firstSchedulerTarget(t, app, model.Name)
+		if target.Source.ID != primary.ID {
+			t.Fatalf("restored primary should receive traffic, got %+v", target.Source)
+		}
 	}
 }
 
@@ -3801,7 +3784,7 @@ func TestHealthProbeRecordsHistoryForClosedBinding(t *testing.T) {
 		t.Fatalf("load health binding: %v", err)
 	}
 
-	app.healthProbeBinding(binding.ID)
+	app.probeBinding(binding.ID)
 
 	binding = loadRouteBinding(t, app, binding.ID)
 	if schedulerBindingState(binding) != schedulerStateClosed {
@@ -3821,18 +3804,18 @@ func TestHealthProbeRecordsHistoryForClosedBinding(t *testing.T) {
 		t.Fatalf("expected 1 health probe call, got %d", calls)
 	}
 
-	// 刚探测完成后，runDueHealthProbes 不应立即重复探测（5 分钟间隔未到）。
-	app.runDueHealthProbes(time.Now())
+	// 刚探测完成后，统一检测不应立即重复探测（5 分钟间隔未到）。
+	app.runDueSchedulerProbes(time.Now())
 	time.Sleep(500 * time.Millisecond)
 	if calls != 1 {
 		t.Fatalf("expected no immediate re-probe, got %d calls", calls)
 	}
 
-	// 将 last_probe_at 设为很久以前，runDueHealthProbes 会重新触发探测。
+	// 将 last_probe_at 设为很久以前，统一检测会重新触发探测。
 	if err := app.db.Model(&ModelRouteBinding{}).Where("id = ?", binding.ID).Update("last_probe_at", time.Now().Add(-10*time.Minute)).Error; err != nil {
 		t.Fatalf("reset last_probe_at: %v", err)
 	}
-	app.runDueHealthProbes(time.Now())
+	app.runDueSchedulerProbes(time.Now())
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) && calls < 2 {
 		time.Sleep(50 * time.Millisecond)
@@ -3865,7 +3848,7 @@ func TestHealthProbeRecordsFailureWithoutTrippingBreaker(t *testing.T) {
 		t.Fatalf("load binding: %v", err)
 	}
 
-	app.healthProbeBinding(binding.ID)
+	app.probeBinding(binding.ID)
 
 	binding = loadRouteBinding(t, app, binding.ID)
 	if schedulerBindingState(binding) != schedulerStateClosed {
@@ -3993,5 +3976,54 @@ func TestDefaultModelGroupCannotBeDisabled(t *testing.T) {
 	}
 	if got := decodeBody(t, w)["error"]; got != "default model group cannot be disabled" {
 		t.Fatalf("unexpected error: %v", got)
+	}
+}
+
+func TestSchedulerUsesBindingPriorityAsStrictPrimary(t *testing.T) {
+	app := testApp(t)
+	primary := UpstreamSource{Name: "Binding_Primary", Type: SourceTypeThirdParty, BaseURL: "https://bp.example.com/v1", APIKey: "bp-key", Priority: 1, Status: SourceStatusOnline}
+	backup := UpstreamSource{Name: "Binding_Backup", Type: SourceTypeThirdParty, BaseURL: "https://bb.example.com/v1", APIKey: "bb-key", Priority: 1, Status: SourceStatusOnline}
+	if err := app.db.Create(&primary).Error; err != nil {
+		t.Fatalf("create primary: %v", err)
+	}
+	if err := app.db.Create(&backup).Error; err != nil {
+		t.Fatalf("create backup: %v", err)
+	}
+	model := ModelConfig{SourceID: primary.ID, Name: "binding-priority-model", Provider: "OpenAI", Formats: ModelFormatOpenAI, Status: ModelStatusActive}
+	if err := app.db.Create(&model).Error; err != nil {
+		t.Fatalf("create model: %v", err)
+	}
+	// 绑定级优先级：primary=1、backup=2（源级 priority 相同）
+	if err := app.replaceModelBindings(model.ID, []modelBindingRequest{
+		{SourceID: id("s", primary.ID), SourceKeyID: "default", Priority: 1},
+		{SourceID: id("s", backup.ID), SourceKeyID: "default", Priority: 2},
+	}); err != nil {
+		t.Fatalf("create bindings: %v", err)
+	}
+	// 都健康时只走 primary（情况 2：正常只走主）
+	for i := 0; i < 10; i++ {
+		target := firstSchedulerTarget(t, app, model.Name)
+		if target.Source.ID != primary.ID {
+			t.Fatalf("lower-priority binding selected despite primary health: %+v", target.Source)
+		}
+	}
+	// primary 熔断后切换到 backup
+	var pBinding ModelRouteBinding
+	if err := app.db.Where("model_id = ? AND source_id = ?", model.ID, primary.ID).First(&pBinding).Error; err != nil {
+		t.Fatalf("load primary binding: %v", err)
+	}
+	if err := app.db.Model(&ModelRouteBinding{}).Where("id = ?", pBinding.ID).Updates(map[string]any{
+		"scheduler_state": schedulerStateOpen,
+		"failure_count":   schedulerFailureThreshold,
+		"cooldown_until":  time.Now().Add(time.Hour),
+	}).Error; err != nil {
+		t.Fatalf("open primary binding: %v", err)
+	}
+	app.resetSchedulerMemory()
+	for i := 0; i < 10; i++ {
+		target := firstSchedulerTarget(t, app, model.Name)
+		if target.Source.ID != backup.ID {
+			t.Fatalf("expected backup after primary opened, got %+v", target.Source)
+		}
 	}
 }

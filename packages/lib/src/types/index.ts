@@ -159,7 +159,8 @@ export interface ModelBindingInput {
   id?: string;
   sourceId: string;
   sourceKeyId?: string;
-  routingWeight: number;
+  priority?: number;
+  routingWeight?: number;
 }
 
 export interface ModelRouteCandidate {
@@ -170,6 +171,7 @@ export interface ModelRouteCandidate {
   sourcePriority: number;
   sourceKeyId?: string;
   sourceKeyAlias?: string;
+  priority?: number;
   routingWeight: number;
   routingEnabled: boolean;
   modelEnabled: boolean;
